@@ -38,6 +38,39 @@ fn ensure_runtime_dirs(config: &RuntimeConfig) -> Result<()> {
         )
     })?;
 
+    fs::create_dir_all(&config.raw_mail_dir).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Io,
+            format!(
+                "failed to create raw mail directory {}",
+                config.raw_mail_dir.display()
+            ),
+            error,
+        )
+    })?;
+
+    fs::create_dir_all(&config.patch_dir).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Io,
+            format!(
+                "failed to create patch directory {}",
+                config.patch_dir.display()
+            ),
+            error,
+        )
+    })?;
+
+    fs::create_dir_all(&config.log_dir).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Io,
+            format!(
+                "failed to create log directory {}",
+                config.log_dir.display()
+            ),
+            error,
+        )
+    })?;
+
     if let Some(db_dir) = config.database_path.parent() {
         fs::create_dir_all(db_dir).map_err(|error| {
             CourierError::with_source(

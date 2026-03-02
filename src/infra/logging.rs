@@ -1,22 +1,40 @@
-use std::sync::Once;
+use std::path::Path;
+use std::sync::{Once, OnceLock};
 
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::infra::error::{CourierError, ErrorCode, Result};
 
 static INIT: Once = Once::new();
+static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
-pub fn init(default_filter: &str) -> Result<()> {
+pub fn init(default_filter: &str, log_dir: &Path) -> Result<()> {
     let mut result = Ok(());
 
     INIT.call_once(|| {
+        if let Err(err) = std::fs::create_dir_all(log_dir) {
+            result = Err(CourierError::with_source(
+                ErrorCode::LoggingInit,
+                format!("failed to create log directory {}", log_dir.display()),
+                err,
+            ));
+            return;
+        }
+
         let env_filter = EnvFilter::try_from_default_env()
             .or_else(|_| EnvFilter::try_new(default_filter))
             .unwrap_or_else(|_| EnvFilter::new("info"));
 
+        let appender = tracing_appender::rolling::daily(log_dir, "courier.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let _ = LOG_GUARD.set(guard);
+
         if let Err(err) = tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_target(false)
+            .with_ansi(false)
+            .with_writer(non_blocking)
             .compact()
             .try_init()
         {

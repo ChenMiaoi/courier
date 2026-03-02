@@ -17,8 +17,21 @@ pub struct Cli {
 pub enum Command {
     /// Start Courier TUI.
     Tui,
-    /// Initialize runtime and execute sync bootstrap.
-    Sync,
+    /// Execute mailbox sync worker.
+    Sync {
+        /// Mailbox name to sync (defaults to [source].mailbox or linux-kernel).
+        #[arg(long)]
+        mailbox: Option<String>,
+        /// Local fixture directory for offline/local test (.eml files).
+        #[arg(long, value_name = "DIR")]
+        fixture_dir: Option<PathBuf>,
+        /// Override UIDVALIDITY when using --fixture-dir.
+        #[arg(long, value_name = "N")]
+        uidvalidity: Option<u64>,
+        /// Maximum reconnect attempts for the sync loop (default 3).
+        #[arg(long, value_name = "N")]
+        reconnect_attempts: Option<u8>,
+    },
     /// Run environment diagnostics.
     Doctor,
     /// Print Courier version.

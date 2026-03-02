@@ -18,6 +18,8 @@ pub enum ErrorCode {
     B4,
     Tui,
     Command,
+    Imap,
+    MailParse,
 }
 
 impl ErrorCode {
@@ -31,6 +33,8 @@ impl ErrorCode {
             Self::B4 => "E1006",
             Self::Tui => "E1007",
             Self::Command => "E1008",
+            Self::Imap => "E1009",
+            Self::MailParse => "E1010",
         }
     }
 
@@ -43,6 +47,8 @@ impl ErrorCode {
             Self::B4 => 6,
             Self::Tui => 7,
             Self::Command => 8,
+            Self::Imap => 9,
+            Self::MailParse => 10,
         }
     }
 }

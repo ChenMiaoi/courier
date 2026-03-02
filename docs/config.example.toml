@@ -1,13 +1,25 @@
-# Courier minimal config example.
+# Courier config example (minimal).
+# Relative paths are resolved from the config file directory.
 
 [storage]
-# Relative paths are resolved from the config file directory.
-data_dir = "./data"
-database = "./data/courier.db"
+# Optional runtime root, default is ~/.courier
+# data_dir = "~/.courier"
+
+# Required to customize DB location. Default: ~/.courier/db/courier.db
+database = "./.courier/db/courier.db"
+
+# Required to customize patch file location. Default: ~/.courier/patches
+patch_dir = "./.courier/patches"
+
+[logging]
+# Required to customize log directory. Default: ~/.courier/logs
+dir = "./.courier/logs"
+filter = "info"
 
 [b4]
 # Optional. When omitted, Courier tries vendor/b4/b4.sh and then b4 in PATH.
 # path = "./vendor/b4/b4.sh"
 
-[logging]
-filter = "info"
+[source]
+# Optional lore base URL.
+# lore_base_url = "https://lore.kernel.org"

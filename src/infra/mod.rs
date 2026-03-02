@@ -3,4 +3,8 @@ pub mod bootstrap;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod imap;
 pub mod logging;
+pub mod mail_parser;
+pub mod mail_store;
+pub mod ui_state;

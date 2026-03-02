@@ -51,28 +51,40 @@ TUI 主循环，确保项目具备后续迭代基础。
 - CLI、日志、DB、b4、TUI 五条基础链路全部可演示。
 - 没有阻塞 M2 的结构性缺口（如无状态持久层抽象）。
 
-## M2：邮件读取链路（必须）
+## M2：邮件读取链路（必须，已完成）
 
 ### 阶段目标
 
-完成从 IMAP 增量同步到本地入库、解析、thread 展示的闭环，保证
-同步一致性与线程结构正确性。
+完成从同步源（lore / 本地 fixture）增量拉取到本地入库、解析、thread 展示、
+订阅驱动浏览与状态持久化的闭环，保证同步一致性与线程结构正确性。
 
-### 任务拆分
+### 已完成项
 
-1. IMAP 连接管理：认证、重连、mailbox 选择与错误分类。
-2. 同步状态管理：`UIDVALIDITY`、`last_seen_uid`、`highest_modseq`。
-3. 增量拉取：按 UID 拉取新邮件，支持 MODSEQ flag 变更。
-4. 原始邮件落盘与 RFC 5322/MIME 解析。
-5. 数据入库事务：`mail`、`mail_ref`、`thread_node` 原子写入。
-6. JWZ 风格 thread 构建与局部重建策略。
-7. TUI 列表展示：可浏览 thread，支持基础检索和定位。
+1. 同步入口：完成 `sync` 命令与 TUI 命令栏 `sync` 命令，支持
+   `--mailbox`、`--fixture-dir`、`--uidvalidity`、`--reconnect-attempts`。
+2. 同步源：实现本地 fixture 同步与 `lore.kernel.org/<mailbox>/new.atom` 抓取同步，
+   统一接入同一入库与建线程链路。
+3. checkpoint：落地并维护 `UIDVALIDITY`、`last_seen_uid`、`highest_modseq`，
+   支持断点续传与 UIDVALIDITY 变化重建。
+4. 初次窗口策略：当订阅 mailbox 数据为空时，仅保留最近 20 个 threads；
+   非空时从 checkpoint 增量更新到最新。
+5. 入库与建线程：完成 `mail` / `mail_ref` / `thread` / `thread_node` /
+   `imap_mailbox_state` 的事务写入与幂等去重。
+6. 线程模型：实现 JWZ 风格（`References` 优先，`In-Reply-To` 回退）构建与局部重建。
+7. 订阅视图：左栏内置 vger 子系统列表，支持 `y/n` 启停、启用/停用分组、
+   各组字典序、分组折叠展开。
+8. 交互与状态：`Enter` 在订阅项上打开对应 Threads；
+   若本地无数据则自动触发该订阅同步；UI 状态持久化（启用列表、分组展开状态、
+   active mailbox）并在下次启动恢复。
+9. 启动同步：进入 TUI 时自动同步已启用订阅；首次打开默认全 `n`（无启用项）。
+10. 预览链路：右栏预览隐藏 RFC 头部，清理控制字符，线程切换时清屏并重置滚动。
 
 ### 交付物
 
-- IMAP 同步 worker 与 checkpoint 机制。
-- `.eml` 样本导入工具（用于离线调试）。
-- thread 列表页（含基础层级显示）。
+- 同步 worker（fixture + lore）与 checkpoint 机制。
+- `.eml` fixture 同步路径（用于离线调试与回归）。
+- 线程列表页（层级展示、检索定位）与订阅驱动切换。
+- UI 状态持久化文件（`ui-state.toml`）与启动自动同步逻辑。
 
 ### 验收标准
 
@@ -80,11 +92,15 @@ TUI 主循环，确保项目具备后续迭代基础。
 - `UIDVALIDITY` 变化时可触发并完成 mailbox 重建。
 - 进程中断后可从 checkpoint 继续，不破坏一致性。
 - thread 展示可正确反映 `References` / `In-Reply-To` 关系。
+- 空库首次同步仅落最近 20 个 threads，后续同步按 checkpoint 增量补齐。
+- 启动 TUI 时仅同步已启用订阅；首次启动默认不启用任何订阅。
+- 订阅启用与分组折叠状态在重启后可恢复。
 
 ### 退出条件
 
 - 同步一致性测试全部通过。
 - 能稳定展示真实邮件样本中的线程结构。
+- M2 相关单元/集成测试与 `clippy -D warnings` 通过。
 
 ## M3：patch 工作流（必须）
 
