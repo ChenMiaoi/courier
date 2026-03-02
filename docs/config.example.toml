@@ -1,0 +1,13 @@
+# Courier minimal config example.
+
+[storage]
+# Relative paths are resolved from the config file directory.
+data_dir = "./data"
+database = "./data/courier.db"
+
+[b4]
+# Optional. When omitted, Courier tries vendor/b4/b4.sh and then b4 in PATH.
+# path = "./vendor/b4/b4.sh"
+
+[logging]
+filter = "info"
