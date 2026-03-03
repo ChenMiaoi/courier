@@ -439,6 +439,7 @@ mod tests {
             log_filter: "info".to_string(),
             imap_mailbox: "inbox".to_string(),
             lore_base_url: "https://lore.kernel.org".to_string(),
+            kernel_trees: Vec::new(),
         };
 
         let first = run(
@@ -510,6 +511,7 @@ mod tests {
             log_filter: "info".to_string(),
             imap_mailbox: "inbox".to_string(),
             lore_base_url: "https://lore.kernel.org".to_string(),
+            kernel_trees: Vec::new(),
         };
 
         let summary = run(

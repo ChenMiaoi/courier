@@ -21,6 +21,7 @@ pub struct RuntimeConfig {
     pub log_filter: String,
     pub imap_mailbox: String,
     pub lore_base_url: String,
+    pub kernel_trees: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -35,6 +36,8 @@ struct FileConfig {
     source: SourceConfig,
     #[serde(default)]
     imap: ImapCompatConfig,
+    #[serde(default)]
+    kernel: KernelConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -65,6 +68,13 @@ struct SourceConfig {
 #[derive(Debug, Default, Deserialize)]
 struct ImapCompatConfig {
     mailbox: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KernelConfig {
+    tree: Option<PathBuf>,
+    #[serde(default)]
+    trees: Vec<PathBuf>,
 }
 
 pub fn load(config_override: Option<&Path>) -> Result<RuntimeConfig> {
@@ -145,6 +155,17 @@ pub fn load(config_override: Option<&Path>) -> Result<RuntimeConfig> {
         .lore_base_url
         .unwrap_or_else(|| DEFAULT_LORE_BASE_URL.to_string());
 
+    let mut kernel_trees = Vec::new();
+    if let Some(tree) = file_config.kernel.tree {
+        kernel_trees.push(resolve_path(&config_base_dir, tree));
+    }
+    for tree in file_config.kernel.trees {
+        let resolved = resolve_path(&config_base_dir, tree);
+        if !kernel_trees.iter().any(|existing| existing == &resolved) {
+            kernel_trees.push(resolved);
+        }
+    }
+
     Ok(RuntimeConfig {
         config_path,
         data_dir,
@@ -156,6 +177,7 @@ pub fn load(config_override: Option<&Path>) -> Result<RuntimeConfig> {
         log_filter,
         imap_mailbox,
         lore_base_url,
+        kernel_trees,
     })
 }
 
@@ -227,6 +249,10 @@ dir = "./state/logs"
 [source]
 mailbox = "linux-kernel"
 lore_base_url = "https://lore.kernel.org"
+
+[kernel]
+tree = "./linux"
+trees = ["./linux-next"]
 "#,
         )
         .expect("write config");
@@ -242,6 +268,10 @@ lore_base_url = "https://lore.kernel.org"
         assert_eq!(loaded.log_filter, "debug");
         assert_eq!(loaded.imap_mailbox, "linux-kernel");
         assert_eq!(loaded.lore_base_url, "https://lore.kernel.org");
+        assert_eq!(
+            loaded.kernel_trees,
+            vec![base.join("./linux"), base.join("./linux-next")]
+        );
 
         let _ = fs::remove_dir_all(base);
     }

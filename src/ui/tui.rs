@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::app::sync as sync_worker;
@@ -83,6 +83,9 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
 
 const PALETTE_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
 const PREVIEW_TAB_SPACES: &str = "    ";
+const KERNEL_TREE_MAX_ROWS: usize = 2048;
+const CODE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
+const CODE_PREVIEW_MAX_LINES: usize = 800;
 
 #[derive(Debug, Default)]
 struct CommandPaletteState {
@@ -117,12 +120,105 @@ struct SubscriptionRow {
     text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiPage {
+    Mail,
+    CodeBrowser,
+}
+
+impl UiPage {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Mail => Self::CodeBrowser,
+            Self::CodeBrowser => Self::Mail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodePaneFocus {
+    Tree,
+    Source,
+}
+
+impl CodePaneFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Tree => Self::Source,
+            Self::Source => Self::Tree,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Tree => Self::Source,
+            Self::Source => Self::Tree,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelTreeRowKind {
+    RootDirectory,
+    Directory,
+    File,
+    RootFile,
+    MissingPath,
+}
+
+#[derive(Debug, Clone)]
+struct KernelTreeRow {
+    path: PathBuf,
+    name: String,
+    depth: usize,
+    kind: KernelTreeRowKind,
+    expandable: bool,
+    expanded: bool,
+}
+
+impl KernelTreeRow {
+    fn is_file(&self) -> bool {
+        matches!(
+            self.kind,
+            KernelTreeRowKind::File | KernelTreeRowKind::RootFile
+        )
+    }
+
+    fn display_text(&self) -> String {
+        match self.kind {
+            KernelTreeRowKind::RootDirectory => {
+                let marker = if self.expandable {
+                    if self.expanded { "▼" } else { "▶" }
+                } else {
+                    "•"
+                };
+                format!("{marker} [root] {}", self.path.display())
+            }
+            KernelTreeRowKind::Directory => {
+                let marker = if self.expandable {
+                    if self.expanded { "▼" } else { "▶" }
+                } else {
+                    "•"
+                };
+                format!("{}{} {}/", "  ".repeat(self.depth), marker, self.name)
+            }
+            KernelTreeRowKind::File => {
+                format!("{}  {}", "  ".repeat(self.depth), self.name)
+            }
+            KernelTreeRowKind::RootFile => format!("[file] {}", self.path.display()),
+            KernelTreeRowKind::MissingPath => format!("[missing] {}", self.path.display()),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AppState {
     runtime: RuntimeConfig,
     ui_state_path: PathBuf,
     active_thread_mailbox: String,
+    ui_page: UiPage,
     focus: Pane,
+    code_focus: CodePaneFocus,
     subscriptions: Vec<SubscriptionItem>,
     enabled_group_expanded: bool,
     disabled_group_expanded: bool,
@@ -130,6 +226,10 @@ struct AppState {
     filtered_thread_indices: Vec<usize>,
     subscription_index: usize,
     subscription_row_index: usize,
+    kernel_tree_rows: Vec<KernelTreeRow>,
+    kernel_tree_expanded_paths: HashSet<PathBuf>,
+    kernel_tree_row_index: usize,
+    code_preview_scroll: u16,
     thread_index: usize,
     preview_scroll: u16,
     started_at: Instant,
@@ -166,11 +266,16 @@ impl AppState {
             &enabled_mailboxes,
             Some(active_thread_mailbox.as_str()),
         );
+        let kernel_tree_expanded_paths = default_kernel_tree_expanded_paths(&runtime.kernel_trees);
+        let kernel_tree_rows =
+            build_kernel_tree_rows(&runtime.kernel_trees, &kernel_tree_expanded_paths);
         let mut state = Self {
             active_thread_mailbox,
             runtime,
             ui_state_path,
+            ui_page: UiPage::Mail,
             focus: Pane::Subscriptions,
+            code_focus: CodePaneFocus::Tree,
             subscriptions,
             enabled_group_expanded: persisted
                 .as_ref()
@@ -184,6 +289,10 @@ impl AppState {
             filtered_thread_indices: Vec::new(),
             subscription_index: 0,
             subscription_row_index: 0,
+            kernel_tree_rows,
+            kernel_tree_expanded_paths,
+            kernel_tree_row_index: 0,
+            code_preview_scroll: 0,
             thread_index: 0,
             preview_scroll: 0,
             started_at: Instant::now(),
@@ -524,72 +633,219 @@ impl AppState {
             .and_then(|index| self.threads.get(*index))
     }
 
-    fn move_focus_next(&mut self) {
-        self.focus = self.focus.next();
+    fn selected_kernel_tree_row(&self) -> Option<&KernelTreeRow> {
+        self.kernel_tree_rows.get(
+            self.kernel_tree_row_index
+                .min(self.kernel_tree_rows.len().saturating_sub(1)),
+        )
     }
 
-    fn move_focus_previous(&mut self) {
-        self.focus = self.focus.previous();
+    fn selected_kernel_tree_path(&self) -> Option<PathBuf> {
+        self.selected_kernel_tree_row().map(|row| row.path.clone())
     }
 
-    fn move_up(&mut self) {
-        match self.focus {
-            Pane::Subscriptions => {
-                let rows = self.subscription_rows();
-                if rows.is_empty() {
-                    return;
-                }
-                if self.subscription_row_index >= rows.len() {
-                    self.subscription_row_index = rows.len().saturating_sub(1);
-                }
-                if self.subscription_row_index > 0 {
-                    self.subscription_row_index -= 1;
-                }
-                if let Some(SubscriptionRowKind::Item(index)) =
-                    rows.get(self.subscription_row_index).map(|row| row.kind)
-                {
-                    self.subscription_index = index;
-                }
+    fn selected_kernel_tree_file_path(&self) -> Option<&Path> {
+        self.selected_kernel_tree_row()
+            .filter(|row| row.is_file())
+            .map(|row| row.path.as_path())
+    }
+
+    fn refresh_kernel_tree_rows(&mut self, selected_path_hint: Option<&Path>) {
+        self.kernel_tree_rows =
+            build_kernel_tree_rows(&self.runtime.kernel_trees, &self.kernel_tree_expanded_paths);
+        if self.kernel_tree_rows.is_empty() {
+            self.kernel_tree_row_index = 0;
+            return;
+        }
+
+        if let Some(path) = selected_path_hint
+            && let Some(index) = self
+                .kernel_tree_rows
+                .iter()
+                .position(|row| row.path == path)
+        {
+            self.kernel_tree_row_index = index;
+            return;
+        }
+
+        if self.kernel_tree_row_index >= self.kernel_tree_rows.len() {
+            self.kernel_tree_row_index = self.kernel_tree_rows.len().saturating_sub(1);
+        }
+    }
+
+    fn supports_code_browser(&self) -> bool {
+        !self.runtime.kernel_trees.is_empty()
+    }
+
+    fn toggle_ui_page(&mut self) {
+        if matches!(self.ui_page, UiPage::Mail) && !self.supports_code_browser() {
+            self.status =
+                "no kernel tree configured; set [kernel].tree or [kernel].trees".to_string();
+            return;
+        }
+
+        self.ui_page = self.ui_page.toggled();
+        match self.ui_page {
+            UiPage::Mail => {
+                self.status = "switched to mail page".to_string();
             }
-            Pane::Threads => {
-                if self.thread_index > 0 {
-                    self.thread_index -= 1;
-                    self.preview_scroll = 0;
-                }
-            }
-            Pane::Preview => {
-                self.preview_scroll = self.preview_scroll.saturating_sub(1);
+            UiPage::CodeBrowser => {
+                self.refresh_kernel_tree_rows(self.selected_kernel_tree_path().as_deref());
+                self.code_preview_scroll = 0;
+                self.status = "switched to code browser page".to_string();
             }
         }
     }
 
+    fn move_subscription_up(&mut self) {
+        let rows = self.subscription_rows();
+        if rows.is_empty() {
+            return;
+        }
+        if self.subscription_row_index >= rows.len() {
+            self.subscription_row_index = rows.len().saturating_sub(1);
+        }
+        if self.subscription_row_index > 0 {
+            self.subscription_row_index -= 1;
+        }
+        if let Some(SubscriptionRowKind::Item(index)) =
+            rows.get(self.subscription_row_index).map(|row| row.kind)
+        {
+            self.subscription_index = index;
+        }
+    }
+
+    fn move_subscription_down(&mut self) {
+        let rows = self.subscription_rows();
+        if rows.is_empty() {
+            return;
+        }
+        if self.subscription_row_index >= rows.len() {
+            self.subscription_row_index = rows.len().saturating_sub(1);
+        } else if self.subscription_row_index + 1 < rows.len() {
+            self.subscription_row_index += 1;
+        }
+        if let Some(SubscriptionRowKind::Item(index)) =
+            rows.get(self.subscription_row_index).map(|row| row.kind)
+        {
+            self.subscription_index = index;
+        }
+    }
+
+    fn move_kernel_tree_up(&mut self) {
+        let previous_file = self.selected_kernel_tree_file_path().map(Path::to_path_buf);
+        if self.kernel_tree_row_index > 0 {
+            self.kernel_tree_row_index -= 1;
+        }
+        let next_file = self.selected_kernel_tree_file_path().map(Path::to_path_buf);
+        if previous_file != next_file {
+            self.code_preview_scroll = 0;
+        }
+    }
+
+    fn move_kernel_tree_down(&mut self) {
+        let previous_file = self.selected_kernel_tree_file_path().map(Path::to_path_buf);
+        if self.kernel_tree_row_index + 1 < self.kernel_tree_rows.len() {
+            self.kernel_tree_row_index += 1;
+        }
+        let next_file = self.selected_kernel_tree_file_path().map(Path::to_path_buf);
+        if previous_file != next_file {
+            self.code_preview_scroll = 0;
+        }
+    }
+
+    fn handle_kernel_tree_enter(&mut self) {
+        let Some(row) = self.selected_kernel_tree_row().cloned() else {
+            self.status = "kernel tree is empty".to_string();
+            return;
+        };
+
+        if !row.expandable {
+            self.code_preview_scroll = 0;
+            self.status = format!("selected {}", row.path.display());
+            return;
+        }
+
+        if row.expanded {
+            self.kernel_tree_expanded_paths.remove(&row.path);
+            self.status = format!("collapsed {}", row.path.display());
+        } else {
+            self.kernel_tree_expanded_paths.insert(row.path.clone());
+            self.status = format!("expanded {}", row.path.display());
+        }
+        self.refresh_kernel_tree_rows(Some(&row.path));
+        self.code_preview_scroll = 0;
+    }
+
+    fn move_focus_next(&mut self) {
+        match self.ui_page {
+            UiPage::Mail => {
+                self.focus = self.focus.next();
+            }
+            UiPage::CodeBrowser => {
+                self.code_focus = self.code_focus.next();
+            }
+        }
+    }
+
+    fn move_focus_previous(&mut self) {
+        match self.ui_page {
+            UiPage::Mail => {
+                self.focus = self.focus.previous();
+            }
+            UiPage::CodeBrowser => {
+                self.code_focus = self.code_focus.previous();
+            }
+        }
+    }
+
+    fn move_up(&mut self) {
+        match self.ui_page {
+            UiPage::Mail => match self.focus {
+                Pane::Subscriptions => {
+                    self.move_subscription_up();
+                }
+                Pane::Threads => {
+                    if self.thread_index > 0 {
+                        self.thread_index -= 1;
+                        self.preview_scroll = 0;
+                    }
+                }
+                Pane::Preview => {
+                    self.preview_scroll = self.preview_scroll.saturating_sub(1);
+                }
+            },
+            UiPage::CodeBrowser => match self.code_focus {
+                CodePaneFocus::Tree => self.move_kernel_tree_up(),
+                CodePaneFocus::Source => {
+                    self.code_preview_scroll = self.code_preview_scroll.saturating_sub(1);
+                }
+            },
+        }
+    }
+
     fn move_down(&mut self) {
-        match self.focus {
-            Pane::Subscriptions => {
-                let rows = self.subscription_rows();
-                if rows.is_empty() {
-                    return;
+        match self.ui_page {
+            UiPage::Mail => match self.focus {
+                Pane::Subscriptions => {
+                    self.move_subscription_down();
                 }
-                if self.subscription_row_index >= rows.len() {
-                    self.subscription_row_index = rows.len().saturating_sub(1);
-                } else if self.subscription_row_index + 1 < rows.len() {
-                    self.subscription_row_index += 1;
+                Pane::Threads => {
+                    if self.thread_index + 1 < self.filtered_thread_indices.len() {
+                        self.thread_index += 1;
+                        self.preview_scroll = 0;
+                    }
                 }
-                if let Some(SubscriptionRowKind::Item(index)) =
-                    rows.get(self.subscription_row_index).map(|row| row.kind)
-                {
-                    self.subscription_index = index;
+                Pane::Preview => {
+                    self.preview_scroll = self.preview_scroll.saturating_add(1);
                 }
-            }
-            Pane::Threads => {
-                if self.thread_index + 1 < self.filtered_thread_indices.len() {
-                    self.thread_index += 1;
-                    self.preview_scroll = 0;
+            },
+            UiPage::CodeBrowser => match self.code_focus {
+                CodePaneFocus::Tree => self.move_kernel_tree_down(),
+                CodePaneFocus::Source => {
+                    self.code_preview_scroll = self.code_preview_scroll.saturating_add(1);
                 }
-            }
-            Pane::Preview => {
-                self.preview_scroll = self.preview_scroll.saturating_add(1);
-            }
+            },
         }
     }
 
@@ -754,32 +1010,46 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
 
     match key.code {
         KeyCode::Char('/') => {
-            state.open_search();
+            if matches!(state.ui_page, UiPage::Mail) {
+                state.open_search();
+            } else {
+                state.status = "search is only available on mail page".to_string();
+            }
         }
         KeyCode::Char(character)
-            if matches!(state.focus, Pane::Subscriptions)
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Subscriptions)
                 && character.eq_ignore_ascii_case(&'y') =>
         {
             state.set_current_subscription_enabled(true);
         }
         KeyCode::Char(character)
-            if matches!(state.focus, Pane::Subscriptions)
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Subscriptions)
                 && character.eq_ignore_ascii_case(&'n') =>
         {
             state.set_current_subscription_enabled(false);
         }
+        KeyCode::Tab => state.toggle_ui_page(),
         KeyCode::Char('j') => state.move_focus_previous(),
         KeyCode::Char('l') => state.move_focus_next(),
         KeyCode::Char('i') => state.move_up(),
         KeyCode::Char('k') => state.move_down(),
-        KeyCode::Enter => match state.focus {
-            Pane::Subscriptions => state.handle_subscription_enter(),
-            Pane::Threads => {
-                if let Some(thread) = state.selected_thread() {
-                    state.status = format!("selected {}", thread.message_id);
+        KeyCode::Enter => match state.ui_page {
+            UiPage::Mail => match state.focus {
+                Pane::Subscriptions => state.handle_subscription_enter(),
+                Pane::Threads => {
+                    if let Some(thread) = state.selected_thread() {
+                        state.status = format!("selected {}", thread.message_id);
+                    }
+                }
+                Pane::Preview => {}
+            },
+            UiPage::CodeBrowser => {
+                if matches!(state.code_focus, CodePaneFocus::Tree) {
+                    state.handle_kernel_tree_enter();
                 }
             }
-            Pane::Preview => {}
         },
         KeyCode::Esc => {
             state.status = "open command palette with : (preferred) or Ctrl+`".to_string();
@@ -997,8 +1267,13 @@ fn draw(
         .split(frame.area());
 
     let uptime = state.started_at.elapsed().as_secs();
+    let page_label = match state.ui_page {
+        UiPage::Mail => "mail",
+        UiPage::CodeBrowser => "code",
+    };
     let header = format!(
-        "mailbox: {} | db schema: {} | db: {} | threads: {} | uptime: {}s",
+        "page: {} | mailbox: {} | db schema: {} | db: {} | threads: {} | uptime: {}s",
+        page_label,
         state.active_thread_mailbox,
         bootstrap.db.schema_version,
         bootstrap.db.path.display(),
@@ -1016,14 +1291,27 @@ fn draw(
             Constraint::Percentage(35),
             Constraint::Percentage(40),
         ])
-        .split(areas[1]);
+        .split(areas[1]); // placeholder layout to keep ratios on mail page
 
-    draw_subscriptions(frame, panes[0], state);
-    draw_threads(frame, panes[1], state);
-    draw_preview(frame, panes[2], state, config);
+    match state.ui_page {
+        UiPage::Mail => {
+            draw_subscriptions(frame, panes[0], state);
+            draw_threads(frame, panes[1], state);
+            draw_preview(frame, panes[2], state, config);
+        }
+        UiPage::CodeBrowser => {
+            draw_code_browser_page(frame, areas[1], state);
+        }
+    }
 
-    let shortcuts_text =
-        "/ search | : palette | j/l focus | i/k move | y/n enable | Enter open/toggle";
+    let shortcuts_text = match state.ui_page {
+        UiPage::Mail => {
+            "/ search | Tab page | : palette | j/l focus | i/k move | y/n enable | Enter open/toggle"
+        }
+        UiPage::CodeBrowser => {
+            "Tab page | : palette | j/l focus | i/k move/scroll | Enter expand/collapse"
+        }
+    };
     let footer_sections = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -1048,6 +1336,16 @@ fn draw(
     if state.search.active {
         draw_search_overlay(frame, state);
     }
+}
+
+fn draw_code_browser_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(area);
+
+    draw_kernel_tree(frame, panes[0], state);
+    draw_code_source_preview(frame, panes[1], state);
 }
 
 fn draw_subscriptions(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -1080,6 +1378,53 @@ fn draw_subscriptions(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
+fn draw_kernel_tree(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let block = panel_block_with_title("Kernel Tree", state.code_focus == CodePaneFocus::Tree);
+    let items: Vec<ListItem> = if state.kernel_tree_rows.is_empty() {
+        vec![ListItem::new(
+            "<no files found under configured kernel trees>",
+        )]
+    } else {
+        state
+            .kernel_tree_rows
+            .iter()
+            .map(|row| ListItem::new(row.display_text()))
+            .collect()
+    };
+
+    let selected_row = if state.kernel_tree_rows.is_empty() {
+        None
+    } else {
+        Some(
+            state
+                .kernel_tree_row_index
+                .min(state.kernel_tree_rows.len().saturating_sub(1)),
+        )
+    };
+
+    let mut list_state = ListState::default();
+    list_state.select(selected_row);
+
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn draw_code_source_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let block = panel_block_with_title("Source Preview", state.code_focus == CodePaneFocus::Source);
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Clear, inner_area);
+
+    let paragraph =
+        Paragraph::new(load_code_source_preview(state)).scroll((state.code_preview_scroll, 0));
+    frame.render_widget(paragraph, inner_area);
+}
+
 fn subscription_line(item: &SubscriptionItem) -> String {
     let marker = if item.enabled { "y" } else { "n" };
     format!(
@@ -1088,6 +1433,176 @@ fn subscription_line(item: &SubscriptionItem) -> String {
         item.description,
         lore_archive_url(&item.mailbox)
     )
+}
+
+fn default_kernel_tree_expanded_paths(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
+    root_paths
+        .iter()
+        .filter(|path| path.exists() && path.is_dir())
+        .cloned()
+        .collect()
+}
+
+fn build_kernel_tree_rows(
+    root_paths: &[PathBuf],
+    expanded_paths: &HashSet<PathBuf>,
+) -> Vec<KernelTreeRow> {
+    let mut rows = Vec::new();
+    for root in root_paths {
+        if rows.len() >= KERNEL_TREE_MAX_ROWS {
+            break;
+        }
+
+        if !root.exists() {
+            rows.push(KernelTreeRow {
+                path: root.clone(),
+                name: String::new(),
+                depth: 0,
+                kind: KernelTreeRowKind::MissingPath,
+                expandable: false,
+                expanded: false,
+            });
+            continue;
+        }
+
+        if !root.is_dir() {
+            rows.push(KernelTreeRow {
+                path: root.clone(),
+                name: root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| root.display().to_string()),
+                depth: 0,
+                kind: KernelTreeRowKind::RootFile,
+                expandable: false,
+                expanded: false,
+            });
+            continue;
+        }
+
+        let has_children = has_child_entries(root);
+        let is_expanded = expanded_paths.contains(root);
+        rows.push(KernelTreeRow {
+            path: root.clone(),
+            name: root
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.display().to_string()),
+            depth: 0,
+            kind: KernelTreeRowKind::RootDirectory,
+            expandable: has_children,
+            expanded: has_children && is_expanded,
+        });
+
+        if has_children && is_expanded {
+            append_kernel_tree_rows(root, 1, expanded_paths, &mut rows);
+        }
+    }
+    rows
+}
+
+fn append_kernel_tree_rows(
+    directory: &Path,
+    depth: usize,
+    expanded_paths: &HashSet<PathBuf>,
+    rows: &mut Vec<KernelTreeRow>,
+) {
+    if rows.len() >= KERNEL_TREE_MAX_ROWS {
+        return;
+    }
+
+    let children = child_entries(directory);
+    for child in children {
+        if rows.len() >= KERNEL_TREE_MAX_ROWS {
+            break;
+        }
+
+        if child.is_dir() {
+            let has_children = has_child_entries(&child);
+            let is_expanded = expanded_paths.contains(&child);
+            let name = child
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| child.display().to_string());
+            rows.push(KernelTreeRow {
+                path: child.clone(),
+                name,
+                depth,
+                kind: KernelTreeRowKind::Directory,
+                expandable: has_children,
+                expanded: has_children && is_expanded,
+            });
+
+            if has_children && is_expanded {
+                append_kernel_tree_rows(&child, depth + 1, expanded_paths, rows);
+            }
+            continue;
+        }
+
+        let name = child
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| child.display().to_string());
+        rows.push(KernelTreeRow {
+            path: child,
+            name,
+            depth,
+            kind: KernelTreeRowKind::File,
+            expandable: false,
+            expanded: false,
+        });
+    }
+}
+
+fn child_entries(path: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            dirs.push(child);
+        } else if child.is_file() {
+            files.push(child);
+        }
+    }
+    dirs.sort_by(|left, right| {
+        left.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .cmp(
+                &right
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string()),
+            )
+    });
+    files.sort_by(|left, right| {
+        left.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .cmp(
+                &right
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string()),
+            )
+    });
+    dirs.extend(files);
+    dirs
+}
+
+fn has_child_entries(path: &Path) -> bool {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() || child.is_file() {
+            return true;
+        }
+    }
+    false
 }
 
 fn default_subscriptions(
@@ -1250,6 +1765,67 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
     frame.render_widget(paragraph, inner_area);
 }
 
+fn load_code_source_preview(state: &AppState) -> String {
+    if !state.supports_code_browser() {
+        return "No kernel tree configured.\n\nSet [kernel].tree or [kernel].trees in config."
+            .to_string();
+    }
+
+    let Some(row) = state.selected_kernel_tree_row() else {
+        return "<kernel tree is empty>".to_string();
+    };
+
+    match row.kind {
+        KernelTreeRowKind::File | KernelTreeRowKind::RootFile => {
+            load_source_file_preview(&row.path)
+        }
+        KernelTreeRowKind::MissingPath => {
+            format!("<missing path>\n\n{}", row.path.display())
+        }
+        KernelTreeRowKind::RootDirectory | KernelTreeRowKind::Directory => format!(
+            "Directory: {}\n\nSelect a file in the tree to preview source content.",
+            row.path.display()
+        ),
+    }
+}
+
+fn load_source_file_preview(path: &Path) -> String {
+    let content = match fs::read(path) {
+        Ok(value) => value,
+        Err(error) => return format!("<failed to read {}: {}>", path.display(), error),
+    };
+
+    let truncated_by_bytes = content.len() > CODE_PREVIEW_MAX_BYTES;
+    let content_slice = if truncated_by_bytes {
+        &content[..CODE_PREVIEW_MAX_BYTES]
+    } else {
+        content.as_slice()
+    };
+
+    let text = String::from_utf8_lossy(content_slice)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let sanitized = sanitize_source_preview_text(&text);
+    let mut source_lines = sanitized.lines();
+    let mut lines = Vec::new();
+    for line in source_lines.by_ref().take(CODE_PREVIEW_MAX_LINES) {
+        lines.push(line);
+    }
+    let truncated_by_lines = source_lines.next().is_some();
+
+    let body = if lines.is_empty() {
+        "<empty file>".to_string()
+    } else {
+        lines.join("\n")
+    };
+
+    let mut preview = format!("File: {}\n\n{}", path.display(), body);
+    if truncated_by_bytes || truncated_by_lines {
+        preview.push_str("\n\n<truncated preview>");
+    }
+    preview
+}
+
 fn load_mail_body_preview(path: Option<&PathBuf>) -> String {
     let Some(path) = path else {
         return "<raw mail file unavailable>".to_string();
@@ -1296,6 +1872,18 @@ fn sanitize_preview_text(input: &str) -> String {
         match character {
             '\n' => sanitized.push('\n'),
             '\t' => sanitized.push_str(PREVIEW_TAB_SPACES),
+            _ if character.is_control() => {}
+            _ => sanitized.push(character),
+        }
+    }
+    sanitized
+}
+
+fn sanitize_source_preview_text(input: &str) -> String {
+    let mut sanitized = String::with_capacity(input.len());
+    for character in input.chars() {
+        match character {
+            '\n' | '\t' => sanitized.push(character),
             _ if character.is_control() => {}
             _ => sanitized.push(character),
         }
@@ -1479,10 +2067,14 @@ fn matching_commands(input: &str) -> Vec<&'static PaletteCommand> {
 
 fn panel_block(panel: Pane, focus: Pane) -> Block<'static> {
     let is_focused = panel == focus;
-    let title = if is_focused {
-        format!("{} *", panel.title())
+    panel_block_with_title(panel.title(), is_focused)
+}
+
+fn panel_block_with_title(title: &str, is_focused: bool) -> Block<'static> {
+    let decorated_title = if is_focused {
+        format!("{title} *")
     } else {
-        panel.title().to_string()
+        title.to_string()
     };
 
     let border_style = if is_focused {
@@ -1494,7 +2086,7 @@ fn panel_block(panel: Pane, focus: Pane) -> Block<'static> {
     };
 
     Block::default()
-        .title(title)
+        .title(decorated_title)
         .borders(Borders::ALL)
         .border_style(border_style)
 }
@@ -1525,8 +2117,8 @@ mod tests {
     use crate::infra::mail_store::ThreadRow;
 
     use super::{
-        AppState, LoopAction, Pane, draw, extract_mail_body_preview, handle_key_event,
-        is_palette_open_shortcut, is_palette_toggle, matching_commands,
+        AppState, LoopAction, Pane, UiPage, draw, extract_mail_body_preview, handle_key_event,
+        is_palette_open_shortcut, is_palette_toggle, load_source_file_preview, matching_commands,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1605,7 +2197,14 @@ mod tests {
             log_filter: "info".to_string(),
             imap_mailbox: "inbox".to_string(),
             lore_base_url: "https://lore.kernel.org".to_string(),
+            kernel_trees: Vec::new(),
         }
+    }
+
+    fn test_runtime_with_kernel_tree(tree: PathBuf) -> RuntimeConfig {
+        let mut runtime = test_runtime();
+        runtime.kernel_trees = vec![tree];
+        runtime
     }
 
     fn test_bootstrap(runtime: &RuntimeConfig) -> BootstrapState {
@@ -1664,6 +2263,109 @@ mod tests {
         let action = handle_key_event(&mut state, key);
         assert!(matches!(action, LoopAction::Continue));
         assert!(state.palette.open);
+    }
+
+    #[test]
+    fn tab_toggles_between_mail_page_and_code_browser_page() {
+        let tree_root = temp_dir("kernel-tree-tab");
+        fs::create_dir_all(tree_root.join("io_uring")).expect("create kernel dir");
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+
+        assert!(matches!(state.ui_page, UiPage::Mail));
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(state.ui_page, UiPage::Mail));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn kernel_tree_enter_expands_and_collapses_selected_directory() {
+        let tree_root = temp_dir("kernel-tree-expand");
+        let dir_a = tree_root.join("a");
+        let dir_b = dir_a.join("b");
+        let dir_c = tree_root.join("c");
+        fs::create_dir_all(&dir_b).expect("create nested directory");
+        fs::create_dir_all(&dir_c).expect("create sibling directory");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+        let index_a = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == dir_a)
+            .expect("directory a row exists");
+        state.kernel_tree_row_index = index_a;
+        assert!(state.kernel_tree_rows[index_a].expandable);
+        assert!(!state.kernel_tree_rows.iter().any(|row| row.path == dir_b));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state.kernel_tree_rows.iter().any(|row| row.path == dir_b));
+
+        let index_a_after_expand = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == dir_a)
+            .expect("directory a row exists after expand");
+        state.kernel_tree_row_index = index_a_after_expand;
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!state.kernel_tree_rows.iter().any(|row| row.path == dir_b));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn kernel_tree_lists_files_and_source_preview_preserves_indentation() {
+        let tree_root = temp_dir("kernel-tree-files");
+        let dir_a = tree_root.join("a");
+        let file_path = dir_a.join("demo.c");
+        fs::create_dir_all(&dir_a).expect("create directory");
+        fs::write(
+            &file_path,
+            "fn demo() {\n\tif true {\n        return;\n\t}\n}\n",
+        )
+        .expect("write source file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+        let index_a = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == dir_a)
+            .expect("directory a row exists");
+        state.kernel_tree_row_index = index_a;
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("file row exists");
+        state.kernel_tree_row_index = file_index;
+
+        let preview = load_source_file_preview(&file_path);
+        assert!(preview.contains("\tif true {"));
+        assert!(preview.contains("        return;"));
+
+        let _ = fs::remove_dir_all(tree_root);
     }
 
     #[test]

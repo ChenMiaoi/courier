@@ -23,3 +23,10 @@ filter = "info"
 [source]
 # Optional lore base URL.
 # lore_base_url = "https://lore.kernel.org"
+
+[kernel]
+# Optional. Single kernel tree root path shown in left pane tree view (Tab toggles).
+# tree = "/path/to/linux"
+
+# Optional. Multiple kernel tree roots; each appears as a top-level root in tree view.
+# trees = ["/path/to/linux", "/path/to/linux-next"]

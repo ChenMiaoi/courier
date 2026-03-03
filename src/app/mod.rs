@@ -80,6 +80,13 @@ pub fn run() -> Result<()> {
             println!("  log_dir: {}", runtime.log_dir.display());
             println!("  imap_mailbox: {}", runtime.imap_mailbox);
             println!("  lore_base_url: {}", runtime.lore_base_url);
+            if runtime.kernel_trees.is_empty() {
+                println!("  kernel_trees: <none>");
+            } else {
+                for tree in &runtime.kernel_trees {
+                    println!("  kernel_tree: {}", tree.display());
+                }
+            }
             println!("  schema_version: {}", bootstrap_state.db.schema_version);
             println!(
                 "  schema_version_expected: {}",
