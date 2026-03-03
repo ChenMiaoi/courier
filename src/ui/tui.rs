@@ -82,6 +82,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
 ];
 
 const PALETTE_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
+const PREVIEW_TAB_SPACES: &str = "    ";
 
 #[derive(Debug, Default)]
 struct CommandPaletteState {
@@ -1191,8 +1192,6 @@ fn thread_line(row: &ThreadRow) -> String {
 }
 
 fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &RuntimeConfig) {
-    frame.render_widget(Clear, area);
-
     let preview = if let Some(thread) = state.selected_thread() {
         let subject = if thread.subject.trim().is_empty() {
             "(no subject)"
@@ -1212,12 +1211,16 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         )
     };
 
-    let paragraph = Paragraph::new(preview)
-        .block(panel_block(Pane::Preview, state.focus))
-        .scroll((state.preview_scroll, 0))
-        .wrap(Wrap { trim: true });
+    let block = panel_block(Pane::Preview, state.focus);
+    let inner_area = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Clear, inner_area);
 
-    frame.render_widget(paragraph, area);
+    let paragraph = Paragraph::new(preview)
+        .scroll((state.preview_scroll, 0))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, inner_area);
 }
 
 fn load_mail_body_preview(path: Option<&PathBuf>) -> String {
@@ -1261,10 +1264,16 @@ fn extract_mail_body_preview(raw: &[u8]) -> String {
 }
 
 fn sanitize_preview_text(input: &str) -> String {
-    input
-        .chars()
-        .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
-        .collect()
+    let mut sanitized = String::with_capacity(input.len());
+    for character in input.chars() {
+        match character {
+            '\n' => sanitized.push('\n'),
+            '\t' => sanitized.push_str(PREVIEW_TAB_SPACES),
+            _ if character.is_control() => {}
+            _ => sanitized.push(character),
+        }
+    }
+    sanitized
 }
 
 fn strip_first_mime_part_headers(body: &str) -> String {
@@ -1831,8 +1840,9 @@ mod tests {
         let preview = extract_mail_body_preview(raw);
         assert!(!preview.contains('\u{001b}'));
         assert!(!preview.contains('\u{0007}'));
+        assert!(!preview.contains('\t'));
         assert!(preview.contains("line1"));
-        assert!(preview.contains("line2\tok"));
+        assert!(preview.contains("line2    ok"));
     }
 
     #[test]
@@ -1880,6 +1890,40 @@ mod tests {
         let second_frame = format!("{}", terminal.backend());
         assert!(!second_frame.contains("STALE_PREVIEW_TOKEN_123456"));
         assert!(second_frame.contains("short"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_render_preserves_code_indentation() {
+        let root = temp_dir("preview-indent");
+        let raw = root.join("indent.eml");
+
+        fs::write(
+            &raw,
+            b"Message-ID: <indent@example.com>\r\nSubject: indent\r\nFrom: a@example.com\r\n\r\nfn demo() {\n\tif true {\n        return;\n\t}\n}\n",
+        )
+        .expect("write raw mail");
+
+        let runtime = test_runtime();
+        let bootstrap = test_bootstrap(&runtime);
+        let state = AppState::new(
+            vec![sample_thread_with_raw(
+                "indent",
+                "indent@example.com",
+                0,
+                raw.clone(),
+            )],
+            runtime.clone(),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+            .expect("draw frame");
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("    if true {"));
+        assert!(rendered.contains("        return;"));
 
         let _ = fs::remove_dir_all(root);
     }
