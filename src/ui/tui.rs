@@ -64,6 +64,12 @@ struct PaletteCommand {
     description: &'static str,
 }
 
+#[derive(Debug, Clone)]
+struct PaletteSuggestion {
+    value: String,
+    description: Option<String>,
+}
+
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "quit",
@@ -92,11 +98,51 @@ const PREVIEW_TAB_SPACES: &str = "    ";
 const KERNEL_TREE_MAX_ROWS: usize = 2048;
 const CODE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 const CODE_PREVIEW_MAX_LINES: usize = 800;
+const CONFIG_GET_KEYS: &[&str] = &[
+    "config.path",
+    "storage.data_dir",
+    "storage.database",
+    "storage.raw_mail_dir",
+    "storage.patch_dir",
+    "logging.dir",
+    "logging.filter",
+    "b4.path",
+    "source.mailbox",
+    "imap.mailbox",
+    "source.lore_base_url",
+    "kernel.tree",
+    "kernel.trees",
+];
+const CONFIG_SET_KEYS: &[&str] = &[
+    "storage.data_dir",
+    "storage.database",
+    "storage.raw_mail_dir",
+    "storage.patch_dir",
+    "logging.dir",
+    "logging.filter",
+    "b4.path",
+    "source.mailbox",
+    "imap.mailbox",
+    "source.lore_base_url",
+    "kernel.tree",
+    "kernel.trees",
+];
 
 #[derive(Debug, Default)]
 struct CommandPaletteState {
     open: bool,
     input: String,
+    suggestions: Vec<PaletteSuggestion>,
+    show_suggestions: bool,
+    last_tab_input: String,
+}
+
+impl CommandPaletteState {
+    fn clear_completion(&mut self) {
+        self.suggestions.clear();
+        self.show_suggestions = false;
+        self.last_tab_input.clear();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -877,9 +923,11 @@ impl AppState {
     fn toggle_palette(&mut self) {
         self.palette.open = !self.palette.open;
         if self.palette.open {
+            self.palette.clear_completion();
             self.status = "command palette opened".to_string();
         } else {
             self.palette.input.clear();
+            self.palette.clear_completion();
             self.status = "command palette closed".to_string();
         }
     }
@@ -887,6 +935,7 @@ impl AppState {
     fn close_palette(&mut self) {
         self.palette.open = false;
         self.palette.input.clear();
+        self.palette.clear_completion();
         self.status = "command palette closed".to_string();
     }
 }
@@ -1100,6 +1149,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         KeyCode::Enter => {
             let command = state.palette.input.trim().to_ascii_lowercase();
             state.palette.input.clear();
+            state.palette.clear_completion();
 
             if command.is_empty() {
                 state.status = "empty command".to_string();
@@ -1125,6 +1175,10 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         }
         KeyCode::Backspace => {
             state.palette.input.pop();
+            state.palette.clear_completion();
+        }
+        KeyCode::Tab => {
+            apply_palette_completion(state);
         }
         KeyCode::Char(character)
             if !key
@@ -1132,6 +1186,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) =>
         {
             state.palette.input.push(character);
+            state.palette.clear_completion();
         }
         _ => {}
     }
@@ -1478,6 +1533,310 @@ fn effective_config_value(state: &AppState, key: &str) -> Option<String> {
             .map(|path| path.display().to_string()),
         _ => None,
     }
+}
+
+fn apply_palette_completion(state: &mut AppState) {
+    let input_before_completion = state.palette.input.clone();
+    let context = parse_palette_completion_context(&state.palette.input);
+    let mut suggestions = palette_completion_suggestions(state, &context);
+    let prefix_lower = context.active_token.to_ascii_lowercase();
+    suggestions.retain(|suggestion| {
+        suggestion
+            .value
+            .to_ascii_lowercase()
+            .starts_with(&prefix_lower)
+    });
+    suggestions.sort_by(|left, right| left.value.cmp(&right.value));
+    suggestions.dedup_by(|left, right| left.value == right.value);
+
+    if suggestions.is_empty() {
+        state.palette.clear_completion();
+        state.status = "no completion candidates".to_string();
+        return;
+    }
+
+    let completion_values: Vec<String> = suggestions
+        .iter()
+        .map(|suggestion| suggestion.value.clone())
+        .collect();
+
+    if completion_values.len() == 1 {
+        let candidate = completion_values[0].clone();
+        state.palette.input = format!("{}{} ", context.prefix, candidate);
+        state.palette.clear_completion();
+        state.status = format!("completed: {candidate}");
+        return;
+    }
+
+    let common_prefix = longest_common_prefix(&completion_values);
+    if common_prefix.len() > context.active_token.len() {
+        state.palette.input = format!("{}{}", context.prefix, common_prefix);
+    }
+
+    let show_suggestions =
+        context.active_token.is_empty() || state.palette.last_tab_input == input_before_completion;
+    state.palette.suggestions = suggestions;
+    state.palette.show_suggestions = show_suggestions;
+    state.palette.last_tab_input = state.palette.input.clone();
+
+    let summary = state
+        .palette
+        .suggestions
+        .iter()
+        .map(|suggestion| suggestion.value.as_str())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    state.status = if show_suggestions {
+        format!(
+            "completion options: {}",
+            if summary.is_empty() {
+                "<none>".to_string()
+            } else {
+                summary
+            }
+        )
+    } else {
+        format!(
+            "{} completion candidates (Tab again to list)",
+            state.palette.suggestions.len()
+        )
+    };
+}
+
+fn palette_completion_suggestions(
+    state: &AppState,
+    context: &PaletteCompletionContext,
+) -> Vec<PaletteSuggestion> {
+    if context.active_index == 0 {
+        return PALETTE_COMMANDS
+            .iter()
+            .map(|command| PaletteSuggestion {
+                value: command.name.to_string(),
+                description: Some(command.description.to_string()),
+            })
+            .collect();
+    }
+
+    let command = context
+        .tokens
+        .first()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match command.as_str() {
+        "config" => config_completion_suggestions(state, context),
+        "sync" => sync_completion_suggestions(state, context),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PaletteCompletionContext {
+    tokens: Vec<String>,
+    active_index: usize,
+    active_token: String,
+    prefix: String,
+}
+
+fn parse_palette_completion_context(input: &str) -> PaletteCompletionContext {
+    let tokens: Vec<String> = input.split_whitespace().map(ToOwned::to_owned).collect();
+    let trailing_space = input.chars().last().is_some_and(char::is_whitespace);
+
+    if trailing_space {
+        return PaletteCompletionContext {
+            active_index: tokens.len(),
+            active_token: String::new(),
+            prefix: input.to_string(),
+            tokens,
+        };
+    }
+
+    let split_index = input
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| character.is_whitespace().then_some(index));
+
+    if let Some(index) = split_index {
+        return PaletteCompletionContext {
+            active_index: tokens.len().saturating_sub(1),
+            active_token: input[index + 1..].to_string(),
+            prefix: input[..=index].to_string(),
+            tokens,
+        };
+    }
+
+    PaletteCompletionContext {
+        active_index: 0,
+        active_token: input.to_string(),
+        prefix: String::new(),
+        tokens,
+    }
+}
+
+fn config_completion_suggestions(
+    state: &AppState,
+    context: &PaletteCompletionContext,
+) -> Vec<PaletteSuggestion> {
+    let action = context
+        .tokens
+        .get(1)
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match context.active_index {
+        1 => vec![
+            PaletteSuggestion {
+                value: "get".to_string(),
+                description: Some("Read one config key".to_string()),
+            },
+            PaletteSuggestion {
+                value: "help".to_string(),
+                description: Some("Show config command usage".to_string()),
+            },
+            PaletteSuggestion {
+                value: "set".to_string(),
+                description: Some("Write one config key".to_string()),
+            },
+            PaletteSuggestion {
+                value: "show".to_string(),
+                description: Some("Show config file path or one key".to_string()),
+            },
+        ],
+        2 => {
+            let keys = if action == "set" {
+                CONFIG_SET_KEYS
+            } else {
+                CONFIG_GET_KEYS
+            };
+            keys.iter()
+                .map(|key| PaletteSuggestion {
+                    value: (*key).to_string(),
+                    description: Some("Config key".to_string()),
+                })
+                .collect()
+        }
+        3 if action == "set" => config_value_suggestions(state, context.tokens.get(2)),
+        _ => Vec::new(),
+    }
+}
+
+fn config_value_suggestions(state: &AppState, key: Option<&String>) -> Vec<PaletteSuggestion> {
+    let Some(key) = key.map(String::as_str) else {
+        return Vec::new();
+    };
+
+    match key {
+        "logging.filter" => ["trace", "debug", "info", "warn", "error"]
+            .iter()
+            .map(|value| PaletteSuggestion {
+                value: (*value).to_string(),
+                description: Some("Log filter".to_string()),
+            })
+            .collect(),
+        "source.mailbox" | "imap.mailbox" => state
+            .subscriptions
+            .iter()
+            .map(|subscription| PaletteSuggestion {
+                value: subscription.mailbox.clone(),
+                description: Some("Mailbox".to_string()),
+            })
+            .collect(),
+        "source.lore_base_url" => vec![PaletteSuggestion {
+            value: "https://lore.kernel.org".to_string(),
+            description: Some("Lore base URL".to_string()),
+        }],
+        "kernel.trees" => vec![PaletteSuggestion {
+            value: "[\"/path/to/linux\"]".to_string(),
+            description: Some("TOML array".to_string()),
+        }],
+        "kernel.tree" => state
+            .runtime
+            .kernel_trees
+            .first()
+            .map(|path| {
+                vec![PaletteSuggestion {
+                    value: format!("\"{}\"", path.display()),
+                    description: Some("Current kernel tree".to_string()),
+                }]
+            })
+            .unwrap_or_default(),
+        "storage.data_dir" => vec![PaletteSuggestion {
+            value: format!("\"{}\"", state.runtime.data_dir.display()),
+            description: Some("Current data dir".to_string()),
+        }],
+        "storage.database" => vec![PaletteSuggestion {
+            value: format!("\"{}\"", state.runtime.database_path.display()),
+            description: Some("Current database path".to_string()),
+        }],
+        "storage.raw_mail_dir" => vec![PaletteSuggestion {
+            value: format!("\"{}\"", state.runtime.raw_mail_dir.display()),
+            description: Some("Current raw mail dir".to_string()),
+        }],
+        "storage.patch_dir" => vec![PaletteSuggestion {
+            value: format!("\"{}\"", state.runtime.patch_dir.display()),
+            description: Some("Current patch dir".to_string()),
+        }],
+        "logging.dir" => vec![PaletteSuggestion {
+            value: format!("\"{}\"", state.runtime.log_dir.display()),
+            description: Some("Current log dir".to_string()),
+        }],
+        "b4.path" => vec![PaletteSuggestion {
+            value: "\"/usr/bin/b4\"".to_string(),
+            description: Some("Path to b4 executable".to_string()),
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn sync_completion_suggestions(
+    state: &AppState,
+    context: &PaletteCompletionContext,
+) -> Vec<PaletteSuggestion> {
+    if context.active_index != 1 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<String> = state
+        .subscriptions
+        .iter()
+        .map(|subscription| subscription.mailbox.clone())
+        .collect();
+    candidates.push(state.active_thread_mailbox.clone());
+    candidates.push(state.runtime.imap_mailbox.clone());
+    candidates.sort();
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .map(|value| PaletteSuggestion {
+            value,
+            description: Some("Mailbox".to_string()),
+        })
+        .collect()
+}
+
+fn longest_common_prefix(values: &[String]) -> String {
+    let Some(first) = values.first() else {
+        return String::new();
+    };
+
+    let mut prefix = first.clone();
+    for value in values.iter().skip(1) {
+        let mut matched_bytes = 0usize;
+        for (left, right) in prefix.chars().zip(value.chars()) {
+            if left == right {
+                matched_bytes += left.len_utf8();
+            } else {
+                break;
+            }
+        }
+        prefix.truncate(matched_bytes);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
 }
 
 fn lore_archive_url(mailbox: &str) -> String {
@@ -2266,22 +2625,31 @@ fn draw_command_palette(frame: &mut Frame<'_>, state: &AppState) {
     let input = Paragraph::new(format!("> {}", state.palette.input));
     frame.render_widget(input, sections[0]);
 
-    let hints = Paragraph::new("Enter: execute  Esc: close  Ctrl+` or F1: toggle  : opens");
+    let hints = Paragraph::new(
+        "Tab: complete (press twice to list args)  Enter: execute  Esc: close  Ctrl+` or F1: toggle  : opens",
+    );
     frame.render_widget(hints, sections[1]);
 
-    let candidates = matching_commands(&state.palette.input);
-    let candidate_title = if candidates.is_empty() {
+    let suggestions = palette_overlay_suggestions(state);
+    let candidate_title = if suggestions.is_empty() {
         "Candidates: <none>"
+    } else if state.palette.show_suggestions {
+        "Completion Candidates"
     } else {
-        "Candidates"
+        "Command Candidates"
     };
     let candidate_header = Paragraph::new(candidate_title);
     frame.render_widget(candidate_header, sections[2]);
 
-    let items: Vec<ListItem> = candidates
+    let items: Vec<ListItem> = suggestions
         .iter()
-        .take(4)
-        .map(|command| ListItem::new(format!("{} - {}", command.name, command.description)))
+        .take(8)
+        .map(|suggestion| match suggestion.description.as_deref() {
+            Some(description) if !description.is_empty() => {
+                ListItem::new(format!("{} - {}", suggestion.value, description))
+            }
+            _ => ListItem::new(suggestion.value.clone()),
+        })
         .collect();
 
     let list = List::new(items).block(
@@ -2290,6 +2658,20 @@ fn draw_command_palette(frame: &mut Frame<'_>, state: &AppState) {
             .border_style(Style::default().fg(Color::Gray)),
     );
     frame.render_widget(list, sections[3]);
+}
+
+fn palette_overlay_suggestions(state: &AppState) -> Vec<PaletteSuggestion> {
+    if state.palette.show_suggestions && !state.palette.suggestions.is_empty() {
+        return state.palette.suggestions.clone();
+    }
+
+    matching_commands(&state.palette.input)
+        .into_iter()
+        .map(|command| PaletteSuggestion {
+            value: command.name.to_string(),
+            description: Some(command.description.to_string()),
+        })
+        .collect()
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2582,6 +2964,65 @@ mailbox = "inbox"
         let action = handle_key_event(&mut state, key);
         assert!(matches!(action, LoopAction::Continue));
         assert!(state.palette.open);
+    }
+
+    #[test]
+    fn palette_tab_completes_top_level_command() {
+        let mut state = AppState::new(vec![], test_runtime());
+        state.palette.open = true;
+        state.palette.input = "co".to_string();
+
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(state.palette.input, "config ");
+    }
+
+    #[test]
+    fn palette_tab_completes_config_subcommand_and_key() {
+        let mut state = AppState::new(vec![], test_runtime());
+        state.palette.open = true;
+        state.palette.input = "config g".to_string();
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.palette.input, "config get ");
+
+        state.palette.input = "config get source.m".to_string();
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.palette.input, "config get source.mailbox ");
+    }
+
+    #[test]
+    fn palette_tab_completes_sync_mailbox() {
+        let mut state = AppState::new(vec![], test_runtime());
+        state.palette.open = true;
+        state.palette.input = "sync bp".to_string();
+
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(state.palette.input, "sync bpf ");
+    }
+
+    #[test]
+    fn palette_double_tab_lists_config_arguments() {
+        let mut state = AppState::new(vec![], test_runtime());
+        state.palette.open = true;
+        state.palette.input = "config".to_string();
+
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(state.palette.input, "config ");
+        assert!(!state.palette.show_suggestions);
+
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(state.palette.show_suggestions);
+        let values: Vec<String> = state
+            .palette
+            .suggestions
+            .iter()
+            .map(|item| item.value.clone())
+            .collect();
+        assert!(values.contains(&"show".to_string()));
+        assert!(values.contains(&"get".to_string()));
+        assert!(values.contains(&"set".to_string()));
+        assert!(values.contains(&"help".to_string()));
     }
 
     #[test]

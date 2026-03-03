@@ -71,6 +71,7 @@ cargo run -- tui
 说明：
 - 打开 TUI 前会自动同步“已启用订阅”。
 - 命令栏（`:`）可用命令：`help`、`sync`、`sync <mailbox>`、`config`、`quit`。
+- 命令栏支持 `Tab` 补全命令与参数；同一位置再按一次 `Tab` 会在下方列出可选参数。
 
 ## 本地 fixture 测试（可选）
 
