@@ -236,7 +236,13 @@ FROM thread_node tn
 JOIN thread t ON t.id = tn.thread_id
 JOIN mail m ON m.id = tn.mail_id
 WHERE m.imap_mailbox = ?1 AND m.is_expunged = 0
-ORDER BY t.last_activity_at DESC, tn.depth ASC, tn.sort_ts ASC, tn.mail_id ASC
+ORDER BY
+    t.last_activity_at DESC,
+    tn.root_mail_id ASC,
+    t.id ASC,
+    tn.depth ASC,
+    tn.sort_ts ASC,
+    tn.mail_id ASC
 LIMIT ?2
 ",
         )
@@ -969,6 +975,7 @@ fn to_i64(value: u64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -978,7 +985,9 @@ mod tests {
     use crate::infra::db;
     use crate::infra::mail_parser;
 
-    use super::{IncomingMail, SyncBatch, apply_sync_batch, load_mailbox_state};
+    use super::{
+        IncomingMail, SyncBatch, apply_sync_batch, load_mailbox_state, load_thread_rows_by_mailbox,
+    };
 
     fn temp_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1208,6 +1217,78 @@ WHERE m.message_id = 'grand@example.com'
             )
             .expect("parent for grand");
         assert_eq!(parent_grand.as_deref(), Some("child@example.com"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mailbox_thread_rows_do_not_interleave_threads_when_activity_ties() {
+        let root = temp_dir("thread-row-order");
+        let db_path = root.join("courier.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 4,
+            highest_modseq: Some(4),
+            mails: vec![
+                incoming(
+                    "inbox",
+                    1,
+                    "Message-ID: <root-a@example.com>\nSubject: thread a\nFrom: alice@example.com\n\nbody\n",
+                ),
+                incoming(
+                    "inbox",
+                    2,
+                    "Message-ID: <reply-a@example.com>\nSubject: Re: thread a\nFrom: bob@example.com\nIn-Reply-To: <root-a@example.com>\nReferences: <root-a@example.com>\n\nbody\n",
+                ),
+                incoming(
+                    "inbox",
+                    3,
+                    "Message-ID: <root-b@example.com>\nSubject: thread b\nFrom: carol@example.com\n\nbody\n",
+                ),
+                incoming(
+                    "inbox",
+                    4,
+                    "Message-ID: <reply-b@example.com>\nSubject: Re: thread b\nFrom: dave@example.com\nIn-Reply-To: <root-b@example.com>\nReferences: <root-b@example.com>\n\nbody\n",
+                ),
+            ],
+        };
+        apply_sync_batch(&db_path, batch).expect("sync batch");
+
+        let connection = Connection::open(&db_path).expect("open db");
+        connection
+            .execute(
+                "UPDATE thread SET last_activity_at = '2026-01-01T00:00:00.000Z'",
+                [],
+            )
+            .expect("normalize thread activity");
+        drop(connection);
+
+        let rows = load_thread_rows_by_mailbox(&db_path, "inbox", 20).expect("load thread rows");
+        assert_eq!(rows.len(), 4);
+
+        let mut seen = HashSet::new();
+        let mut completed = HashSet::new();
+        let mut previous_thread_id: Option<i64> = None;
+        for row in rows {
+            if let Some(previous) = previous_thread_id
+                && row.thread_id != previous
+            {
+                completed.insert(previous);
+            }
+
+            assert!(
+                !completed.contains(&row.thread_id),
+                "thread {} became non-contiguous in ordered rows",
+                row.thread_id
+            );
+
+            seen.insert(row.thread_id);
+            previous_thread_id = Some(row.thread_id);
+        }
+        assert_eq!(seen.len(), 2);
 
         let _ = fs::remove_dir_all(root);
     }

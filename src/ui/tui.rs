@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -1153,19 +1153,41 @@ fn default_subscriptions(
 }
 
 fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let items: Vec<ListItem> = state
-        .filtered_thread_indices
-        .iter()
-        .filter_map(|index| state.threads.get(*index))
-        .map(thread_line)
-        .map(ListItem::new)
-        .collect();
+    let mut visible_count_by_thread: HashMap<i64, usize> = HashMap::new();
+    for index in &state.filtered_thread_indices {
+        if let Some(row) = state.threads.get(*index) {
+            *visible_count_by_thread.entry(row.thread_id).or_insert(0) += 1;
+        }
+    }
 
-    let selected = if items.is_empty() {
-        None
-    } else {
-        Some(state.thread_index)
-    };
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut selected = None;
+    let mut previous_thread_id: Option<i64> = None;
+    for (position, index) in state.filtered_thread_indices.iter().enumerate() {
+        let Some(row) = state.threads.get(*index) else {
+            continue;
+        };
+
+        if previous_thread_id != Some(row.thread_id) {
+            previous_thread_id = Some(row.thread_id);
+            let visible_count = visible_count_by_thread
+                .get(&row.thread_id)
+                .copied()
+                .unwrap_or(1);
+            items.push(
+                ListItem::new(thread_group_line(row.thread_id, visible_count)).style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+        }
+
+        if position == state.thread_index {
+            selected = Some(items.len());
+        }
+        items.push(ListItem::new(thread_line(row)));
+    }
 
     let mut list_state = ListState::default();
     list_state.select(selected);
@@ -1179,6 +1201,11 @@ fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         );
 
     frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn thread_group_line(thread_id: i64, visible_count: usize) -> String {
+    let noun = if visible_count == 1 { "msg" } else { "msgs" };
+    format!("Thread {thread_id} ({visible_count} {noun})")
 }
 
 fn thread_line(row: &ThreadRow) -> String {
@@ -1542,6 +1569,26 @@ mod tests {
             in_reply_to: None,
             date: None,
             raw_path: Some(raw_path),
+        }
+    }
+
+    fn sample_thread_in_thread(
+        thread_id: i64,
+        mail_id: i64,
+        subject: &str,
+        message_id: &str,
+        depth: u16,
+    ) -> ThreadRow {
+        ThreadRow {
+            thread_id,
+            mail_id,
+            depth,
+            subject: subject.to_string(),
+            from_addr: "alice@example.com".to_string(),
+            message_id: message_id.to_string(),
+            in_reply_to: None,
+            date: None,
+            raw_path: None,
         }
     }
 
@@ -1926,5 +1973,30 @@ mod tests {
         assert!(rendered.contains("        return;"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn threads_panel_renders_thread_group_headers() {
+        let runtime = test_runtime();
+        let bootstrap = test_bootstrap(&runtime);
+        let mut state = AppState::new(
+            vec![
+                sample_thread_in_thread(100, 1, "thread a root", "a-root@example.com", 0),
+                sample_thread_in_thread(100, 2, "thread a reply", "a-reply@example.com", 1),
+                sample_thread_in_thread(200, 3, "thread b root", "b-root@example.com", 0),
+            ],
+            runtime.clone(),
+        );
+        state.focus = Pane::Threads;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+            .expect("draw frame");
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("Thread 100 (2 msgs)"));
+        assert!(rendered.contains("Thread 200 (1 msg)"));
+        assert!(rendered.contains("thread a root"));
+        assert!(rendered.contains("thread b root"));
     }
 }
