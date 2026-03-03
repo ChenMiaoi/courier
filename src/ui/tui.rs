@@ -15,6 +15,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+use toml::Value as TomlValue;
+use toml::value::Table as TomlTable;
 
 use crate::domain::subscriptions::VGER_SUBSCRIPTIONS;
 use crate::infra::bootstrap::BootstrapState;
@@ -78,6 +80,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "sync",
         description: "Sync mailbox now",
+    },
+    PaletteCommand {
+        name: "config",
+        description: "Show or update runtime config",
     },
 ];
 
@@ -1103,10 +1109,14 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
             match command.as_str() {
                 "quit" | "exit" => return LoopAction::Exit,
                 "help" => {
-                    state.status = "commands: quit, exit, help, sync [mailbox]".to_string();
+                    state.status =
+                        "commands: quit, exit, help, sync [mailbox], config ...".to_string();
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
                     run_palette_sync(state, value);
+                }
+                value if value.split_whitespace().next() == Some("config") => {
+                    run_palette_config(state, value);
                 }
                 _ => {
                     state.status = format!("unknown command: {command}");
@@ -1209,6 +1219,265 @@ fn run_palette_sync(state: &mut AppState, command: &str) {
             first_error.unwrap_or_else(|| "unknown error".to_string())
         )
     };
+}
+
+fn run_palette_config(state: &mut AppState, command: &str) {
+    let mut segments = command.split_whitespace();
+    let _ = segments.next();
+    let action = segments.next().unwrap_or("show").to_ascii_lowercase();
+
+    match action.as_str() {
+        "show" => {
+            if let Some(key) = segments.next() {
+                show_config_key(state, key);
+            } else {
+                state.status = format!(
+                    "config file: {} | use: config get <key>, config set <key> <value>",
+                    state.runtime.config_path.display()
+                );
+            }
+        }
+        "get" => {
+            let Some(key) = segments.next() else {
+                state.status = "usage: config get <key>".to_string();
+                return;
+            };
+            show_config_key(state, key);
+        }
+        "set" => {
+            let Some(key) = segments.next() else {
+                state.status = "usage: config set <key> <value>".to_string();
+                return;
+            };
+            let value_literal = segments.collect::<Vec<_>>().join(" ");
+            if value_literal.trim().is_empty() {
+                state.status = "usage: config set <key> <value>".to_string();
+                return;
+            }
+
+            match update_config_key_in_file(&state.runtime.config_path, key, &value_literal) {
+                Ok(rendered_value) => match reload_runtime_from_config(state) {
+                    Ok(()) => {
+                        state.status = format!("config updated: {key} = {rendered_value}");
+                    }
+                    Err(error) => {
+                        state.status =
+                            format!("config file updated but runtime reload failed: {error}");
+                    }
+                },
+                Err(error) => {
+                    state.status = format!("failed to set config key {key}: {error}");
+                }
+            }
+        }
+        "help" => {
+            state.status = "config usage: show [key] | get <key> | set <key> <value>".to_string();
+        }
+        _ => {
+            state.status = "config usage: show [key] | get <key> | set <key> <value>".to_string();
+        }
+    }
+}
+
+fn show_config_key(state: &mut AppState, key: &str) {
+    if key.trim().is_empty() {
+        state.status = "usage: config get <key>".to_string();
+        return;
+    }
+
+    let file_value = read_config_key_from_file(&state.runtime.config_path, key);
+    match file_value {
+        Ok(Some(value)) => {
+            state.status = format!("config file {key} = {}", render_toml_value(&value));
+        }
+        Ok(None) => {
+            if let Some(value) = effective_config_value(state, key) {
+                state.status = format!("config effective {key} = {value} (default/runtime)");
+            } else {
+                state.status = format!("config key not found: {key}");
+            }
+        }
+        Err(error) => {
+            state.status = format!("failed to read config key {key}: {error}");
+        }
+    }
+}
+
+fn read_config_key_from_file(
+    config_path: &Path,
+    key: &str,
+) -> std::result::Result<Option<TomlValue>, String> {
+    let table = read_config_table(config_path)?;
+    Ok(lookup_config_key(&table, key).cloned())
+}
+
+fn update_config_key_in_file(
+    config_path: &Path,
+    key: &str,
+    value_literal: &str,
+) -> std::result::Result<String, String> {
+    let mut table = read_config_table(config_path)?;
+    let value = parse_toml_value_literal(value_literal);
+    set_config_key(&mut table, key, value)?;
+    write_config_table(config_path, &table)?;
+
+    let rendered = lookup_config_key(&table, key)
+        .map(render_toml_value)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    Ok(rendered)
+}
+
+fn read_config_table(config_path: &Path) -> std::result::Result<TomlTable, String> {
+    let content = match fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!("failed to read {}: {error}", config_path.display()));
+        }
+    };
+
+    if content.trim().is_empty() {
+        return Ok(TomlTable::new());
+    }
+
+    toml::from_str::<TomlTable>(&content)
+        .map_err(|error| format!("failed to parse TOML in {}: {error}", config_path.display()))
+}
+
+fn write_config_table(config_path: &Path, table: &TomlTable) -> std::result::Result<(), String> {
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create config directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut content = toml::to_string_pretty(table)
+        .map_err(|error| format!("failed to serialize config table: {error}"))?;
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    fs::write(config_path, content).map_err(|error| {
+        format!(
+            "failed to write config file {}: {error}",
+            config_path.display()
+        )
+    })
+}
+
+fn lookup_config_key<'a>(table: &'a TomlTable, key: &str) -> Option<&'a TomlValue> {
+    let mut key_parts = key.split('.').filter(|part| !part.is_empty());
+    let first = key_parts.next()?;
+    let mut current = table.get(first)?;
+    for segment in key_parts {
+        current = current.as_table()?.get(segment)?;
+    }
+    Some(current)
+}
+
+fn set_config_key(
+    table: &mut TomlTable,
+    key: &str,
+    value: TomlValue,
+) -> std::result::Result<(), String> {
+    let mut key_parts: Vec<&str> = key.split('.').filter(|part| !part.is_empty()).collect();
+    if key_parts.is_empty() {
+        return Err("empty key".to_string());
+    }
+
+    let leaf = key_parts.pop().expect("leaf key exists");
+    let mut current = table;
+    for segment in key_parts {
+        let node = current
+            .entry(segment.to_string())
+            .or_insert_with(|| TomlValue::Table(TomlTable::new()));
+        if !node.is_table() {
+            *node = TomlValue::Table(TomlTable::new());
+        }
+        current = node
+            .as_table_mut()
+            .ok_or_else(|| format!("key segment {segment} is not a table"))?;
+    }
+    current.insert(leaf.to_string(), value);
+    Ok(())
+}
+
+fn parse_toml_value_literal(value_literal: &str) -> TomlValue {
+    let literal = value_literal.trim();
+    if literal.is_empty() {
+        return TomlValue::String(String::new());
+    }
+
+    let snippet = format!("value = {literal}");
+    if let Ok(parsed) = toml::from_str::<TomlTable>(&snippet)
+        && let Some(value) = parsed.get("value")
+    {
+        return value.clone();
+    }
+
+    TomlValue::String(literal.to_string())
+}
+
+fn render_toml_value(value: &TomlValue) -> String {
+    value.to_string()
+}
+
+fn reload_runtime_from_config(state: &mut AppState) -> std::result::Result<(), String> {
+    let selected_path_hint = state.selected_kernel_tree_path();
+    match crate::infra::config::load(Some(&state.runtime.config_path)) {
+        Ok(runtime) => {
+            state.runtime = runtime;
+            state.ui_state_path = ui_state::path_for_data_dir(&state.runtime.data_dir);
+            state.refresh_kernel_tree_rows(selected_path_hint.as_deref());
+            if matches!(state.ui_page, UiPage::CodeBrowser) && !state.supports_code_browser() {
+                state.ui_page = UiPage::Mail;
+                state.code_focus = CodePaneFocus::Tree;
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn effective_config_value(state: &AppState, key: &str) -> Option<String> {
+    match key {
+        "config.path" => Some(state.runtime.config_path.display().to_string()),
+        "storage.data_dir" => Some(state.runtime.data_dir.display().to_string()),
+        "storage.database" => Some(state.runtime.database_path.display().to_string()),
+        "storage.raw_mail_dir" => Some(state.runtime.raw_mail_dir.display().to_string()),
+        "storage.patch_dir" => Some(state.runtime.patch_dir.display().to_string()),
+        "logging.dir" => Some(state.runtime.log_dir.display().to_string()),
+        "logging.filter" => Some(state.runtime.log_filter.clone()),
+        "b4.path" => Some(
+            state
+                .runtime
+                .b4_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string()),
+        ),
+        "source.mailbox" | "imap.mailbox" => Some(state.runtime.imap_mailbox.clone()),
+        "source.lore_base_url" => Some(state.runtime.lore_base_url.clone()),
+        "kernel.trees" => Some(format!(
+            "[{}]",
+            state
+                .runtime
+                .kernel_trees
+                .iter()
+                .map(|path| format!("\"{}\"", path.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        "kernel.tree" => state
+            .runtime
+            .kernel_trees
+            .first()
+            .map(|path| path.display().to_string()),
+        _ => None,
+    }
 }
 
 fn lore_archive_url(mailbox: &str) -> String {
@@ -2221,11 +2490,12 @@ mod tests {
     #[test]
     fn empty_query_returns_all_palette_commands() {
         let all = matching_commands("");
-        assert_eq!(all.len(), 4);
-        assert_eq!(all[0].name, "exit");
-        assert_eq!(all[1].name, "help");
-        assert_eq!(all[2].name, "quit");
-        assert_eq!(all[3].name, "sync");
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].name, "config");
+        assert_eq!(all[1].name, "exit");
+        assert_eq!(all[2].name, "help");
+        assert_eq!(all[3].name, "quit");
+        assert_eq!(all[4].name, "sync");
     }
 
     #[test]
@@ -2245,6 +2515,55 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(matches!(action, LoopAction::Exit));
+    }
+
+    #[test]
+    fn config_palette_get_and_set_roundtrip() {
+        let root = temp_dir("palette-config");
+        let config_path = root.join("courier-config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[source]
+mailbox = "inbox"
+"#,
+        )
+        .expect("write config file");
+
+        let mut runtime = test_runtime();
+        runtime.config_path = config_path.clone();
+        let mut state = AppState::new(vec![], runtime);
+
+        state.palette.open = true;
+        state.palette.input = "config get source.mailbox".to_string();
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state.status.contains("source.mailbox"));
+        assert!(state.status.contains("inbox"));
+
+        state.palette.open = true;
+        state.palette.input = "config set source.mailbox io-uring".to_string();
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state.status.contains("config updated"));
+        assert_eq!(state.runtime.imap_mailbox, "io-uring");
+
+        let persisted = fs::read_to_string(&config_path).expect("read config file");
+        assert!(persisted.contains("mailbox = \"io-uring\""));
+
+        state.palette.open = true;
+        state.palette.input = "config get source.mailbox".to_string();
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state.status.contains("io-uring"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
