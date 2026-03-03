@@ -95,6 +95,9 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
 
 const PALETTE_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
 const PREVIEW_TAB_SPACES: &str = "    ";
+const PREVIEW_RECIPIENT_PREVIEW_LIMIT: usize = 2;
+const PREVIEW_PANE_FIXED_WIDTH: u16 = 80;
+const THREAD_LINE_MAX_CHARS: usize = 120;
 const KERNEL_TREE_MAX_ROWS: usize = 2048;
 const CODE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 const CODE_PREVIEW_MAX_LINES: usize = 800;
@@ -155,7 +158,6 @@ struct SearchState {
 #[derive(Debug, Clone)]
 struct SubscriptionItem {
     mailbox: String,
-    description: String,
     enabled: bool,
 }
 
@@ -1839,21 +1841,6 @@ fn longest_common_prefix(values: &[String]) -> String {
     prefix
 }
 
-fn lore_archive_url(mailbox: &str) -> String {
-    format!("https://lore.kernel.org/{mailbox}/")
-}
-
-fn mailbox_description(mailbox: &str) -> String {
-    if let Some(template) = VGER_SUBSCRIPTIONS
-        .iter()
-        .find(|entry| entry.mailbox == mailbox)
-    {
-        template.description.to_string()
-    } else {
-        "Custom mailbox".to_string()
-    }
-}
-
 fn is_palette_toggle(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::F(1))
         || (key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1912,17 +1899,9 @@ fn draw(
         Paragraph::new(header).style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_widget(header_widget, areas[0]);
 
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(35),
-            Constraint::Percentage(40),
-        ])
-        .split(areas[1]); // placeholder layout to keep ratios on mail page
-
     match state.ui_page {
         UiPage::Mail => {
+            let panes = mail_page_panes(areas[1]);
             draw_subscriptions(frame, panes[0], state);
             draw_threads(frame, panes[1], state);
             draw_preview(frame, panes[2], state, config);
@@ -1974,6 +1953,44 @@ fn draw_code_browser_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     draw_kernel_tree(frame, panes[0], state);
     draw_code_source_preview(frame, panes[1], state);
+}
+
+fn mail_page_panes(area: Rect) -> [Rect; 3] {
+    if area.width == 0 {
+        return [area, area, area];
+    }
+
+    let preview_width = area.width.min(PREVIEW_PANE_FIXED_WIDTH);
+    let left_width = area.width.saturating_sub(preview_width);
+    let preview = Rect {
+        x: area.x + left_width,
+        y: area.y,
+        width: preview_width,
+        height: area.height,
+    };
+
+    if left_width == 0 {
+        let empty = Rect {
+            x: area.x,
+            y: area.y,
+            width: 0,
+            height: area.height,
+        };
+        return [empty, empty, preview];
+    }
+
+    let left = Rect {
+        x: area.x,
+        y: area.y,
+        width: left_width,
+        height: area.height,
+    };
+    let left_panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)])
+        .split(left);
+
+    [left_panes[0], left_panes[1], preview]
 }
 
 fn draw_subscriptions(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -2055,12 +2072,7 @@ fn draw_code_source_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState)
 
 fn subscription_line(item: &SubscriptionItem) -> String {
     let marker = if item.enabled { "y" } else { "n" };
-    format!(
-        "[{marker}] {} - {} ({})",
-        item.mailbox,
-        item.description,
-        lore_archive_url(&item.mailbox)
-    )
+    format!("[{marker}] {}", item.mailbox)
 }
 
 fn default_kernel_tree_expanded_paths(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
@@ -2243,7 +2255,6 @@ fn default_subscriptions(
         .iter()
         .map(|entry| SubscriptionItem {
             mailbox: entry.mailbox.to_string(),
-            description: entry.description.to_string(),
             enabled: if default_enabled {
                 entry.mailbox == default_mailbox
             } else {
@@ -2257,7 +2268,6 @@ fn default_subscriptions(
             0,
             SubscriptionItem {
                 mailbox: default_mailbox.to_string(),
-                description: mailbox_description(default_mailbox),
                 enabled: default_enabled || enabled_mailboxes.contains(default_mailbox),
             },
         );
@@ -2269,7 +2279,6 @@ fn default_subscriptions(
         }
         items.push(SubscriptionItem {
             mailbox: mailbox.clone(),
-            description: mailbox_description(mailbox),
             enabled: true,
         });
     }
@@ -2280,7 +2289,6 @@ fn default_subscriptions(
     {
         items.push(SubscriptionItem {
             mailbox: mailbox.to_string(),
-            description: mailbox_description(mailbox),
             enabled: enabled_mailboxes.contains(mailbox),
         });
     }
@@ -2296,6 +2304,7 @@ fn default_subscriptions(
 }
 
 fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let max_thread_line_chars = thread_line_max_chars(area);
     let mut visible_count_by_thread: HashMap<i64, usize> = HashMap::new();
     for index in &state.filtered_thread_indices {
         if let Some(row) = state.threads.get(*index) {
@@ -2329,7 +2338,7 @@ fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         if position == state.thread_index {
             selected = Some(items.len());
         }
-        items.push(ListItem::new(thread_line(row)));
+        items.push(ListItem::new(thread_line(row, max_thread_line_chars)));
     }
 
     let mut list_state = ListState::default();
@@ -2351,28 +2360,47 @@ fn thread_group_line(thread_id: i64, visible_count: usize) -> String {
     format!("Thread {thread_id} ({visible_count} {noun})")
 }
 
-fn thread_line(row: &ThreadRow) -> String {
+fn thread_line_max_chars(area: Rect) -> usize {
+    let available = area.width.saturating_sub(2) as usize;
+    available.min(THREAD_LINE_MAX_CHARS)
+}
+
+fn thread_line(row: &ThreadRow, max_chars: usize) -> String {
+    let max_chars = max_chars.min(THREAD_LINE_MAX_CHARS);
     let indent = "  ".repeat(row.depth as usize);
     let subject = if row.subject.trim().is_empty() {
         "(no subject)"
     } else {
         row.subject.trim()
     };
-    format!("{indent}{subject}  [{}]", row.from_addr)
+    truncate_with_ellipsis(&format!("{indent}{subject}"), max_chars)
+}
+
+fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let value_len = value.chars().count();
+    if value_len <= max_chars {
+        return value.to_string();
+    }
+
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+
+    let mut truncated = String::new();
+    for ch in value.chars().take(max_chars - 3) {
+        truncated.push(ch);
+    }
+    truncated.push_str("...");
+    truncated
 }
 
 fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &RuntimeConfig) {
     let preview = if let Some(thread) = state.selected_thread() {
-        let subject = if thread.subject.trim().is_empty() {
-            "(no subject)"
-        } else {
-            thread.subject.trim()
-        };
-        format!(
-            "Subject: {}\n\n{}",
-            subject,
-            load_mail_body_preview(thread.raw_path.as_ref()),
-        )
+        load_mail_preview(thread)
     } else {
         format!(
             "No synced thread data\n\nRun:\n  courier sync --fixture-dir <DIR>\n\nConfig: {}\nDatabase: {}",
@@ -2391,6 +2419,229 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, inner_area);
+}
+
+fn load_mail_preview(thread: &ThreadRow) -> String {
+    let subject = normalized_subject_or_default(&thread.subject);
+    let fallback_from = normalized_header_or_default(&thread.from_addr, "<unknown sender>");
+    let fallback_sent = thread.date.as_deref().and_then(non_empty_normalized_header);
+
+    let Some(path) = thread.raw_path.as_ref() else {
+        return format_preview_with_headers(
+            &fallback_from,
+            fallback_sent.as_deref().unwrap_or("<unknown sent time>"),
+            "<none>",
+            "<none>",
+            &subject,
+            "<raw mail file unavailable>",
+        );
+    };
+
+    let content = match fs::read(path) {
+        Ok(value) => value,
+        Err(error) => {
+            return format_preview_with_headers(
+                &fallback_from,
+                fallback_sent.as_deref().unwrap_or("<unknown sent time>"),
+                "<none>",
+                "<none>",
+                &subject,
+                &format!("<failed to read {}: {}>", path.display(), error),
+            );
+        }
+    };
+
+    extract_mail_preview(&content, &subject, &fallback_from, fallback_sent.as_deref())
+}
+
+fn extract_mail_preview(
+    raw: &[u8],
+    fallback_subject: &str,
+    fallback_from: &str,
+    fallback_sent: Option<&str>,
+) -> String {
+    let headers = parse_preview_header_block(raw);
+
+    let from = preview_header_value(&headers, "from")
+        .or_else(|| non_empty_normalized_header(fallback_from))
+        .unwrap_or_else(|| "<unknown sender>".to_string());
+    let sent = preview_header_value(&headers, "date")
+        .or_else(|| fallback_sent.and_then(non_empty_normalized_header))
+        .unwrap_or_else(|| "<unknown sent time>".to_string());
+    let to = preview_recipient_line(&headers, "to");
+    let cc = preview_recipient_line(&headers, "cc");
+    let subject = preview_header_value(&headers, "subject")
+        .or_else(|| non_empty_normalized_header(fallback_subject))
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let body = extract_mail_body_preview(raw);
+
+    format_preview_with_headers(&from, &sent, &to, &cc, &subject, &body)
+}
+
+fn format_preview_with_headers(
+    from: &str,
+    sent: &str,
+    to: &str,
+    cc: &str,
+    subject: &str,
+    body: &str,
+) -> String {
+    format!(
+        "From: {from}\nSent: {sent}\nTo: {to}\nCc: {cc}\nSubject: {subject}\n\n{body}"
+    )
+}
+
+fn normalized_subject_or_default(subject: &str) -> String {
+    non_empty_normalized_header(subject).unwrap_or_else(|| "(no subject)".to_string())
+}
+
+fn non_empty_normalized_header(value: &str) -> Option<String> {
+    let normalized = normalize_preview_header_whitespace(value);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn normalized_header_or_default(value: &str, default: &str) -> String {
+    non_empty_normalized_header(value).unwrap_or_else(|| default.to_string())
+}
+
+fn parse_preview_header_block(raw: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(raw);
+    let mut headers = Vec::new();
+
+    let mut current_name: Option<String> = None;
+    let mut current_value = String::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if current_name.is_some() {
+                let fragment = line.trim();
+                if !fragment.is_empty() {
+                    if !current_value.is_empty() {
+                        current_value.push(' ');
+                    }
+                    current_value.push_str(fragment);
+                }
+            }
+            continue;
+        }
+
+        if let Some(name) = current_name.take() {
+            headers.push((name, normalize_preview_header_whitespace(&current_value)));
+            current_value.clear();
+        }
+
+        if let Some((name, value)) = line.split_once(':') {
+            current_name = Some(name.trim().to_ascii_lowercase());
+            current_value.push_str(value.trim());
+        }
+    }
+
+    if let Some(name) = current_name.take() {
+        headers.push((name, normalize_preview_header_whitespace(&current_value)));
+    }
+
+    headers
+}
+
+fn preview_header_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name == name)
+        .and_then(|(_, value)| non_empty_normalized_header(value))
+}
+
+fn preview_header_values(headers: &[(String, String)], name: &str) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|(header_name, _)| header_name == name)
+        .filter_map(|(_, value)| non_empty_normalized_header(value))
+        .collect()
+}
+
+fn preview_recipient_line(headers: &[(String, String)], name: &str) -> String {
+    let mut recipients = Vec::new();
+    for value in preview_header_values(headers, name) {
+        recipients.extend(split_recipient_list(&value));
+    }
+
+    if recipients.is_empty() {
+        return "<none>".to_string();
+    }
+
+    if recipients.len() <= PREVIEW_RECIPIENT_PREVIEW_LIMIT {
+        return recipients.join("; ");
+    }
+
+    format!(
+        "{}; ...",
+        recipients[..PREVIEW_RECIPIENT_PREVIEW_LIMIT].join("; ")
+    )
+}
+
+fn split_recipient_list(value: &str) -> Vec<String> {
+    let mut recipients = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut angle_depth = 0usize;
+
+    for character in value.chars() {
+        if in_quotes {
+            current.push(character);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+
+            match character {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match character {
+            '"' => {
+                in_quotes = true;
+                current.push(character);
+            }
+            '<' => {
+                angle_depth += 1;
+                current.push(character);
+            }
+            '>' => {
+                angle_depth = angle_depth.saturating_sub(1);
+                current.push(character);
+            }
+            ',' | ';' if angle_depth == 0 => {
+                if let Some(recipient) = non_empty_normalized_header(&current) {
+                    recipients.push(recipient);
+                }
+                current.clear();
+            }
+            _ => current.push(character),
+        }
+    }
+
+    if let Some(recipient) = non_empty_normalized_header(&current) {
+        recipients.push(recipient);
+    }
+
+    recipients
+}
+
+fn normalize_preview_header_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn load_code_source_preview(state: &AppState) -> String {
@@ -2452,19 +2703,6 @@ fn load_source_file_preview(path: &Path) -> String {
         preview.push_str("\n\n<truncated preview>");
     }
     preview
-}
-
-fn load_mail_body_preview(path: Option<&PathBuf>) -> String {
-    let Some(path) = path else {
-        return "<raw mail file unavailable>".to_string();
-    };
-
-    let content = match fs::read(path) {
-        Ok(value) => value,
-        Err(error) => return format!("<failed to read {}: {}>", path.display(), error),
-    };
-
-    extract_mail_body_preview(&content)
 }
 
 fn extract_mail_body_preview(raw: &[u8]) -> String {
@@ -2759,8 +2997,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+    use ratatui::Terminal;
 
     use crate::infra::bootstrap::BootstrapState;
     use crate::infra::config::RuntimeConfig;
@@ -2768,8 +3007,10 @@ mod tests {
     use crate::infra::mail_store::ThreadRow;
 
     use super::{
-        AppState, LoopAction, Pane, UiPage, draw, extract_mail_body_preview, handle_key_event,
-        is_palette_open_shortcut, is_palette_toggle, load_source_file_preview, matching_commands,
+        AppState, LoopAction, Pane, UiPage, draw, extract_mail_body_preview,
+        extract_mail_preview, handle_key_event, is_palette_open_shortcut, is_palette_toggle,
+        load_source_file_preview, mail_page_panes, matching_commands, subscription_line,
+        thread_line, SubscriptionItem,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -2884,6 +3125,64 @@ mod tests {
     fn prefix_matches_rank_before_fuzzy_matches() {
         let commands = matching_commands("ex");
         assert_eq!(commands[0].name, "exit");
+    }
+
+    #[test]
+    fn mail_page_layout_keeps_preview_at_fixed_80_columns() {
+        let panes = mail_page_panes(Rect::new(0, 0, 180, 20));
+
+        assert_eq!(panes[2].width, 80);
+        assert_eq!(panes[2].x, 100);
+        assert_eq!(panes[0].width, 25);
+        assert_eq!(panes[1].width, 75);
+        assert_eq!(panes[0].width + panes[1].width + panes[2].width, 180);
+    }
+
+    #[test]
+    fn mail_page_layout_falls_back_to_available_width_when_terminal_is_narrow() {
+        let panes = mail_page_panes(Rect::new(0, 0, 60, 20));
+
+        assert_eq!(panes[2].width, 60);
+        assert_eq!(panes[0].width, 0);
+        assert_eq!(panes[1].width, 0);
+    }
+
+    #[test]
+    fn subscription_line_shows_marker_and_mailbox_name_only() {
+        let enabled = SubscriptionItem {
+            mailbox: "io-uring".to_string(),
+            enabled: true,
+        };
+        let disabled = SubscriptionItem {
+            mailbox: "linux-mm".to_string(),
+            enabled: false,
+        };
+
+        assert_eq!(subscription_line(&enabled), "[y] io-uring");
+        assert_eq!(subscription_line(&disabled), "[n] linux-mm");
+    }
+
+    #[test]
+    fn thread_line_hides_sender() {
+        let row = sample_thread("thread subject", "x@example.com", 0);
+        let line = thread_line(&row, 120);
+
+        assert_eq!(line, "thread subject");
+        assert!(!line.contains("alice@example.com"));
+    }
+
+    #[test]
+    fn thread_line_truncates_by_max_chars_and_available_width() {
+        let long_subject = "x".repeat(240);
+        let row = sample_thread(&long_subject, "x@example.com", 0);
+
+        let line_capped_at_120 = thread_line(&row, 200);
+        assert_eq!(line_capped_at_120.chars().count(), super::THREAD_LINE_MAX_CHARS);
+        assert!(line_capped_at_120.ends_with("..."));
+
+        let line_capped_by_width = thread_line(&row, 30);
+        assert_eq!(line_capped_by_width.chars().count(), 30);
+        assert!(line_capped_by_width.ends_with("..."));
     }
 
     #[test]
@@ -3352,6 +3651,32 @@ mailbox = "inbox"
         assert!(!preview.contains('\t'));
         assert!(preview.contains("line1"));
         assert!(preview.contains("line2    ok"));
+    }
+
+    #[test]
+    fn preview_shows_from_sent_to_cc_headers() {
+        let raw = b"From: Chen Miao <chenmiao.ku@gmail.com>\r\nDate: Monday, March 2, 2026 5:29 PM\r\nTo: Daniel Baluta <daniel.baluta@nxp.com>; Simona Toaca <simona.toaca@nxp.com>\r\nCc: Team One <team1@example.com>\r\nSubject: [PATCH] demo\r\n\r\nmail body line\n";
+        let preview = extract_mail_preview(raw, "(no subject)", "<unknown sender>", None);
+
+        assert!(preview.contains("From: Chen Miao <chenmiao.ku@gmail.com>"));
+        assert!(preview.contains("Sent: Monday, March 2, 2026 5:29 PM"));
+        assert!(preview.contains(
+            "To: Daniel Baluta <daniel.baluta@nxp.com>; Simona Toaca <simona.toaca@nxp.com>"
+        ));
+        assert!(preview.contains("Cc: Team One <team1@example.com>"));
+        assert!(preview.contains("Subject: [PATCH] demo"));
+        assert!(preview.contains("mail body line"));
+    }
+
+    #[test]
+    fn preview_truncates_to_and_cc_recipient_lists() {
+        let raw = b"From: sender@example.com\r\nDate: Tue, 3 Mar 2026 12:00:00 +0000\r\nTo: A <a@example.com>, B <b@example.com>, C <c@example.com>\r\nCc: X <x@example.com>; Y <y@example.com>; Z <z@example.com>\r\nSubject: test\r\n\r\nbody\n";
+        let preview = extract_mail_preview(raw, "(no subject)", "<unknown sender>", None);
+
+        assert!(preview.contains("To: A <a@example.com>; B <b@example.com>; ..."));
+        assert!(preview.contains("Cc: X <x@example.com>; Y <y@example.com>; ..."));
+        assert!(!preview.contains("C <c@example.com>"));
+        assert!(!preview.contains("Z <z@example.com>"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy)]
 pub struct SubscriptionTemplate {
     pub mailbox: &'static str,
+    #[allow(dead_code)]
     pub description: &'static str,
 }
 
