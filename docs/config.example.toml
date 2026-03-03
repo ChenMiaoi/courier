@@ -1,4 +1,5 @@
 # Courier config example (minimal).
+# Default config path: ~/.courier/courier-config.toml
 # Relative paths are resolved from the config file directory.
 
 [storage]
