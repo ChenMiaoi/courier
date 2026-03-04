@@ -1,3 +1,3 @@
 pub mod tui;
 
-pub use tui::run;
+pub use tui::{TuiAction, run};

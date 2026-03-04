@@ -315,6 +315,29 @@ MVP 范围与阶段目标已迁移至独立文档：
   `CONDSTORE/QRESYNC` 兼容性与 flags 增量准确性。
 - 预览仍以纯文本片段为主，multipart 深层 body 选择与附件解码在 M3/M4 继续完善。
 
+## 16. M3 已决策项与风险更新
+
+### 16.1 已决策项
+
+- patch 工作流数据落库新增 `patch_series`、`patch_series_item`、`patch_series_run` 三表，
+  用于 series 状态机、条目明细和执行日志持久化。
+- series 识别规则固定为解析主题前缀 `[PATCH vN M/N]`，按 thread 聚合并默认选择
+  当前 thread 中最高版本（最大 `vN`）作为可操作 series。
+- 完整性校验在 M3 固定三类：缺片（missing）、重复（duplicate）、乱序（out-of-order）；
+  仅 `complete` 状态允许执行 apply/download。
+- b4 执行在 M3 统一由 Courier 封装，固定超时控制、退出码收集、stdout/stderr 持久化，
+  并映射状态流转：`new -> reviewing -> applied|failed|conflict`。
+- TUI 线程页新增 patch 快捷键：`a` 触发 apply，`d` 触发 download；线程组标题展示
+  series 版本、完整性和当前状态，右侧预览可查看最近一次命令、退出码与错误摘要。
+
+### 16.2 风险与后续动作
+
+- 当前 series 聚合依赖已加载到线程页的数据窗口（默认 500 行）；超长 thread 可能需要
+  后续改为全量按 thread_id 查询以避免识别误差。
+- 目前 download/apply 都走 `b4 am` 封装，后续可按维护者工作流评估是否补充
+  `b4 mbox` / `b4 shazam` 分流策略与更细粒度参数模板。
+- 执行日志目前以内嵌文本保存在 SQLite，后续可增加日志滚动与大小配额，防止长期使用后数据库膨胀。
+
 ---
 
 该文档作为实现基线，后续应同步更新设计决策、风险项与约束变化。

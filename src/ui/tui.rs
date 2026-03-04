@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 
+use crate::app::patch as patch_worker;
 use crate::app::sync as sync_worker;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -70,6 +73,21 @@ struct PaletteSuggestion {
     description: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct LocalCommandResult {
+    command: String,
+    cwd: PathBuf,
+    exit_code: String,
+    output: String,
+}
+
+#[derive(Debug, Clone)]
+struct LastApplySnapshot {
+    thread_id: i64,
+    before_head: String,
+    after_head: String,
+}
+
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "quit",
@@ -82,6 +100,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "help",
         description: "Show available commands",
+    },
+    PaletteCommand {
+        name: "restart",
+        description: "Restart TUI with startup config",
     },
     PaletteCommand {
         name: "sync",
@@ -138,6 +160,7 @@ struct CommandPaletteState {
     suggestions: Vec<PaletteSuggestion>,
     show_suggestions: bool,
     last_tab_input: String,
+    last_local_result: Option<LocalCommandResult>,
 }
 
 impl CommandPaletteState {
@@ -145,6 +168,10 @@ impl CommandPaletteState {
         self.suggestions.clear();
         self.show_suggestions = false;
         self.last_tab_input.clear();
+    }
+
+    fn clear_local_result(&mut self) {
+        self.last_local_result = None;
     }
 }
 
@@ -277,6 +304,7 @@ struct AppState {
     enabled_group_expanded: bool,
     disabled_group_expanded: bool,
     threads: Vec<ThreadRow>,
+    series_summaries: HashMap<i64, patch_worker::SeriesSummary>,
     filtered_thread_indices: Vec<usize>,
     subscription_index: usize,
     subscription_row_index: usize,
@@ -288,6 +316,7 @@ struct AppState {
     preview_scroll: u16,
     started_at: Instant,
     status: String,
+    last_apply_snapshot: Option<LastApplySnapshot>,
     palette: CommandPaletteState,
     search: SearchState,
 }
@@ -340,6 +369,7 @@ impl AppState {
                 .map(|state| state.disabled_group_expanded)
                 .unwrap_or(true),
             threads,
+            series_summaries: HashMap::new(),
             filtered_thread_indices: Vec::new(),
             subscription_index: 0,
             subscription_row_index: 0,
@@ -351,6 +381,7 @@ impl AppState {
             preview_scroll: 0,
             started_at: Instant::now(),
             status: "ready".to_string(),
+            last_apply_snapshot: None,
             palette: CommandPaletteState::default(),
             search: SearchState::default(),
         };
@@ -361,6 +392,7 @@ impl AppState {
         {
             state.subscription_index = index;
         }
+        state.refresh_series_summaries();
         state.apply_thread_filter();
         state.sync_subscription_row_to_selected_item();
         state
@@ -401,9 +433,26 @@ impl AppState {
 
     fn replace_threads(&mut self, threads: Vec<ThreadRow>) {
         self.threads = threads;
+        self.refresh_series_summaries();
         self.thread_index = 0;
         self.preview_scroll = 0;
         self.apply_thread_filter();
+    }
+
+    fn refresh_series_summaries(&mut self) {
+        self.series_summaries =
+            patch_worker::build_series_index(&self.active_thread_mailbox, &self.threads);
+        if let Err(error) = patch_worker::hydrate_series_statuses(
+            &self.runtime.database_path,
+            &self.active_thread_mailbox,
+            &mut self.series_summaries,
+        ) {
+            tracing::warn!(
+                mailbox = %self.active_thread_mailbox,
+                error = %error,
+                "failed to hydrate patch series status from database"
+            );
+        }
     }
 
     fn enabled_mailboxes(&self) -> Vec<String> {
@@ -627,6 +676,7 @@ impl AppState {
         };
         let mailbox = item.mailbox.clone();
         let enabled = item.enabled;
+        tracing::debug!(mailbox = %mailbox, enabled, "user opened subscription");
 
         if !enabled {
             self.status = format!("subscription {} is disabled, press y to enable", mailbox);
@@ -664,6 +714,11 @@ impl AppState {
                             self.persist_ui_state();
                         }
                         Err(error) => {
+                            tracing::error!(
+                                mailbox = %mailbox,
+                                error = %error,
+                                "sync succeeded but reload thread rows failed"
+                            );
                             self.status = format!(
                                 "sync ok but failed to reload threads for {}: {error}",
                                 mailbox
@@ -671,11 +726,17 @@ impl AppState {
                         }
                     },
                     Err(error) => {
+                        tracing::error!(mailbox = %mailbox, error = %error, "subscription sync failed");
                         self.status = format!("failed to sync {}: {error}", mailbox);
                     }
                 }
             }
             Err(error) => {
+                tracing::error!(
+                    mailbox = %mailbox,
+                    error = %error,
+                    "failed to load mailbox thread rows"
+                );
                 self.status = format!("failed to load threads for {}: {error}", mailbox);
             }
         }
@@ -685,6 +746,115 @@ impl AppState {
         self.filtered_thread_indices
             .get(self.thread_index)
             .and_then(|index| self.threads.get(*index))
+    }
+
+    fn selected_series(&self) -> Option<&patch_worker::SeriesSummary> {
+        let thread = self.selected_thread()?;
+        self.series_summaries.get(&thread.thread_id)
+    }
+
+    fn run_patch_action(&mut self, action: patch_worker::PatchAction) {
+        tracing::debug!(action = action.name(), "user triggered patch action");
+        if !matches!(self.ui_page, UiPage::Mail) {
+            self.status = "patch action is only available on mail page".to_string();
+            return;
+        }
+
+        let Some(series) = self.selected_series().cloned() else {
+            self.status = "current thread is not a patch series".to_string();
+            return;
+        };
+
+        match patch_worker::run_action(&self.runtime, &series, action) {
+            Ok(result) => {
+                if let Some(series_summary) = self.series_summaries.get_mut(&series.thread_id) {
+                    series_summary.status = result.status;
+                }
+                if matches!(action, patch_worker::PatchAction::Apply)
+                    && result.status == crate::domain::models::PatchSeriesStatus::Applied
+                    && let (Some(before_head), Some(after_head)) =
+                        (result.head_before.as_deref(), result.head_after.as_deref())
+                {
+                    self.last_apply_snapshot = Some(LastApplySnapshot {
+                        thread_id: series.thread_id,
+                        before_head: before_head.to_string(),
+                        after_head: after_head.to_string(),
+                    });
+                }
+                let exit_code = result
+                    .exit_code
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let output_dir = result
+                    .output_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                self.status = format!(
+                    "{}: {} (status={} exit={} timeout={})",
+                    action.name(),
+                    result.summary,
+                    match result.status {
+                        crate::domain::models::PatchSeriesStatus::New => "new",
+                        crate::domain::models::PatchSeriesStatus::Reviewing => "reviewing",
+                        crate::domain::models::PatchSeriesStatus::Applied => "applied",
+                        crate::domain::models::PatchSeriesStatus::Failed => "failed",
+                        crate::domain::models::PatchSeriesStatus::Conflict => "conflict",
+                    },
+                    exit_code,
+                    result.timed_out
+                );
+                tracing::info!(
+                    action = action.name(),
+                    command = %result.command_line,
+                    output_dir = %output_dir,
+                    "patch action completed"
+                );
+            }
+            Err(error) => {
+                tracing::error!(action = action.name(), error = %error, "patch action failed");
+                self.status = format!("{} failed: {}", action.name(), error);
+            }
+        }
+    }
+
+    fn run_patch_undo_action(&mut self) {
+        tracing::debug!("user triggered patch undo action");
+        if !matches!(self.ui_page, UiPage::Mail) {
+            self.status = "undo is only available on mail page".to_string();
+            return;
+        }
+
+        let Some(snapshot) = self.last_apply_snapshot.clone() else {
+            self.status = "no apply action to undo in this session".to_string();
+            return;
+        };
+
+        match patch_worker::undo_last_apply(
+            &self.runtime,
+            &snapshot.before_head,
+            &snapshot.after_head,
+        ) {
+            Ok(head_after_reset) => {
+                if let Some(series_summary) = self.series_summaries.get_mut(&snapshot.thread_id) {
+                    series_summary.status = crate::domain::models::PatchSeriesStatus::New;
+                }
+                self.last_apply_snapshot = None;
+                self.status = format!(
+                    "undo apply: reset HEAD to {}",
+                    short_commit_id(&head_after_reset)
+                );
+                tracing::info!(
+                    thread_id = snapshot.thread_id,
+                    head = %head_after_reset,
+                    "patch apply undo completed"
+                );
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "patch apply undo failed");
+                self.status = format!("undo apply failed: {error}");
+            }
+        }
     }
 
     fn selected_kernel_tree_row(&self) -> Option<&KernelTreeRow> {
@@ -926,10 +1096,12 @@ impl AppState {
         self.palette.open = !self.palette.open;
         if self.palette.open {
             self.palette.clear_completion();
+            self.palette.clear_local_result();
             self.status = "command palette opened".to_string();
         } else {
             self.palette.input.clear();
             self.palette.clear_completion();
+            self.palette.clear_local_result();
             self.status = "command palette closed".to_string();
         }
     }
@@ -938,16 +1110,24 @@ impl AppState {
         self.palette.open = false;
         self.palette.input.clear();
         self.palette.clear_completion();
+        self.palette.clear_local_result();
         self.status = "command palette closed".to_string();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiAction {
+    Exit,
+    Restart,
 }
 
 enum LoopAction {
     Continue,
     Exit,
+    Restart,
 }
 
-pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<()> {
+pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiAction> {
     let ui_state_path = ui_state::path_for_data_dir(&config.data_dir);
     let persisted_ui_state = load_persisted_ui_state(&ui_state_path);
     let initial_mailbox = persisted_ui_state
@@ -1017,7 +1197,7 @@ fn tui_loop(
     state: &mut AppState,
     config: &RuntimeConfig,
     bootstrap: &BootstrapState,
-) -> Result<()> {
+) -> Result<TuiAction> {
     loop {
         terminal
             .draw(|frame| draw(frame, state, config, bootstrap))
@@ -1037,17 +1217,27 @@ fn tui_loop(
                     continue;
                 }
 
-                if let LoopAction::Exit = handle_key_event(state, key) {
-                    break;
+                match handle_key_event(state, key) {
+                    LoopAction::Continue => {}
+                    LoopAction::Exit => return Ok(TuiAction::Exit),
+                    LoopAction::Restart => return Ok(TuiAction::Restart),
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
+    tracing::debug!(
+        key = ?key,
+        ui_page = ?state.ui_page,
+        focus = ?state.focus,
+        code_focus = ?state.code_focus,
+        palette_open = state.palette.open,
+        search_active = state.search.active,
+        "user key event"
+    );
+
     if state.palette.open {
         if is_palette_toggle(key) {
             state.close_palette();
@@ -1092,6 +1282,27 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         KeyCode::Char('l') => state.move_focus_next(),
         KeyCode::Char('i') => state.move_up(),
         KeyCode::Char('k') => state.move_down(),
+        KeyCode::Char(character)
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Threads)
+                && character.eq_ignore_ascii_case(&'a') =>
+        {
+            state.run_patch_action(patch_worker::PatchAction::Apply);
+        }
+        KeyCode::Char(character)
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Threads)
+                && character.eq_ignore_ascii_case(&'d') =>
+        {
+            state.run_patch_action(patch_worker::PatchAction::Download);
+        }
+        KeyCode::Char(character)
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Threads)
+                && character.eq_ignore_ascii_case(&'u') =>
+        {
+            state.run_patch_undo_action();
+        }
         KeyCode::Enter => match state.ui_page {
             UiPage::Mail => match state.focus {
                 Pane::Subscriptions => state.handle_subscription_enter(),
@@ -1149,20 +1360,28 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
             state.close_palette();
         }
         KeyCode::Enter => {
-            let command = state.palette.input.trim().to_ascii_lowercase();
+            let raw_command = state.palette.input.trim().to_string();
+            tracing::debug!(command = %raw_command, "user submitted command palette input");
             state.palette.input.clear();
             state.palette.clear_completion();
 
-            if command.is_empty() {
+            if raw_command.is_empty() {
                 state.status = "empty command".to_string();
                 return LoopAction::Continue;
             }
 
+            if let Some(local_command) = raw_command.strip_prefix('!') {
+                run_palette_local_command(state, local_command);
+                return LoopAction::Continue;
+            }
+
+            state.palette.clear_local_result();
+            let command = raw_command.to_ascii_lowercase();
             match command.as_str() {
                 "quit" | "exit" => return LoopAction::Exit,
+                "restart" => return LoopAction::Restart,
                 "help" => {
-                    state.status =
-                        "commands: quit, exit, help, sync [mailbox], config ...".to_string();
+                    state.status = "commands: quit, exit, restart, help, sync [mailbox], config ..., !<local shell command> | keys: j/l focus, i/k move, y/n enable, a apply, d download, u undo apply".to_string();
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
                     run_palette_sync(state, value);
@@ -1178,6 +1397,9 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         KeyCode::Backspace => {
             state.palette.input.pop();
             state.palette.clear_completion();
+            if !state.palette.input.trim_start().starts_with('!') {
+                state.palette.clear_local_result();
+            }
         }
         KeyCode::Tab => {
             apply_palette_completion(state);
@@ -1189,6 +1411,9 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         {
             state.palette.input.push(character);
             state.palette.clear_completion();
+            if !state.palette.input.trim_start().starts_with('!') {
+                state.palette.clear_local_result();
+            }
         }
         _ => {}
     }
@@ -1196,7 +1421,150 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
     LoopAction::Continue
 }
 
+fn run_palette_local_command(state: &mut AppState, local_command: &str) {
+    let local_command = local_command.trim();
+    if local_command.is_empty() {
+        state.palette.clear_local_result();
+        state.status = "empty local command after !".to_string();
+        return;
+    }
+    tracing::debug!(command = %local_command, "user triggered local shell command");
+
+    let cwd = match resolve_palette_local_workdir(state) {
+        Ok(path) => path,
+        Err(message) => {
+            tracing::error!(command = %local_command, error = %message, "local command setup failed");
+            state.palette.clear_local_result();
+            state.status = format!("local command setup failed: {message}");
+            return;
+        }
+    };
+
+    let output = ProcessCommand::new("bash")
+        .arg("-lc")
+        .arg(local_command)
+        .current_dir(&cwd)
+        .output();
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let output_text = render_local_command_output(&stdout, &stderr);
+            let summary = first_non_empty_line(&stdout)
+                .or_else(|| first_non_empty_line(&stderr))
+                .unwrap_or_else(|| "<no output>".to_string());
+            let exit_code = output
+                .status
+                .code()
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            state.palette.last_local_result = Some(LocalCommandResult {
+                command: local_command.to_string(),
+                cwd: cwd.clone(),
+                exit_code: exit_code.clone(),
+                output: output_text,
+            });
+
+            if output.status.success() {
+                state.status = format!(
+                    "local command ok (exit={} cwd={}): {}",
+                    exit_code,
+                    cwd.display(),
+                    summary
+                );
+                tracing::info!(
+                    command = local_command,
+                    cwd = %cwd.display(),
+                    exit_code = %exit_code,
+                    "local command executed from command palette"
+                );
+            } else {
+                state.status = format!(
+                    "local command failed (exit={} cwd={}): {}",
+                    exit_code,
+                    cwd.display(),
+                    summary
+                );
+                tracing::error!(
+                    command = local_command,
+                    cwd = %cwd.display(),
+                    exit_code = %exit_code,
+                    "local command failed from command palette"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                command = %local_command,
+                cwd = %cwd.display(),
+                error = %error,
+                "failed to launch local command from command palette"
+            );
+            state.palette.last_local_result = Some(LocalCommandResult {
+                command: local_command.to_string(),
+                cwd: cwd.clone(),
+                exit_code: "spawn-error".to_string(),
+                output: format!("{error}"),
+            });
+            state.status = format!(
+                "failed to launch local command in {}: {}",
+                cwd.display(),
+                error
+            );
+        }
+    }
+}
+
+fn render_local_command_output(stdout: &str, stderr: &str) -> String {
+    let stdout_trimmed = stdout.trim_end();
+    let stderr_trimmed = stderr.trim_end();
+    match (stdout_trimmed.is_empty(), stderr_trimmed.is_empty()) {
+        (true, true) => "<no output>".to_string(),
+        (false, true) => stdout_trimmed.to_string(),
+        (true, false) => format!("[stderr]\n{stderr_trimmed}"),
+        (false, false) => format!("{stdout_trimmed}\n\n[stderr]\n{stderr_trimmed}"),
+    }
+}
+
+fn short_commit_id(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
+fn resolve_palette_local_workdir(state: &AppState) -> std::result::Result<PathBuf, String> {
+    if let Some(path) = state.runtime.kernel_trees.first() {
+        if !path.exists() {
+            return Err(format!("[kernel].tree does not exist: {}", path.display()));
+        }
+        if !path.is_dir() {
+            return Err(format!(
+                "[kernel].tree is not a directory: {}",
+                path.display()
+            ));
+        }
+        return Ok(path.clone());
+    }
+
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set and [kernel].tree is not configured".to_string())?;
+    if !home.exists() || !home.is_dir() {
+        return Err(format!("home directory is unavailable: {}", home.display()));
+    }
+
+    Ok(home)
+}
+
+fn first_non_empty_line(value: &str) -> Option<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn run_palette_sync(state: &mut AppState, command: &str) {
+    tracing::debug!(command = %command, "user executed sync command from palette");
     let mailbox_override = command
         .split_whitespace()
         .nth(1)
@@ -1255,30 +1623,38 @@ fn run_palette_sync(state: &mut AppState, command: &str) {
         state.replace_threads(rows);
     }
 
+    let first_error_text = first_error
+        .as_deref()
+        .unwrap_or("unknown error")
+        .to_string();
+
     state.status = if failed == 0 {
         format!(
             "sync ok: mailboxes={} fetched={} inserted={} updated={}",
             success, total_fetched, total_inserted, total_updated
         )
     } else if success == 0 {
-        format!(
-            "sync failed: {}",
-            first_error.unwrap_or_else(|| "unknown error".to_string())
-        )
+        format!("sync failed: {}", first_error_text)
     } else {
         format!(
             "sync partial: ok={} failed={} fetched={} inserted={} updated={} first_error={}",
-            success,
-            failed,
-            total_fetched,
-            total_inserted,
-            total_updated,
-            first_error.unwrap_or_else(|| "unknown error".to_string())
+            success, failed, total_fetched, total_inserted, total_updated, first_error_text
         )
     };
+
+    if failed > 0 {
+        tracing::error!(
+            command = %command,
+            success,
+            failed,
+            first_error = %first_error_text,
+            "palette sync command finished with errors"
+        );
+    }
 }
 
 fn run_palette_config(state: &mut AppState, command: &str) {
+    tracing::debug!(command = %command, "user executed config command from palette");
     let mut segments = command.split_whitespace();
     let _ = segments.next();
     let action = segments.next().unwrap_or("show").to_ascii_lowercase();
@@ -1318,11 +1694,17 @@ fn run_palette_config(state: &mut AppState, command: &str) {
                         state.status = format!("config updated: {key} = {rendered_value}");
                     }
                     Err(error) => {
+                        tracing::error!(
+                            key = %key,
+                            error = %error,
+                            "config file updated but runtime reload failed"
+                        );
                         state.status =
                             format!("config file updated but runtime reload failed: {error}");
                     }
                 },
                 Err(error) => {
+                    tracing::error!(key = %key, error = %error, "failed to update config key");
                     state.status = format!("failed to set config key {key}: {error}");
                 }
             }
@@ -1355,6 +1737,7 @@ fn show_config_key(state: &mut AppState, key: &str) {
             }
         }
         Err(error) => {
+            tracing::error!(key = %key, error = %error, "failed to read config key");
             state.status = format!("failed to read config key {key}: {error}");
         }
     }
@@ -1538,6 +1921,11 @@ fn effective_config_value(state: &AppState, key: &str) -> Option<String> {
 }
 
 fn apply_palette_completion(state: &mut AppState) {
+    if state.palette.input.trim_start().starts_with('!') {
+        apply_local_palette_completion(state);
+        return;
+    }
+
     let input_before_completion = state.palette.input.clone();
     let context = parse_palette_completion_context(&state.palette.input);
     let mut suggestions = palette_completion_suggestions(state, &context);
@@ -1605,6 +1993,241 @@ fn apply_palette_completion(state: &mut AppState) {
             state.palette.suggestions.len()
         )
     };
+}
+
+fn apply_local_palette_completion(state: &mut AppState) {
+    let Some((local_prefix, local_input)) = split_local_palette_input(&state.palette.input) else {
+        state.palette.clear_completion();
+        state.status = "invalid local command mode".to_string();
+        return;
+    };
+
+    let input_before_completion = state.palette.input.clone();
+    let context = parse_palette_completion_context(&local_input);
+    let mut suggestions = local_completion_suggestions(state, &context);
+    let prefix_lower = context.active_token.to_ascii_lowercase();
+    suggestions.retain(|suggestion| {
+        suggestion
+            .value
+            .to_ascii_lowercase()
+            .starts_with(&prefix_lower)
+    });
+    suggestions.sort_by(|left, right| left.value.cmp(&right.value));
+    suggestions.dedup_by(|left, right| left.value == right.value);
+
+    if suggestions.is_empty() {
+        state.palette.clear_completion();
+        state.status = "no completion candidates".to_string();
+        return;
+    }
+
+    let completion_values: Vec<String> = suggestions
+        .iter()
+        .map(|suggestion| suggestion.value.clone())
+        .collect();
+    let completion_prefix = format!("{local_prefix}{}", context.prefix);
+
+    if completion_values.len() == 1 {
+        let candidate = completion_values[0].clone();
+        state.palette.input = format!(
+            "{}{}{}",
+            completion_prefix,
+            candidate,
+            completion_suffix(&candidate)
+        );
+        state.palette.clear_completion();
+        state.status = format!("completed: {candidate}");
+        return;
+    }
+
+    let common_prefix = longest_common_prefix(&completion_values);
+    if common_prefix.len() > context.active_token.len() {
+        state.palette.input = format!("{completion_prefix}{common_prefix}");
+    }
+
+    let show_suggestions =
+        context.active_token.is_empty() || state.palette.last_tab_input == input_before_completion;
+    state.palette.suggestions = suggestions;
+    state.palette.show_suggestions = show_suggestions;
+    state.palette.last_tab_input = state.palette.input.clone();
+
+    let summary = state
+        .palette
+        .suggestions
+        .iter()
+        .map(|suggestion| suggestion.value.as_str())
+        .take(5)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    state.status = if show_suggestions {
+        format!(
+            "completion options: {}",
+            if summary.is_empty() {
+                "<none>".to_string()
+            } else {
+                summary
+            }
+        )
+    } else {
+        format!(
+            "{} completion candidates (Tab again to list)",
+            state.palette.suggestions.len()
+        )
+    };
+}
+
+fn completion_suffix(candidate: &str) -> &'static str {
+    if candidate.ends_with('/') { "" } else { " " }
+}
+
+fn split_local_palette_input(input: &str) -> Option<(String, String)> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('!') {
+        return None;
+    }
+    let leading_whitespace_len = input.len() - trimmed.len();
+    let leading = &input[..leading_whitespace_len];
+    let content = trimmed.strip_prefix('!')?.to_string();
+    Some((format!("{leading}!"), content))
+}
+
+fn local_completion_suggestions(
+    state: &AppState,
+    context: &PaletteCompletionContext,
+) -> Vec<PaletteSuggestion> {
+    let token = context.active_token.as_str();
+    let token_looks_like_path =
+        token.contains('/') || token.starts_with('.') || token.starts_with('~');
+    let Ok(workdir) = resolve_palette_local_workdir(state) else {
+        return Vec::new();
+    };
+
+    if context.active_index == 0 && !token_looks_like_path {
+        return local_command_completion_suggestions();
+    }
+
+    local_path_completion_suggestions(&workdir, token)
+}
+
+fn local_command_completion_suggestions() -> Vec<PaletteSuggestion> {
+    let mut seen = HashSet::new();
+    let mut suggestions = Vec::new();
+
+    for builtin in ["cd", "echo", "pwd", "true", "false", "test"] {
+        if seen.insert(builtin.to_string()) {
+            suggestions.push(PaletteSuggestion {
+                value: builtin.to_string(),
+                description: Some("Shell builtin".to_string()),
+            });
+        }
+    }
+
+    if let Some(path_os) = env::var_os("PATH") {
+        for directory in env::split_paths(&path_os) {
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !is_executable_path(&path) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.is_empty() || !seen.insert(name.clone()) {
+                    continue;
+                }
+                suggestions.push(PaletteSuggestion {
+                    value: name,
+                    description: Some("Executable in PATH".to_string()),
+                });
+            }
+        }
+    }
+
+    suggestions
+}
+
+fn local_path_completion_suggestions(base_dir: &Path, token: &str) -> Vec<PaletteSuggestion> {
+    if token == "~" {
+        return vec![PaletteSuggestion {
+            value: "~/".to_string(),
+            description: Some("Home directory".to_string()),
+        }];
+    }
+
+    let (dir_part, entry_prefix) = token
+        .rsplit_once('/')
+        .map(|(left, right)| (Some(left), right))
+        .unwrap_or((None, token));
+
+    let (search_dir, display_prefix) = match dir_part {
+        Some(part) if token.starts_with('/') && part.is_empty() => {
+            (PathBuf::from("/"), "/".to_string())
+        }
+        Some("~") => match env::var("HOME") {
+            Ok(home) => (PathBuf::from(home), "~/".to_string()),
+            Err(_) => return Vec::new(),
+        },
+        Some(part) if part.starts_with("~/") => match env::var("HOME") {
+            Ok(home) => {
+                let suffix = part.strip_prefix("~/").unwrap_or_default();
+                (PathBuf::from(home).join(suffix), format!("{part}/"))
+            }
+            Err(_) => return Vec::new(),
+        },
+        Some(part) => {
+            let search = if Path::new(part).is_absolute() {
+                PathBuf::from(part)
+            } else {
+                base_dir.join(part)
+            };
+            (search, format!("{part}/"))
+        }
+        None => (base_dir.to_path_buf(), String::new()),
+    };
+
+    let Ok(entries) = fs::read_dir(search_dir) else {
+        return Vec::new();
+    };
+
+    let mut suggestions = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(entry_prefix) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        let mut value = format!("{display_prefix}{name}");
+        if is_dir {
+            value.push('/');
+        }
+        suggestions.push(PaletteSuggestion {
+            value,
+            description: Some(if is_dir {
+                "Directory".to_string()
+            } else {
+                "Path".to_string()
+            }),
+        });
+    }
+    suggestions
+}
+
+fn is_executable_path(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path)
+            .map(|metadata| metadata.is_file() && (metadata.permissions().mode() & 0o111 != 0))
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 fn palette_completion_suggestions(
@@ -1912,12 +2535,8 @@ fn draw(
     }
 
     let shortcuts_text = match state.ui_page {
-        UiPage::Mail => {
-            "/ search | Tab page | : palette | j/l focus | i/k move | y/n enable | Enter open/toggle"
-        }
-        UiPage::CodeBrowser => {
-            "Tab page | : palette | j/l focus | i/k move/scroll | Enter expand/collapse"
-        }
+        UiPage::Mail => "/ search | Tab page | : palette | Enter open/toggle",
+        UiPage::CodeBrowser => "Tab page | : palette | Enter expand/collapse",
     };
     let footer_sections = Layout::default()
         .direction(Direction::Horizontal)
@@ -2024,6 +2643,7 @@ fn draw_subscriptions(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn draw_kernel_tree(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    frame.render_widget(Clear, area);
     let block = panel_block_with_title("Kernel Tree", state.code_focus == CodePaneFocus::Tree);
     let items: Vec<ListItem> = if state.kernel_tree_rows.is_empty() {
         vec![ListItem::new(
@@ -2060,6 +2680,7 @@ fn draw_kernel_tree(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 }
 
 fn draw_code_source_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    frame.render_widget(Clear, area);
     let block = panel_block_with_title("Source Preview", state.code_focus == CodePaneFocus::Source);
     let inner_area = block.inner(area);
     frame.render_widget(block, area);
@@ -2327,7 +2948,12 @@ fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 .copied()
                 .unwrap_or(1);
             items.push(
-                ListItem::new(thread_group_line(row.thread_id, visible_count)).style(
+                ListItem::new(thread_group_line(
+                    row.thread_id,
+                    visible_count,
+                    state.series_summaries.get(&row.thread_id),
+                ))
+                .style(
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::BOLD),
@@ -2355,9 +2981,24 @@ fn draw_threads(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn thread_group_line(thread_id: i64, visible_count: usize) -> String {
+fn thread_group_line(
+    thread_id: i64,
+    visible_count: usize,
+    series: Option<&patch_worker::SeriesSummary>,
+) -> String {
     let noun = if visible_count == 1 { "msg" } else { "msgs" };
-    format!("Thread {thread_id} ({visible_count} {noun})")
+    let mut line = format!("Thread {thread_id} ({visible_count} {noun})");
+    if let Some(series) = series {
+        line.push_str(&format!(
+            " | v{} {}/{} | integrity={} | status={}",
+            series.version,
+            series.present_count(),
+            series.expected_total,
+            series.integrity.short_label(),
+            series.status_label()
+        ));
+    }
+    line
 }
 
 fn thread_line_max_chars(area: Rect) -> usize {
@@ -2400,7 +3041,12 @@ fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
 
 fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &RuntimeConfig) {
     let preview = if let Some(thread) = state.selected_thread() {
-        load_mail_preview(thread)
+        let mut sections = Vec::new();
+        if let Some(series_details) = load_series_preview(state, config, thread.thread_id) {
+            sections.push(series_details);
+        }
+        sections.push(load_mail_preview(thread));
+        sections.join("\n\n")
     } else {
         format!(
             "No synced thread data\n\nRun:\n  courier sync --fixture-dir <DIR>\n\nConfig: {}\nDatabase: {}",
@@ -2419,6 +3065,71 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, inner_area);
+}
+
+fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64) -> Option<String> {
+    let series = state.series_summaries.get(&thread_id)?;
+    let mut lines = vec![
+        format!(
+            "Series: v{} {}/{} | integrity={} | status={}",
+            series.version,
+            series.present_count(),
+            series.expected_total,
+            series.integrity.short_label(),
+            series.status_label()
+        ),
+        format!("Anchor: <{}>", series.anchor_message_id),
+    ];
+
+    if !series.missing_seq.is_empty() {
+        lines.push(format!(
+            "Missing: {}",
+            series
+                .missing_seq
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if !series.duplicate_seq.is_empty() {
+        lines.push(format!(
+            "Duplicate: {}",
+            series
+                .duplicate_seq
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+
+    match patch_worker::load_latest_report(
+        &config.database_path,
+        &state.active_thread_mailbox,
+        thread_id,
+    ) {
+        Ok(Some(report)) => {
+            if let Some(summary) = report.last_summary.as_deref() {
+                lines.push(format!("Last run: {summary}"));
+            }
+            if let Some(exit_code) = report.last_exit_code {
+                lines.push(format!("Exit code: {exit_code}"));
+            }
+            if let Some(command) = report.last_command.as_deref() {
+                lines.push(format!("Command: {command}"));
+            }
+            if let Some(error) = report.last_error.as_deref() {
+                lines.push(format!("Error: {error}"));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            lines.push(format!("Series report load failed: {error}"));
+        }
+    }
+
+    Some(lines.join("\n"))
 }
 
 fn load_mail_preview(thread: &ThreadRow) -> String {
@@ -2486,9 +3197,7 @@ fn format_preview_with_headers(
     subject: &str,
     body: &str,
 ) -> String {
-    format!(
-        "From: {from}\nSent: {sent}\nTo: {to}\nCc: {cc}\nSubject: {subject}\n\n{body}"
-    )
+    format!("From: {from}\nSent: {sent}\nTo: {to}\nCc: {cc}\nSubject: {subject}\n\n{body}")
 }
 
 fn normalized_subject_or_default(subject: &str) -> String {
@@ -2749,7 +3458,8 @@ fn sanitize_source_preview_text(input: &str) -> String {
     let mut sanitized = String::with_capacity(input.len());
     for character in input.chars() {
         match character {
-            '\n' | '\t' => sanitized.push(character),
+            '\n' => sanitized.push('\n'),
+            '\t' => sanitized.push_str(PREVIEW_TAB_SPACES),
             _ if character.is_control() => {}
             _ => sanitized.push(character),
         }
@@ -2864,38 +3574,63 @@ fn draw_command_palette(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(input, sections[0]);
 
     let hints = Paragraph::new(
-        "Tab: complete (press twice to list args)  Enter: execute  Esc: close  Ctrl+` or F1: toggle  : opens",
+        "Tab: complete (built-in + !local)  Enter: execute  !<cmd>: local shell in [kernel].tree (or ~)  Esc: close",
     );
     frame.render_widget(hints, sections[1]);
 
-    let suggestions = palette_overlay_suggestions(state);
-    let candidate_title = if suggestions.is_empty() {
-        "Candidates: <none>"
-    } else if state.palette.show_suggestions {
-        "Completion Candidates"
+    let show_local_result = state.palette.last_local_result.is_some()
+        && (state.palette.input.trim().is_empty()
+            || state.palette.input.trim_start().starts_with('!'));
+
+    if show_local_result {
+        if let Some(result) = state.palette.last_local_result.as_ref() {
+            let header = Paragraph::new(format!(
+                "Local Result: !{} | exit={} | cwd={}",
+                result.command,
+                result.exit_code,
+                result.cwd.display()
+            ));
+            frame.render_widget(header, sections[2]);
+
+            let output = Paragraph::new(result.output.clone())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Gray)),
+                )
+                .wrap(Wrap { trim: false });
+            frame.render_widget(output, sections[3]);
+        }
     } else {
-        "Command Candidates"
-    };
-    let candidate_header = Paragraph::new(candidate_title);
-    frame.render_widget(candidate_header, sections[2]);
+        let suggestions = palette_overlay_suggestions(state);
+        let candidate_title = if suggestions.is_empty() {
+            "Candidates: <none>"
+        } else if state.palette.show_suggestions {
+            "Completion Candidates"
+        } else {
+            "Command Candidates"
+        };
+        let candidate_header = Paragraph::new(candidate_title);
+        frame.render_widget(candidate_header, sections[2]);
 
-    let items: Vec<ListItem> = suggestions
-        .iter()
-        .take(8)
-        .map(|suggestion| match suggestion.description.as_deref() {
-            Some(description) if !description.is_empty() => {
-                ListItem::new(format!("{} - {}", suggestion.value, description))
-            }
-            _ => ListItem::new(suggestion.value.clone()),
-        })
-        .collect();
+        let items: Vec<ListItem> = suggestions
+            .iter()
+            .take(8)
+            .map(|suggestion| match suggestion.description.as_deref() {
+                Some(description) if !description.is_empty() => {
+                    ListItem::new(format!("{} - {}", suggestion.value, description))
+                }
+                _ => ListItem::new(suggestion.value.clone()),
+            })
+            .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Gray)),
-    );
-    frame.render_widget(list, sections[3]);
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray)),
+        );
+        frame.render_widget(list, sections[3]);
+    }
 }
 
 fn palette_overlay_suggestions(state: &AppState) -> Vec<PaletteSuggestion> {
@@ -2936,6 +3671,9 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn matching_commands(input: &str) -> Vec<&'static PaletteCommand> {
     let query = input.trim().to_ascii_lowercase();
+    if query.starts_with('!') {
+        return Vec::new();
+    }
     let mut matched: Vec<(u8, &PaletteCommand)> = Vec::new();
 
     for command in PALETTE_COMMANDS {
@@ -2997,9 +3735,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
-    use ratatui::Terminal;
 
     use crate::infra::bootstrap::BootstrapState;
     use crate::infra::config::RuntimeConfig;
@@ -3007,10 +3745,10 @@ mod tests {
     use crate::infra::mail_store::ThreadRow;
 
     use super::{
-        AppState, LoopAction, Pane, UiPage, draw, extract_mail_body_preview,
-        extract_mail_preview, handle_key_event, is_palette_open_shortcut, is_palette_toggle,
-        load_source_file_preview, mail_page_panes, matching_commands, subscription_line,
-        thread_line, SubscriptionItem,
+        AppState, CodePaneFocus, LoopAction, Pane, SubscriptionItem, UiPage, draw,
+        extract_mail_body_preview, extract_mail_preview, handle_key_event,
+        is_palette_open_shortcut, is_palette_toggle, load_source_file_preview, mail_page_panes,
+        matching_commands, resolve_palette_local_workdir, subscription_line, thread_line,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -3113,18 +3851,25 @@ mod tests {
     #[test]
     fn empty_query_returns_all_palette_commands() {
         let all = matching_commands("");
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         assert_eq!(all[0].name, "config");
         assert_eq!(all[1].name, "exit");
         assert_eq!(all[2].name, "help");
         assert_eq!(all[3].name, "quit");
-        assert_eq!(all[4].name, "sync");
+        assert_eq!(all[4].name, "restart");
+        assert_eq!(all[5].name, "sync");
     }
 
     #[test]
     fn prefix_matches_rank_before_fuzzy_matches() {
         let commands = matching_commands("ex");
         assert_eq!(commands[0].name, "exit");
+    }
+
+    #[test]
+    fn bang_mode_is_not_matched_as_builtin_command() {
+        let commands = matching_commands("!pwd");
+        assert!(commands.is_empty());
     }
 
     #[test]
@@ -3177,7 +3922,10 @@ mod tests {
         let row = sample_thread(&long_subject, "x@example.com", 0);
 
         let line_capped_at_120 = thread_line(&row, 200);
-        assert_eq!(line_capped_at_120.chars().count(), super::THREAD_LINE_MAX_CHARS);
+        assert_eq!(
+            line_capped_at_120.chars().count(),
+            super::THREAD_LINE_MAX_CHARS
+        );
         assert!(line_capped_at_120.ends_with("..."));
 
         let line_capped_by_width = thread_line(&row, 30);
@@ -3196,6 +3944,39 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(matches!(action, LoopAction::Exit));
+    }
+
+    #[test]
+    fn command_palette_restart_requests_tui_restart() {
+        let mut state = AppState::new(vec![], test_runtime());
+        state.palette.open = true;
+        state.palette.input = "restart".to_string();
+
+        let action = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(action, LoopAction::Restart));
+    }
+
+    #[test]
+    fn command_palette_help_includes_keyboard_shortcuts() {
+        let mut state = AppState::new(vec![], test_runtime());
+        state.palette.open = true;
+        state.palette.input = "help".to_string();
+
+        let action = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(action, LoopAction::Continue));
+        assert!(state.status.contains("keys:"));
+        assert!(state.status.contains("j/l focus"));
+        assert!(state.status.contains("i/k move"));
+        assert!(state.status.contains("y/n enable"));
+        assert!(state.status.contains("a apply"));
+        assert!(state.status.contains("d download"));
+        assert!(state.status.contains("u undo apply"));
     }
 
     #[test]
@@ -3325,6 +4106,99 @@ mailbox = "inbox"
     }
 
     #[test]
+    fn palette_tab_completes_local_command_path() {
+        let tree_root = temp_dir("palette-bang-complete");
+        fs::write(tree_root.join("echo-local"), "#!/bin/sh\n").expect("write executable");
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        state.palette.open = true;
+        state.palette.input = "!./ec".to_string();
+
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(state.palette.input, "!./echo-local ");
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn local_command_mode_uses_kernel_tree_as_workdir() {
+        let tree_root = temp_dir("palette-bang-kernel-tree");
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let state = AppState::new(vec![], runtime);
+
+        let workdir = resolve_palette_local_workdir(&state).expect("resolve local workdir");
+        assert_eq!(workdir, tree_root);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn local_command_mode_falls_back_to_home_workdir() {
+        let state = AppState::new(vec![], test_runtime());
+        let resolved = resolve_palette_local_workdir(&state);
+        match std::env::var("HOME") {
+            Ok(home) => assert_eq!(resolved.expect("resolve home"), PathBuf::from(home)),
+            Err(_) => assert!(resolved.is_err()),
+        }
+    }
+
+    #[test]
+    fn palette_bang_executes_local_command() {
+        let tree_root = temp_dir("palette-bang-exec");
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        state.palette.open = true;
+        state.palette.input = "!pwd".to_string();
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(state.status.contains("local command ok"));
+        assert!(state.status.contains(&tree_root.display().to_string()));
+        let local_result = state
+            .palette
+            .last_local_result
+            .as_ref()
+            .expect("local result should exist");
+        assert_eq!(local_result.command, "pwd");
+        assert!(
+            local_result
+                .output
+                .contains(&tree_root.display().to_string())
+        );
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn command_palette_renders_local_command_result() {
+        let tree_root = temp_dir("palette-bang-render");
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let bootstrap = test_bootstrap(&runtime);
+        let mut state = AppState::new(vec![], runtime.clone());
+        state.palette.open = true;
+        state.palette.input = "!pwd".to_string();
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+            .expect("draw frame");
+        let rendered = format!("{}", terminal.backend());
+        assert!(rendered.contains("Local Result"));
+        assert!(rendered.contains("!pwd"));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
     fn tab_toggles_between_mail_page_and_code_browser_page() {
         let tree_root = temp_dir("kernel-tree-tab");
         fs::create_dir_all(tree_root.join("io_uring")).expect("create kernel dir");
@@ -3421,8 +4295,9 @@ mailbox = "inbox"
         state.kernel_tree_row_index = file_index;
 
         let preview = load_source_file_preview(&file_path);
-        assert!(preview.contains("\tif true {"));
+        assert!(preview.contains("    if true {"));
         assert!(preview.contains("        return;"));
+        assert!(!preview.contains('\t'));
 
         let _ = fs::remove_dir_all(tree_root);
     }
@@ -3624,6 +4499,36 @@ mailbox = "inbox"
     }
 
     #[test]
+    fn a_d_and_u_require_patch_series_or_apply_snapshot_on_thread_focus() {
+        let mut state = AppState::new(
+            vec![sample_thread("normal mail", "plain@example.com", 0)],
+            test_runtime(),
+        );
+        state.focus = Pane::Threads;
+
+        let action_apply = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert!(matches!(action_apply, LoopAction::Continue));
+        assert!(state.status.contains("not a patch series"));
+
+        let action_download = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert!(matches!(action_download, LoopAction::Continue));
+        assert!(state.status.contains("not a patch series"));
+
+        let action_undo = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+        assert!(matches!(action_undo, LoopAction::Continue));
+        assert!(state.status.contains("no apply action to undo"));
+    }
+
+    #[test]
     fn preview_hides_rfc_headers_and_keeps_body() {
         let raw = b"Message-ID: <a@example.com>\r\nSubject: test\r\nFrom: a@example.com\r\n\r\nhello\nworld\n";
         let preview = extract_mail_body_preview(raw);
@@ -3724,6 +4629,52 @@ mailbox = "inbox"
         let second_frame = format!("{}", terminal.backend());
         assert!(!second_frame.contains("STALE_PREVIEW_TOKEN_123456"));
         assert!(second_frame.contains("short"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn code_source_preview_redraw_clears_stale_characters_after_file_switch() {
+        let root = temp_dir("code-preview-clear");
+        let file_a = root.join("a-long.rs");
+        let file_b = root.join("b-short.rs");
+        fs::write(
+            &file_a,
+            "fn demo() {\n    let _x = \"STALE_SOURCE_TOKEN_987654\";\n}\n",
+        )
+        .expect("write file a");
+        fs::write(&file_b, "fn demo() {}\n").expect("write file b");
+
+        let runtime = test_runtime_with_kernel_tree(root.clone());
+        let bootstrap = test_bootstrap(&runtime);
+        let mut state = AppState::new(vec![], runtime.clone());
+        state.ui_page = UiPage::CodeBrowser;
+        state.code_focus = CodePaneFocus::Tree;
+
+        let index_a = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_a)
+            .expect("find file a");
+        state.kernel_tree_row_index = index_a;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+            .expect("draw first frame");
+        let first_frame = format!("{}", terminal.backend());
+        assert!(first_frame.contains("STALE_SOURCE_TOKEN_987654"));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+        terminal
+            .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+            .expect("draw second frame");
+        let second_frame = format!("{}", terminal.backend());
+        assert!(!second_frame.contains("STALE_SOURCE_TOKEN_987654"));
+        assert!(second_frame.contains("fn demo() {}"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,6 +1,10 @@
 use std::env;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::infra::error::{CourierError, ErrorCode, Result};
 
 #[derive(Debug, Clone)]
 pub struct B4Check {
@@ -14,9 +18,24 @@ pub enum B4Status {
     Missing,
 }
 
+#[derive(Debug, Clone)]
+pub struct B4CommandResult {
+    pub command_line: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+}
+
 enum Candidate {
     Path(PathBuf),
     Program(String),
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCommand {
+    command: String,
+    display_path: PathBuf,
 }
 
 pub fn check(configured_path: Option<&Path>) -> B4Check {
@@ -25,7 +44,7 @@ pub fn check(configured_path: Option<&Path>) -> B4Check {
 
     for candidate in candidates {
         match probe(&candidate) {
-            Probe::Available { path, version } => {
+            Probe::Available { path, version, .. } => {
                 return B4Check {
                     status: B4Status::Available { path, version },
                 };
@@ -46,6 +65,79 @@ pub fn check(configured_path: Option<&Path>) -> B4Check {
             status: B4Status::Missing,
         }
     }
+}
+
+pub fn run(
+    configured_path: Option<&Path>,
+    subcommand: &str,
+    args: &[String],
+    timeout: Duration,
+    working_dir: Option<&Path>,
+) -> Result<B4CommandResult> {
+    let resolved = resolve_command(configured_path)?;
+
+    let mut command = Command::new(&resolved.command);
+    if let Some(working_dir) = working_dir {
+        command.current_dir(working_dir);
+    }
+    command.arg(subcommand);
+    for arg in args {
+        command.arg(arg);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let command_line = render_command_line(&resolved.command, subcommand, args);
+    let mut child = command.spawn().map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::B4,
+            format!(
+                "failed to spawn b4 command '{}' ({})",
+                command_line,
+                resolved.display_path.display()
+            ),
+            error,
+        )
+    })?;
+
+    let started_at = Instant::now();
+    let mut timed_out = false;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if started_at.elapsed() >= timeout {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+            Err(error) => {
+                return Err(CourierError::with_source(
+                    ErrorCode::B4,
+                    format!("failed while waiting for b4 command '{}'", command_line),
+                    error,
+                ));
+            }
+        }
+    }
+
+    let output = child.wait_with_output().map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::B4,
+            format!("failed to collect output for b4 command '{}'", command_line),
+            error,
+        )
+    })?;
+
+    Ok(B4CommandResult {
+        command_line,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code(),
+        timed_out,
+    })
 }
 
 fn candidates(configured_path: Option<&Path>) -> Vec<Candidate> {
@@ -72,8 +164,15 @@ fn candidates(configured_path: Option<&Path>) -> Vec<Candidate> {
 }
 
 enum Probe {
-    Available { path: PathBuf, version: String },
-    Broken { path: PathBuf, reason: String },
+    Available {
+        command: String,
+        path: PathBuf,
+        version: String,
+    },
+    Broken {
+        path: PathBuf,
+        reason: String,
+    },
     Missing,
 }
 
@@ -83,16 +182,16 @@ fn probe(candidate: &Candidate) -> Probe {
             if !path.exists() {
                 return Probe::Missing;
             }
-            run_probe(path, path)
+            run_probe(path, path, path.display().to_string())
         }
         Candidate::Program(program) => {
             let label = PathBuf::from(format!("{program} (PATH)"));
-            run_probe(program, &label)
+            run_probe(program, &label, program.clone())
         }
     }
 }
 
-fn run_probe<T>(command: T, label: &Path) -> Probe
+fn run_probe<T>(command: T, label: &Path, command_value: String) -> Probe
 where
     T: AsRef<std::ffi::OsStr>,
 {
@@ -103,6 +202,7 @@ where
                 .unwrap_or_else(|| "unknown".to_string());
 
             Probe::Available {
+                command: command_value,
                 path: label.to_path_buf(),
                 version,
             }
@@ -123,6 +223,59 @@ where
             reason: error.to_string(),
         },
     }
+}
+
+fn resolve_command(configured_path: Option<&Path>) -> Result<ResolvedCommand> {
+    let mut last_failure: Option<(PathBuf, String)> = None;
+    for candidate in candidates(configured_path) {
+        match probe(&candidate) {
+            Probe::Available { command, path, .. } => {
+                return Ok(ResolvedCommand {
+                    command,
+                    display_path: path,
+                });
+            }
+            Probe::Broken { path, reason } => {
+                last_failure = Some((path, reason));
+            }
+            Probe::Missing => {}
+        }
+    }
+
+    if let Some((path, reason)) = last_failure {
+        return Err(CourierError::new(
+            ErrorCode::B4,
+            format!("b4 executable '{}' is broken: {}", path.display(), reason),
+        ));
+    }
+
+    Err(CourierError::new(
+        ErrorCode::B4,
+        "b4 executable not found (checked config path, COURIER_B4_PATH, vendor/b4/b4.sh and PATH)",
+    ))
+}
+
+fn render_command_line(command: &str, subcommand: &str, args: &[String]) -> String {
+    let mut pieces = Vec::with_capacity(2 + args.len());
+    pieces.push(render_shell_token(command));
+    pieces.push(render_shell_token(subcommand));
+    for arg in args {
+        pieces.push(render_shell_token(arg));
+    }
+    pieces.join(" ")
+}
+
+fn render_shell_token(token: &str) -> String {
+    if token.is_empty() {
+        return "''".to_string();
+    }
+    if token
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "_-./:@".contains(character))
+    {
+        return token.to_string();
+    }
+    format!("'{}'", token.replace('\'', "'\\''"))
 }
 
 fn normalize_output(bytes: &[u8]) -> Option<String> {

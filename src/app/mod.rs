@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod patch;
 pub mod sync;
 
 use clap::Parser;
@@ -21,13 +22,15 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    let runtime = config::load(cli.config.as_deref())?;
+    let mut runtime = config::load(cli.config.as_deref())?;
     logging::init(&runtime.log_filter, &runtime.log_dir)?;
+    tracing::debug!(command = ?command, "user invoked cli command");
 
-    let bootstrap_state = bootstrap::prepare(&runtime)?;
+    let startup_config_path = runtime.config_path.clone();
+    let mut bootstrap_state = bootstrap::prepare(&runtime)?;
 
     match command {
-        cli::Command::Tui => {
+        cli::Command::Tui => loop {
             let ui_state_path = ui_state::path_for_data_dir(&runtime.data_dir);
             let startup_mailboxes = load_startup_mailboxes(&ui_state_path);
 
@@ -51,8 +54,18 @@ pub fn run() -> Result<()> {
                 }
             }
 
-            crate::ui::run(&runtime, &bootstrap_state)
-        }
+            match crate::ui::run(&runtime, &bootstrap_state)? {
+                crate::ui::TuiAction::Exit => break Ok(()),
+                crate::ui::TuiAction::Restart => {
+                    tracing::info!(
+                        config_path = %startup_config_path.display(),
+                        "user requested tui restart"
+                    );
+                    runtime = config::load(Some(startup_config_path.as_path()))?;
+                    bootstrap_state = bootstrap::prepare(&runtime)?;
+                }
+            }
+        },
         cli::Command::Sync {
             mailbox,
             fixture_dir,

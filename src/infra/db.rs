@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 
 use crate::infra::error::{CourierError, ErrorCode, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
 const CREATE_SCHEMA_VERSION_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -20,11 +20,18 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "initial schema",
-    sql: include_str!("../../migrations/0001_init.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "initial schema",
+        sql: include_str!("../../migrations/0001_init.sql"),
+    },
+    Migration {
+        version: 2,
+        description: "patch workflow schema",
+        sql: include_str!("../../migrations/0002_patch_workflow.sql"),
+    },
+];
 
 #[derive(Debug, Clone)]
 pub struct DatabaseState {
@@ -160,7 +167,7 @@ mod tests {
         let state = initialize(&db_path).expect("initialize db");
         assert!(state.created);
         assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(state.applied_migrations, vec![CURRENT_SCHEMA_VERSION]);
+        assert_eq!(state.applied_migrations, vec![1, CURRENT_SCHEMA_VERSION]);
 
         let connection = Connection::open(&db_path).expect("open sqlite");
         let version = connection

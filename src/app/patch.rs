@@ -1,0 +1,1401 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::domain::models::PatchSeriesStatus;
+use crate::infra::b4;
+use crate::infra::config::RuntimeConfig;
+use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::mail_store::ThreadRow;
+use crate::infra::patch_store;
+
+const B4_ACTION_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_LOG_BYTES: usize = 16 * 1024;
+const DOWNLOAD_NAME_MAX_CHARS: usize = 72;
+const APPLY_ARTIFACTS_DIR: &str = "apply-artifacts";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchAction {
+    Apply,
+    Download,
+}
+
+impl PatchAction {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Download => "download",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeriesIntegrity {
+    Complete,
+    Missing,
+    Duplicate,
+    OutOfOrder,
+    Invalid,
+}
+
+impl SeriesIntegrity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Missing => "missing",
+            Self::Duplicate => "duplicate",
+            Self::OutOfOrder => "out-of-order",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Complete => "ready",
+            Self::Missing => "missing",
+            Self::Duplicate => "duplicate",
+            Self::OutOfOrder => "out-of-order",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    pub fn is_ready(self) -> bool {
+        self == Self::Complete
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SeriesItem {
+    pub seq: u32,
+    pub total: u32,
+    pub mail_id: i64,
+    pub message_id: String,
+    pub subject: String,
+    pub raw_path: Option<PathBuf>,
+    pub sort_ord: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SeriesSummary {
+    pub mailbox: String,
+    pub thread_id: i64,
+    pub version: u32,
+    pub expected_total: u32,
+    pub subject: String,
+    pub author: String,
+    pub anchor_message_id: String,
+    pub items: Vec<SeriesItem>,
+    pub missing_seq: Vec<u32>,
+    pub duplicate_seq: Vec<u32>,
+    pub out_of_order: bool,
+    pub integrity: SeriesIntegrity,
+    pub status: PatchSeriesStatus,
+}
+
+impl SeriesSummary {
+    pub fn present_count(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn status_label(&self) -> &'static str {
+        status_to_label(self.status)
+    }
+
+    pub fn integrity_reason(&self) -> Option<String> {
+        match self.integrity {
+            SeriesIntegrity::Complete => None,
+            SeriesIntegrity::Missing => Some(format!(
+                "missing patch index: {}",
+                format_seq(&self.missing_seq)
+            )),
+            SeriesIntegrity::Duplicate => Some(format!(
+                "duplicate patch index: {}",
+                format_seq(&self.duplicate_seq)
+            )),
+            SeriesIntegrity::OutOfOrder => {
+                Some("patch order is out-of-order in thread".to_string())
+            }
+            SeriesIntegrity::Invalid => Some("no valid [PATCH vN M/N] sequence found".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PatchActionResult {
+    pub status: PatchSeriesStatus,
+    pub summary: String,
+    pub command_line: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub output_path: Option<PathBuf>,
+    pub head_before: Option<String>,
+    pub head_after: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedPatchSubject {
+    version: u32,
+    seq: u32,
+    total: u32,
+    title: String,
+}
+
+#[derive(Debug, Clone)]
+struct CandidatePatch<'a> {
+    row: &'a ThreadRow,
+    parsed: ParsedPatchSubject,
+    sort_ord: usize,
+}
+
+pub fn build_series_index(mailbox: &str, threads: &[ThreadRow]) -> HashMap<i64, SeriesSummary> {
+    let mut rows_by_thread: HashMap<i64, Vec<(usize, &ThreadRow)>> = HashMap::new();
+    for (index, row) in threads.iter().enumerate() {
+        rows_by_thread
+            .entry(row.thread_id)
+            .or_default()
+            .push((index, row));
+    }
+
+    let mut summaries = HashMap::new();
+    for (thread_id, rows) in rows_by_thread {
+        if let Some(summary) = analyze_thread_series(mailbox, thread_id, &rows) {
+            summaries.insert(thread_id, summary);
+        }
+    }
+    summaries
+}
+
+pub fn hydrate_series_statuses(
+    path: &Path,
+    mailbox: &str,
+    summaries: &mut HashMap<i64, SeriesSummary>,
+) -> Result<()> {
+    let thread_ids: Vec<i64> = summaries.keys().copied().collect();
+    let statuses = patch_store::load_series_statuses(path, mailbox, &thread_ids)?;
+    for (thread_id, status) in statuses {
+        if let Some(summary) = summaries.get_mut(&thread_id) {
+            summary.status = status;
+        }
+    }
+    Ok(())
+}
+
+pub fn load_latest_report(
+    database_path: &Path,
+    mailbox: &str,
+    thread_id: i64,
+) -> Result<Option<patch_store::SeriesLatestReport>> {
+    patch_store::load_latest_report(database_path, mailbox, thread_id)
+}
+
+pub fn run_action(
+    runtime: &RuntimeConfig,
+    summary: &SeriesSummary,
+    action: PatchAction,
+) -> Result<PatchActionResult> {
+    if !summary.integrity.is_ready() {
+        let reason = summary
+            .integrity_reason()
+            .unwrap_or_else(|| "series is not ready".to_string());
+        return Err(CourierError::new(
+            ErrorCode::Command,
+            format!("cannot {} series: {}", action.name(), reason),
+        ));
+    }
+
+    let record = patch_store::upsert_series(
+        &runtime.database_path,
+        &patch_store::UpsertSeriesRequest {
+            mailbox: summary.mailbox.clone(),
+            thread_id: summary.thread_id,
+            version: summary.version,
+            expected_total: summary.expected_total,
+            author: summary.author.clone(),
+            subject: summary.subject.clone(),
+            anchor_message_id: summary.anchor_message_id.clone(),
+            integrity: summary.integrity.as_str().to_string(),
+            missing_seq: summary.missing_seq.clone(),
+            duplicate_seq: summary.duplicate_seq.clone(),
+            out_of_order: summary.out_of_order,
+            items: summary
+                .items
+                .iter()
+                .map(|item| patch_store::UpsertSeriesItem {
+                    seq: item.seq,
+                    total: item.total,
+                    mail_id: item.mail_id,
+                    message_id: item.message_id.clone(),
+                    subject: item.subject.clone(),
+                    raw_path: item.raw_path.clone(),
+                    sort_ord: item.sort_ord,
+                })
+                .collect(),
+        },
+    )?;
+
+    patch_store::update_series_result(
+        &runtime.database_path,
+        record.id,
+        &patch_store::SeriesResultUpdate {
+            status: PatchSeriesStatus::Reviewing,
+            last_error: None,
+            last_command: None,
+            last_exit_code: None,
+            last_stdout: None,
+            last_stderr: None,
+            output_path: None,
+        },
+    )?;
+
+    let working_dir = action_working_dir(runtime, action)?;
+    let baseline_head = if matches!(action, PatchAction::Apply) {
+        let Some(path) = working_dir.as_deref() else {
+            return Err(CourierError::new(
+                ErrorCode::Command,
+                "apply requires [kernel].tree to be configured",
+            ));
+        };
+        Some(resolve_git_head(path)?)
+    } else {
+        None
+    };
+    let mut output_path: Option<PathBuf> = None;
+    let apply_artifacts_before = if matches!(action, PatchAction::Apply) {
+        working_dir
+            .as_deref()
+            .map(snapshot_apply_artifacts)
+            .transpose()?
+    } else {
+        None
+    };
+    let args = action_args(runtime, summary, action, &mut output_path)?;
+    let subcommand = action_subcommand(action);
+    let fallback_command = fallback_command_line("b4", subcommand, &args);
+
+    let output = match b4::run(
+        runtime.b4_path.as_deref(),
+        subcommand,
+        &args,
+        B4_ACTION_TIMEOUT,
+        working_dir.as_deref(),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let message = error.to_string();
+            patch_store::update_series_result(
+                &runtime.database_path,
+                record.id,
+                &patch_store::SeriesResultUpdate {
+                    status: PatchSeriesStatus::Failed,
+                    last_error: Some(message.clone()),
+                    last_command: Some(fallback_command.clone()),
+                    last_exit_code: None,
+                    last_stdout: None,
+                    last_stderr: None,
+                    output_path: output_path.clone(),
+                },
+            )?;
+            patch_store::insert_series_run(
+                &runtime.database_path,
+                &patch_store::SeriesRunRequest {
+                    series_id: record.id,
+                    action: action.name().to_string(),
+                    command: fallback_command.clone(),
+                    status: "failed".to_string(),
+                    exit_code: None,
+                    timed_out: false,
+                    summary: Some(message.clone()),
+                    stdout: None,
+                    stderr: Some(message.clone()),
+                    output_path: output_path.clone(),
+                },
+            )?;
+            return Err(error);
+        }
+    };
+
+    let apply_artifact_dir = if matches!(action, PatchAction::Apply) {
+        if let (Some(path), Some(before)) =
+            (working_dir.as_deref(), apply_artifacts_before.as_ref())
+        {
+            relocate_new_apply_artifacts(path, before, &runtime.patch_dir, summary)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if output_path.is_none() {
+        output_path = apply_artifact_dir.clone();
+    }
+
+    let (mut status, mut summary_line) = map_b4_result(action, &output, output_path.as_deref());
+    let mut applied_head_before: Option<String> = None;
+    let mut applied_head_after: Option<String> = None;
+    if matches!(action, PatchAction::Apply)
+        && status == PatchSeriesStatus::Applied
+        && let (Some(path), Some(before_head)) = (working_dir.as_deref(), baseline_head.as_deref())
+    {
+        match resolve_git_head(path) {
+            Ok(after_head) => {
+                if after_head == *before_head {
+                    status = PatchSeriesStatus::Failed;
+                    summary_line =
+                        "b4 shazam exited successfully, but git HEAD did not move (no new commit in git log)"
+                            .to_string();
+                } else {
+                    applied_head_before = Some(before_head.to_string());
+                    applied_head_after = Some(after_head);
+                }
+            }
+            Err(error) => {
+                status = PatchSeriesStatus::Failed;
+                summary_line = format!("apply verification failed: {error}");
+            }
+        }
+    }
+    if matches!(action, PatchAction::Apply)
+        && status == PatchSeriesStatus::Applied
+        && let Some(path) = apply_artifact_dir.as_deref()
+    {
+        summary_line = format!("{summary_line}; artifacts moved to {}", path.display());
+    }
+    let command_line = output.command_line.clone();
+    let truncated_stdout = truncate_output(&output.stdout);
+    let truncated_stderr = truncate_output(&output.stderr);
+    let last_error = if matches!(
+        status,
+        PatchSeriesStatus::Applied | PatchSeriesStatus::Reviewing
+    ) {
+        None
+    } else {
+        Some(summary_line.as_str())
+    };
+
+    patch_store::update_series_result(
+        &runtime.database_path,
+        record.id,
+        &patch_store::SeriesResultUpdate {
+            status,
+            last_error: last_error.map(ToOwned::to_owned),
+            last_command: Some(command_line.clone()),
+            last_exit_code: output.exit_code,
+            last_stdout: Some(truncated_stdout.clone()),
+            last_stderr: Some(truncated_stderr.clone()),
+            output_path: output_path.clone(),
+        },
+    )?;
+
+    patch_store::insert_series_run(
+        &runtime.database_path,
+        &patch_store::SeriesRunRequest {
+            series_id: record.id,
+            action: action.name().to_string(),
+            command: command_line.clone(),
+            status: status_to_label(status).to_string(),
+            exit_code: output.exit_code,
+            timed_out: output.timed_out,
+            summary: Some(summary_line.clone()),
+            stdout: Some(truncated_stdout),
+            stderr: Some(truncated_stderr),
+            output_path: output_path.clone(),
+        },
+    )?;
+
+    Ok(PatchActionResult {
+        status,
+        summary: summary_line,
+        command_line,
+        exit_code: output.exit_code,
+        timed_out: output.timed_out,
+        output_path,
+        head_before: applied_head_before,
+        head_after: applied_head_after,
+    })
+}
+
+pub fn undo_last_apply(
+    runtime: &RuntimeConfig,
+    before_head: &str,
+    expected_current_head: &str,
+) -> Result<String> {
+    let working_dir = action_working_dir(runtime, PatchAction::Apply)?.ok_or_else(|| {
+        CourierError::new(
+            ErrorCode::Command,
+            "apply undo requires [kernel].tree to be configured",
+        )
+    })?;
+    let current_head = resolve_git_head(&working_dir)?;
+    if current_head != expected_current_head {
+        return Err(CourierError::new(
+            ErrorCode::Command,
+            format!(
+                "cannot undo apply: expected HEAD {} but found {} in {}",
+                expected_current_head,
+                current_head,
+                working_dir.display()
+            ),
+        ));
+    }
+
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(&working_dir)
+        .arg("reset")
+        .arg("--hard")
+        .arg(before_head)
+        .output()
+        .map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Command,
+                format!(
+                    "failed to execute git reset --hard in {}",
+                    working_dir.display()
+                ),
+                error,
+            )
+        })?;
+    if !output.status.success() {
+        let reason = first_non_empty_line(&String::from_utf8_lossy(&output.stderr))
+            .or_else(|| first_non_empty_line(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or_else(|| "git reset --hard returned non-zero exit code".to_string());
+        return Err(CourierError::new(
+            ErrorCode::Command,
+            format!(
+                "failed to undo apply in {}: {}",
+                working_dir.display(),
+                reason
+            ),
+        ));
+    }
+
+    let head_after_reset = resolve_git_head(&working_dir)?;
+    if head_after_reset != before_head {
+        return Err(CourierError::new(
+            ErrorCode::Command,
+            format!(
+                "undo apply verification failed: expected {} but got {}",
+                before_head, head_after_reset
+            ),
+        ));
+    }
+    Ok(head_after_reset)
+}
+
+fn analyze_thread_series(
+    mailbox: &str,
+    thread_id: i64,
+    rows: &[(usize, &ThreadRow)],
+) -> Option<SeriesSummary> {
+    let mut parsed_candidates = Vec::new();
+    for (sort_ord, row) in rows {
+        if let Some(parsed) = parse_patch_subject(&row.subject) {
+            parsed_candidates.push(CandidatePatch {
+                row,
+                parsed,
+                sort_ord: *sort_ord,
+            });
+        }
+    }
+
+    if parsed_candidates.is_empty() {
+        return None;
+    }
+
+    let selected_version = parsed_candidates
+        .iter()
+        .map(|candidate| candidate.parsed.version)
+        .max()
+        .unwrap_or(1);
+    let selected: Vec<CandidatePatch<'_>> = parsed_candidates
+        .into_iter()
+        .filter(|candidate| candidate.parsed.version == selected_version)
+        .collect();
+
+    if selected.is_empty() {
+        return None;
+    }
+
+    let expected_total = selected
+        .iter()
+        .map(|candidate| candidate.parsed.total)
+        .max()
+        .unwrap_or(0);
+
+    let mut by_seq: BTreeMap<u32, Vec<&CandidatePatch<'_>>> = BTreeMap::new();
+    for candidate in &selected {
+        if candidate.parsed.seq > 0 {
+            by_seq
+                .entry(candidate.parsed.seq)
+                .or_default()
+                .push(candidate);
+        }
+    }
+
+    let duplicates: Vec<u32> = by_seq
+        .iter()
+        .filter_map(|(seq, values)| if values.len() > 1 { Some(*seq) } else { None })
+        .collect();
+
+    let items: Vec<SeriesItem> = by_seq
+        .iter()
+        .filter_map(|(_, values)| values.iter().min_by_key(|candidate| candidate.sort_ord))
+        .map(|candidate| SeriesItem {
+            seq: candidate.parsed.seq,
+            total: candidate.parsed.total,
+            mail_id: candidate.row.mail_id,
+            message_id: candidate.row.message_id.clone(),
+            subject: candidate.row.subject.clone(),
+            raw_path: candidate.row.raw_path.clone(),
+            sort_ord: candidate.sort_ord,
+        })
+        .collect();
+
+    let mut missing = Vec::new();
+    if expected_total > 0 {
+        for seq in 1..=expected_total {
+            if !by_seq.contains_key(&seq) {
+                missing.push(seq);
+            }
+        }
+    }
+
+    let mut ordered = selected
+        .iter()
+        .filter(|candidate| candidate.parsed.seq > 0)
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|candidate| candidate.sort_ord);
+    let out_of_order = ordered
+        .windows(2)
+        .any(|pair| pair[1].parsed.seq < pair[0].parsed.seq);
+
+    let anchor = selected
+        .iter()
+        .filter(|candidate| candidate.parsed.seq == 0)
+        .min_by_key(|candidate| candidate.sort_ord)
+        .or_else(|| {
+            selected
+                .iter()
+                .filter(|candidate| candidate.parsed.seq == 1)
+                .min_by_key(|candidate| candidate.sort_ord)
+        })
+        .or_else(|| selected.iter().min_by_key(|candidate| candidate.sort_ord))?;
+
+    let subject = if anchor.parsed.title.is_empty() {
+        anchor.row.subject.trim().to_string()
+    } else {
+        anchor.parsed.title.clone()
+    };
+    let author = anchor.row.from_addr.trim().to_string();
+
+    let integrity = if expected_total == 0 || items.is_empty() {
+        SeriesIntegrity::Invalid
+    } else if !duplicates.is_empty() {
+        SeriesIntegrity::Duplicate
+    } else if !missing.is_empty() {
+        SeriesIntegrity::Missing
+    } else if out_of_order {
+        SeriesIntegrity::OutOfOrder
+    } else {
+        SeriesIntegrity::Complete
+    };
+
+    Some(SeriesSummary {
+        mailbox: mailbox.to_string(),
+        thread_id,
+        version: selected_version,
+        expected_total,
+        subject,
+        author,
+        anchor_message_id: anchor.row.message_id.clone(),
+        items,
+        missing_seq: missing,
+        duplicate_seq: duplicates,
+        out_of_order,
+        integrity,
+        status: PatchSeriesStatus::New,
+    })
+}
+
+fn parse_patch_subject(subject: &str) -> Option<ParsedPatchSubject> {
+    let mut trimmed = subject.trim();
+    let mut has_reply_or_forward_prefix = false;
+    loop {
+        let lowered = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lowered.strip_prefix("re:") {
+            let consumed = trimmed.len() - rest.len();
+            trimmed = trimmed[consumed..].trim_start();
+            has_reply_or_forward_prefix = true;
+            continue;
+        }
+        if let Some(rest) = lowered.strip_prefix("fwd:") {
+            let consumed = trimmed.len() - rest.len();
+            trimmed = trimmed[consumed..].trim_start();
+            has_reply_or_forward_prefix = true;
+            continue;
+        }
+        break;
+    }
+    if has_reply_or_forward_prefix {
+        return None;
+    }
+
+    if !trimmed.starts_with('[') {
+        return None;
+    }
+    let end = trimmed.find(']')?;
+    let tag = &trimmed[1..end];
+
+    let mut has_patch = false;
+    let mut version = 1u32;
+    let mut seq_total: Option<(u32, u32)> = None;
+
+    for token in tag.split_whitespace() {
+        let normalized = token
+            .trim_matches(|character: char| character == ',' || character == ';')
+            .to_ascii_lowercase();
+        if normalized.contains("patch") {
+            has_patch = true;
+        }
+        if let Some(parsed) = parse_version_token(&normalized) {
+            version = parsed;
+        }
+        if let Some(parsed) = parse_seq_total_token(&normalized) {
+            seq_total = Some(parsed);
+        }
+    }
+
+    if !has_patch {
+        return None;
+    }
+
+    let (seq, total) = seq_total.unwrap_or((1, 1));
+    if total == 0 || (seq > total && seq != 0) {
+        return None;
+    }
+
+    let title = trimmed[end + 1..].trim().to_string();
+    Some(ParsedPatchSubject {
+        version,
+        seq,
+        total,
+        title,
+    })
+}
+
+fn parse_version_token(token: &str) -> Option<u32> {
+    let value = token.strip_prefix('v')?;
+    if value.is_empty() || !value.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u32>().ok().filter(|parsed| *parsed > 0)
+}
+
+fn parse_seq_total_token(token: &str) -> Option<(u32, u32)> {
+    let normalized = token.trim_matches(|character: char| {
+        !character.is_ascii_digit() && character != '/' && character != '-'
+    });
+    let (left, right) = normalized.split_once('/')?;
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    if !left.chars().all(|character| character.is_ascii_digit())
+        || !right.chars().all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    let seq = left.parse::<u32>().ok()?;
+    let total = right.parse::<u32>().ok()?;
+    Some((seq, total))
+}
+
+fn action_args(
+    runtime: &RuntimeConfig,
+    summary: &SeriesSummary,
+    action: PatchAction,
+    output_path: &mut Option<PathBuf>,
+) -> Result<Vec<String>> {
+    let mut args = vec!["--no-parent".to_string()];
+
+    if matches!(action, PatchAction::Download) {
+        let dir = prepare_download_dir(&runtime.patch_dir, summary)?;
+        let name = download_series_name(summary);
+        args.push("-o".to_string());
+        args.push(dir.display().to_string());
+        args.push("-n".to_string());
+        args.push(name);
+        *output_path = Some(dir);
+    }
+
+    args.push(summary.anchor_message_id.clone());
+    Ok(args)
+}
+
+fn action_working_dir(runtime: &RuntimeConfig, action: PatchAction) -> Result<Option<PathBuf>> {
+    if !matches!(action, PatchAction::Apply) {
+        return Ok(None);
+    }
+
+    let Some(path) = runtime.kernel_trees.first() else {
+        return Err(CourierError::new(
+            ErrorCode::Command,
+            "apply requires [kernel].tree to be configured",
+        ));
+    };
+    if !path.exists() {
+        return Err(CourierError::new(
+            ErrorCode::Command,
+            format!(
+                "apply requires existing [kernel].tree, but '{}' does not exist",
+                path.display()
+            ),
+        ));
+    }
+    if !path.is_dir() {
+        return Err(CourierError::new(
+            ErrorCode::Command,
+            format!(
+                "apply requires [kernel].tree to be a directory, but '{}' is not",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(Some(path.clone()))
+}
+
+fn prepare_download_dir(root: &Path, summary: &SeriesSummary) -> Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let name = download_series_name(summary);
+    let dir = root.join(format!("{name}-{nonce}"));
+    fs::create_dir_all(&dir).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Io,
+            format!("failed to create patch export directory {}", dir.display()),
+            error,
+        )
+    })?;
+    Ok(dir)
+}
+
+fn action_subcommand(action: PatchAction) -> &'static str {
+    match action {
+        PatchAction::Apply => "shazam",
+        PatchAction::Download => "am",
+    }
+}
+
+fn snapshot_apply_artifacts(root: &Path) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    let entries = fs::read_dir(root).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Io,
+            format!("failed to inspect apply artifacts under {}", root.display()),
+            error,
+        )
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Io,
+                format!(
+                    "failed to inspect apply artifact entry under {}",
+                    root.display()
+                ),
+                error,
+            )
+        })?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let file_type = entry.file_type().map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Io,
+                format!(
+                    "failed to inspect apply artifact type for {}",
+                    entry.path().display()
+                ),
+                error,
+            )
+        })?;
+        if is_apply_artifact_name(&name, file_type.is_dir()) {
+            names.insert(name);
+        }
+    }
+
+    Ok(names)
+}
+
+fn is_apply_artifact_name(name: &str, is_dir: bool) -> bool {
+    if is_dir {
+        return name.ends_with(".patches");
+    }
+    name.ends_with(".mbx") || name.ends_with(".cover")
+}
+
+fn relocate_new_apply_artifacts(
+    root: &Path,
+    before: &HashSet<String>,
+    patch_root: &Path,
+    summary: &SeriesSummary,
+) -> Result<Option<PathBuf>> {
+    let mut created: Vec<String> = snapshot_apply_artifacts(root)?
+        .into_iter()
+        .filter(|name| !before.contains(name))
+        .collect();
+    if created.is_empty() {
+        return Ok(None);
+    }
+    created.sort();
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let destination = patch_root
+        .join(APPLY_ARTIFACTS_DIR)
+        .join(format!("{}-{nonce}", download_series_name(summary)));
+    fs::create_dir_all(&destination).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Io,
+            format!(
+                "failed to create apply artifact directory {}",
+                destination.display()
+            ),
+            error,
+        )
+    })?;
+
+    for name in created {
+        let source = root.join(&name);
+        let target = destination.join(&name);
+        fs::rename(&source, &target).map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Io,
+                format!(
+                    "failed to move apply artifact from {} to {}",
+                    source.display(),
+                    target.display()
+                ),
+                error,
+            )
+        })?;
+    }
+
+    Ok(Some(destination))
+}
+
+fn resolve_git_head(path: &Path) -> Result<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("--verify")
+        .arg("HEAD")
+        .output()
+        .map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Command,
+                format!("failed to execute git rev-parse under {}", path.display()),
+                error,
+            )
+        })?;
+
+    if !output.status.success() {
+        let reason = first_non_empty_line(&String::from_utf8_lossy(&output.stderr))
+            .or_else(|| first_non_empty_line(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or_else(|| "git rev-parse returned non-zero exit code".to_string());
+        return Err(CourierError::new(
+            ErrorCode::Command,
+            format!(
+                "apply requires a valid git repository at '{}': {}",
+                path.display(),
+                reason
+            ),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    first_non_empty_line(&stdout).ok_or_else(|| {
+        CourierError::new(
+            ErrorCode::Command,
+            format!(
+                "failed to resolve git HEAD under '{}': empty output",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn download_series_name(summary: &SeriesSummary) -> String {
+    let mut slug = slugify_series_subject(&summary.subject);
+    if slug.is_empty() {
+        slug = format!("series-t{}", summary.thread_id);
+    }
+    format!("{slug}-v{}", summary.version)
+}
+
+fn slugify_series_subject(subject: &str) -> String {
+    let mut value = String::new();
+    let mut previous_is_dash = false;
+    for character in subject.chars() {
+        if character.is_ascii_alphanumeric() {
+            value.push(character.to_ascii_lowercase());
+            previous_is_dash = false;
+            continue;
+        }
+        if !previous_is_dash && !value.is_empty() {
+            value.push('-');
+            previous_is_dash = true;
+        }
+    }
+    while value.ends_with('-') {
+        value.pop();
+    }
+    if value.len() > DOWNLOAD_NAME_MAX_CHARS {
+        value.truncate(DOWNLOAD_NAME_MAX_CHARS);
+        while value.ends_with('-') {
+            value.pop();
+        }
+    }
+    value
+}
+
+fn map_b4_result(
+    action: PatchAction,
+    output: &b4::B4CommandResult,
+    output_path: Option<&Path>,
+) -> (PatchSeriesStatus, String) {
+    if output.timed_out {
+        return (
+            PatchSeriesStatus::Failed,
+            format!(
+                "b4 {} timed out after {}s",
+                action.name(),
+                B4_ACTION_TIMEOUT.as_secs()
+            ),
+        );
+    }
+
+    if output.exit_code == Some(0) {
+        if matches!(action, PatchAction::Apply) {
+            return (
+                PatchSeriesStatus::Applied,
+                "series applied by b4 shazam".to_string(),
+            );
+        }
+        if let Some(path) = output_path {
+            return (
+                PatchSeriesStatus::Reviewing,
+                format!("series downloaded to {}", path.display()),
+            );
+        }
+        return (
+            PatchSeriesStatus::Reviewing,
+            "series downloaded by b4 am".to_string(),
+        );
+    }
+
+    let reason = first_non_empty_line(&output.stderr)
+        .or_else(|| first_non_empty_line(&output.stdout))
+        .unwrap_or_else(|| "unknown b4 error".to_string());
+    if looks_like_conflict(&reason) {
+        return (
+            PatchSeriesStatus::Conflict,
+            format!("series apply conflict: {}", reason),
+        );
+    }
+
+    let exit_code = output
+        .exit_code
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    (
+        PatchSeriesStatus::Failed,
+        format!("b4 exited with {}: {}", exit_code, reason),
+    )
+}
+
+fn looks_like_conflict(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    lowered.contains("conflict")
+        || lowered.contains("does not apply")
+        || lowered.contains("failed to apply")
+        || lowered.contains("patch failed")
+}
+
+fn first_non_empty_line(value: &str) -> Option<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn truncate_output(value: &str) -> String {
+    if value.len() <= MAX_LOG_BYTES {
+        return value.to_string();
+    }
+    let mut truncated = value[..MAX_LOG_BYTES].to_string();
+    truncated.push_str("\n<truncated>");
+    truncated
+}
+
+fn fallback_command_line(command: &str, subcommand: &str, args: &[String]) -> String {
+    let mut pieces = Vec::with_capacity(2 + args.len());
+    pieces.push(command.to_string());
+    pieces.push(subcommand.to_string());
+    pieces.extend(args.iter().cloned());
+    pieces.join(" ")
+}
+
+fn status_to_label(status: PatchSeriesStatus) -> &'static str {
+    match status {
+        PatchSeriesStatus::New => "new",
+        PatchSeriesStatus::Reviewing => "reviewing",
+        PatchSeriesStatus::Applied => "applied",
+        PatchSeriesStatus::Failed => "failed",
+        PatchSeriesStatus::Conflict => "conflict",
+    }
+}
+
+fn format_seq(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command as ProcessCommand;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::infra::config::RuntimeConfig;
+    use crate::infra::mail_store::ThreadRow;
+
+    use super::{
+        APPLY_ARTIFACTS_DIR, PatchAction, SeriesIntegrity, action_args, action_subcommand,
+        action_working_dir, build_series_index, download_series_name, parse_patch_subject,
+        parse_seq_total_token, parse_version_token, relocate_new_apply_artifacts,
+        snapshot_apply_artifacts, undo_last_apply,
+    };
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("courier-patch-{label}-{nonce}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
+    fn runtime_with_kernel_trees(kernel_trees: Vec<PathBuf>) -> RuntimeConfig {
+        let root = PathBuf::from("/tmp/courier-patch-runtime");
+        RuntimeConfig {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            database_path: root.join("data/courier.db"),
+            raw_mail_dir: root.join("data/raw"),
+            patch_dir: root.join("data/patches"),
+            log_dir: root.join("data/logs"),
+            b4_path: None,
+            log_filter: "info".to_string(),
+            imap_mailbox: "io-uring".to_string(),
+            lore_base_url: "https://lore.kernel.org".to_string(),
+            kernel_trees,
+        }
+    }
+
+    fn run_git(repo: &PathBuf, args: &[&str]) {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout(repo: &PathBuf, args: &[&str]) -> String {
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn thread_row(
+        thread_id: i64,
+        mail_id: i64,
+        subject: &str,
+        message_id: &str,
+        depth: u16,
+    ) -> ThreadRow {
+        ThreadRow {
+            thread_id,
+            mail_id,
+            depth,
+            subject: subject.to_string(),
+            from_addr: "alice@example.com".to_string(),
+            message_id: message_id.to_string(),
+            in_reply_to: None,
+            date: None,
+            raw_path: Some(PathBuf::from(format!("/tmp/{message_id}.eml"))),
+        }
+    }
+
+    fn sample_summary(subject: &str, version: u32) -> super::SeriesSummary {
+        super::SeriesSummary {
+            mailbox: "io-uring".to_string(),
+            thread_id: 42,
+            version,
+            expected_total: 1,
+            subject: subject.to_string(),
+            author: "alice@example.com".to_string(),
+            anchor_message_id: "patch@example.com".to_string(),
+            items: vec![super::SeriesItem {
+                seq: 1,
+                total: 1,
+                mail_id: 1,
+                message_id: "patch@example.com".to_string(),
+                subject: subject.to_string(),
+                raw_path: None,
+                sort_ord: 0,
+            }],
+            missing_seq: Vec::new(),
+            duplicate_seq: Vec::new(),
+            out_of_order: false,
+            integrity: super::SeriesIntegrity::Complete,
+            status: crate::domain::models::PatchSeriesStatus::New,
+        }
+    }
+
+    #[test]
+    fn parses_patch_subject_with_version_and_seq() {
+        let parsed = parse_patch_subject("[PATCH v5 2/9] io_uring: demo").expect("parsed");
+        assert_eq!(parsed.version, 5);
+        assert_eq!(parsed.seq, 2);
+        assert_eq!(parsed.total, 9);
+        assert_eq!(parsed.title, "io_uring: demo");
+    }
+
+    #[test]
+    fn ignores_reply_or_forward_prefix_for_patch_series_detection() {
+        assert!(parse_patch_subject("Re: [PATCH v5 2/9] io_uring: demo").is_none());
+        assert!(parse_patch_subject("fwd: [PATCH 1/1] io_uring: demo").is_none());
+    }
+
+    #[test]
+    fn parse_token_helpers_handle_expected_variants() {
+        assert_eq!(parse_version_token("v2"), Some(2));
+        assert_eq!(parse_version_token("v"), None);
+        assert_eq!(parse_seq_total_token("03/09"), Some((3, 9)));
+        assert_eq!(parse_seq_total_token("1/x"), None);
+    }
+
+    #[test]
+    fn apply_uses_b4_shazam_subcommand() {
+        assert_eq!(action_subcommand(PatchAction::Apply), "shazam");
+        assert_eq!(action_subcommand(PatchAction::Download), "am");
+    }
+
+    #[test]
+    fn download_uses_patch_subject_in_export_name() {
+        let root = temp_dir("download-name");
+        let mut runtime = runtime_with_kernel_trees(Vec::new());
+        runtime.patch_dir = root.clone();
+        let summary = sample_summary("io_uring: keep PATCH thread name", 3);
+
+        let mut output_path = None;
+        let args = action_args(&runtime, &summary, PatchAction::Download, &mut output_path)
+            .expect("download args");
+
+        assert_eq!(
+            download_series_name(&summary),
+            "io-uring-keep-patch-thread-name-v3"
+        );
+        assert_eq!(args[4], "io-uring-keep-patch-thread-name-v3");
+        assert!(
+            output_path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("io-uring-keep-patch-thread-name-v3-"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_series_index_detects_missing_patch() {
+        let rows = vec![
+            thread_row(10, 1, "[PATCH v3 0/3] demo", "cover@example.com", 0),
+            thread_row(10, 2, "[PATCH v3 1/3] a", "p1@example.com", 1),
+            thread_row(10, 3, "[PATCH v3 3/3] c", "p3@example.com", 1),
+        ];
+        let index = build_series_index("io-uring", &rows);
+        let series = index.get(&10).expect("series exists");
+        assert_eq!(series.version, 3);
+        assert_eq!(series.expected_total, 3);
+        assert_eq!(series.present_count(), 2);
+        assert_eq!(series.missing_seq, vec![2]);
+        assert_eq!(series.integrity, SeriesIntegrity::Missing);
+    }
+
+    #[test]
+    fn build_series_index_prefers_latest_version() {
+        let rows = vec![
+            thread_row(12, 1, "[PATCH v1 1/1] old", "old@example.com", 0),
+            thread_row(12, 2, "[PATCH v2 1/2] new-a", "new-a@example.com", 0),
+            thread_row(12, 3, "[PATCH v2 2/2] new-b", "new-b@example.com", 0),
+        ];
+        let index = build_series_index("io-uring", &rows);
+        let series = index.get(&12).expect("series exists");
+        assert_eq!(series.version, 2);
+        assert_eq!(series.expected_total, 2);
+        assert_eq!(series.integrity, SeriesIntegrity::Complete);
+    }
+
+    #[test]
+    fn build_series_index_ignores_reply_subject_duplicate_indices() {
+        let rows = vec![
+            thread_row(13, 1, "[PATCH v1 1/1] demo", "patch@example.com", 0),
+            thread_row(13, 2, "Re: [PATCH v1 1/1] demo", "reply@example.com", 1),
+        ];
+        let index = build_series_index("io-uring", &rows);
+        let series = index.get(&13).expect("series exists");
+        assert_eq!(series.present_count(), 1);
+        assert!(series.duplicate_seq.is_empty());
+        assert_eq!(series.integrity, SeriesIntegrity::Complete);
+    }
+
+    #[test]
+    fn apply_requires_kernel_tree_configuration() {
+        let runtime = runtime_with_kernel_trees(Vec::new());
+        let error = action_working_dir(&runtime, PatchAction::Apply).expect_err("should fail");
+        assert!(error.to_string().contains("[kernel].tree"));
+    }
+
+    #[test]
+    fn apply_uses_first_kernel_tree_directory() {
+        let first = temp_dir("apply-first");
+        let second = temp_dir("apply-second");
+        let runtime = runtime_with_kernel_trees(vec![first.clone(), second]);
+
+        let working_dir = action_working_dir(&runtime, PatchAction::Apply)
+            .expect("resolve apply dir")
+            .expect("apply should have working directory");
+        assert_eq!(working_dir, first);
+    }
+
+    #[test]
+    fn download_does_not_require_kernel_tree_directory() {
+        let runtime = runtime_with_kernel_trees(Vec::new());
+        let working_dir =
+            action_working_dir(&runtime, PatchAction::Download).expect("download dir resolution");
+        assert!(working_dir.is_none());
+    }
+
+    #[test]
+    fn undo_last_apply_resets_head_to_previous_commit() {
+        let repo = temp_dir("undo-apply");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "Courier Test"]);
+        run_git(&repo, &["config", "user.email", "courier@example.com"]);
+
+        fs::write(repo.join("demo.txt"), "v1\n").expect("write v1");
+        run_git(&repo, &["add", "demo.txt"]);
+        run_git(&repo, &["commit", "-m", "commit-1"]);
+        let before_head = git_stdout(&repo, &["rev-parse", "--verify", "HEAD"]);
+
+        fs::write(repo.join("demo.txt"), "v2\n").expect("write v2");
+        run_git(&repo, &["add", "demo.txt"]);
+        run_git(&repo, &["commit", "-m", "commit-2"]);
+        let after_head = git_stdout(&repo, &["rev-parse", "--verify", "HEAD"]);
+
+        let runtime = runtime_with_kernel_trees(vec![repo.clone()]);
+        let reset_head =
+            undo_last_apply(&runtime, &before_head, &after_head).expect("undo apply succeeds");
+        assert_eq!(reset_head, before_head);
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "--verify", "HEAD"]),
+            before_head
+        );
+
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn undo_last_apply_rejects_head_mismatch() {
+        let repo = temp_dir("undo-apply-mismatch");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "Courier Test"]);
+        run_git(&repo, &["config", "user.email", "courier@example.com"]);
+
+        fs::write(repo.join("demo.txt"), "v1\n").expect("write v1");
+        run_git(&repo, &["add", "demo.txt"]);
+        run_git(&repo, &["commit", "-m", "commit-1"]);
+        let first = git_stdout(&repo, &["rev-parse", "--verify", "HEAD"]);
+
+        fs::write(repo.join("demo.txt"), "v2\n").expect("write v2");
+        run_git(&repo, &["add", "demo.txt"]);
+        run_git(&repo, &["commit", "-m", "commit-2"]);
+        let second = git_stdout(&repo, &["rev-parse", "--verify", "HEAD"]);
+
+        let runtime = runtime_with_kernel_trees(vec![repo.clone()]);
+        let error = undo_last_apply(&runtime, &first, &first).expect_err("must reject mismatch");
+        assert!(error.to_string().contains("expected HEAD"));
+        assert_eq!(
+            git_stdout(&repo, &["rev-parse", "--verify", "HEAD"]),
+            second
+        );
+
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn relocate_new_apply_artifacts_moves_mbx_and_cover_to_patch_dir() {
+        let root = temp_dir("apply-artifacts-root");
+        let patch_dir = temp_dir("apply-artifacts-dest");
+        let summary = sample_summary("io_uring: demo", 1);
+
+        fs::write(root.join("existing.mbx"), "old").expect("write existing");
+        let before = snapshot_apply_artifacts(&root).expect("snapshot before");
+        fs::write(root.join("new-series.mbx"), "new").expect("write new mbx");
+        fs::write(root.join("new-series.cover"), "cover").expect("write new cover");
+
+        let moved_dir = relocate_new_apply_artifacts(&root, &before, &patch_dir, &summary)
+            .expect("relocate succeeds")
+            .expect("moved directory");
+        assert!(moved_dir.starts_with(patch_dir.join(APPLY_ARTIFACTS_DIR)));
+        assert!(moved_dir.join("new-series.mbx").exists());
+        assert!(moved_dir.join("new-series.cover").exists());
+        assert!(root.join("existing.mbx").exists());
+        assert!(!root.join("new-series.mbx").exists());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(patch_dir);
+    }
+}

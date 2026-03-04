@@ -7,4 +7,5 @@ pub mod imap;
 pub mod logging;
 pub mod mail_parser;
 pub mod mail_store;
+pub mod patch_store;
 pub mod ui_state;
