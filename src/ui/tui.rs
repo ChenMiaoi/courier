@@ -245,6 +245,29 @@ impl CodePaneFocus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeEditMode {
+    Browse,
+    VimNormal,
+    VimInsert,
+    VimCommand,
+}
+
+impl CodeEditMode {
+    fn is_active(self) -> bool {
+        !matches!(self, Self::Browse)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Browse => "BROWSE",
+            Self::VimNormal => "NORMAL",
+            Self::VimInsert => "INSERT",
+            Self::VimCommand => "COMMAND",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KernelTreeRowKind {
     RootDirectory,
     Directory,
@@ -318,6 +341,13 @@ struct AppState {
     kernel_tree_expanded_paths: HashSet<PathBuf>,
     kernel_tree_row_index: usize,
     code_preview_scroll: u16,
+    code_edit_mode: CodeEditMode,
+    code_edit_target: Option<PathBuf>,
+    code_edit_buffer: Vec<String>,
+    code_edit_cursor_row: usize,
+    code_edit_cursor_col: usize,
+    code_edit_dirty: bool,
+    code_edit_command_input: String,
     thread_index: usize,
     preview_scroll: u16,
     started_at: Instant,
@@ -383,6 +413,13 @@ impl AppState {
             kernel_tree_expanded_paths,
             kernel_tree_row_index: 0,
             code_preview_scroll: 0,
+            code_edit_mode: CodeEditMode::Browse,
+            code_edit_target: None,
+            code_edit_buffer: Vec::new(),
+            code_edit_cursor_row: 0,
+            code_edit_cursor_col: 0,
+            code_edit_dirty: false,
+            code_edit_command_input: String::new(),
             thread_index: 0,
             preview_scroll: 0,
             started_at: Instant::now(),
@@ -1119,6 +1156,306 @@ impl AppState {
         self.palette.clear_local_result();
         self.status = "command palette closed".to_string();
     }
+
+    fn is_code_edit_active(&self) -> bool {
+        self.code_edit_mode.is_active()
+    }
+
+    fn enter_code_edit_mode(&mut self) {
+        if !matches!(self.ui_page, UiPage::CodeBrowser)
+            || !matches!(self.code_focus, CodePaneFocus::Source)
+        {
+            self.status = "select a source file in Source pane, then press e".to_string();
+            return;
+        }
+
+        let Some(path) = self.selected_kernel_tree_file_path().map(Path::to_path_buf) else {
+            self.status = "select a source file in Source pane, then press e".to_string();
+            return;
+        };
+
+        let content = match fs::read(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = format!("failed to read {}: {}", path.display(), error);
+                return;
+            }
+        };
+
+        let text = String::from_utf8_lossy(&content)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        let mut buffer: Vec<String> = text.split('\n').map(ToOwned::to_owned).collect();
+        if buffer.is_empty() {
+            buffer.push(String::new());
+        }
+
+        self.code_edit_mode = CodeEditMode::VimNormal;
+        self.code_edit_target = Some(path.clone());
+        self.code_edit_buffer = buffer;
+        self.code_edit_cursor_row = 0;
+        self.code_edit_cursor_col = 0;
+        self.code_edit_dirty = false;
+        self.code_edit_command_input.clear();
+        self.code_preview_scroll = 0;
+        self.status = format!("editing {} (NORMAL)", path.display());
+    }
+
+    fn exit_code_edit_mode(&mut self, status: String) {
+        self.code_edit_mode = CodeEditMode::Browse;
+        self.code_edit_target = None;
+        self.code_edit_buffer.clear();
+        self.code_edit_cursor_row = 0;
+        self.code_edit_cursor_col = 0;
+        self.code_edit_dirty = false;
+        self.code_edit_command_input.clear();
+        self.code_preview_scroll = 0;
+        self.status = status;
+    }
+
+    fn save_code_edit_buffer(&mut self) -> bool {
+        let Some(path) = self.code_edit_target.clone() else {
+            self.status = "no file is being edited".to_string();
+            return false;
+        };
+
+        let content = self.code_edit_buffer.join("\n");
+        match fs::write(&path, content) {
+            Ok(_) => {
+                self.code_edit_dirty = false;
+                self.status = format!("saved {}", path.display());
+                true
+            }
+            Err(error) => {
+                self.status = format!("failed to save {}: {}", path.display(), error);
+                false
+            }
+        }
+    }
+
+    fn code_edit_line_len(&self, row: usize) -> usize {
+        self.code_edit_buffer
+            .get(row)
+            .map(|line| line.chars().count())
+            .unwrap_or(0)
+    }
+
+    fn clamp_code_edit_cursor(&mut self) {
+        if self.code_edit_buffer.is_empty() {
+            self.code_edit_buffer.push(String::new());
+        }
+        if self.code_edit_cursor_row >= self.code_edit_buffer.len() {
+            self.code_edit_cursor_row = self.code_edit_buffer.len().saturating_sub(1);
+        }
+        let line_len = self.code_edit_line_len(self.code_edit_cursor_row);
+        if self.code_edit_cursor_col > line_len {
+            self.code_edit_cursor_col = line_len;
+        }
+    }
+
+    fn adjust_code_edit_scroll(&mut self) {
+        const EDIT_HEADER_LINES: usize = 4;
+        let logical_cursor_line = self.code_edit_cursor_row.saturating_add(EDIT_HEADER_LINES);
+        let scroll_target = logical_cursor_line.saturating_sub(3);
+        self.code_preview_scroll = scroll_target.min(u16::MAX as usize) as u16;
+    }
+
+    fn move_code_edit_cursor_left(&mut self) {
+        self.clamp_code_edit_cursor();
+        if self.code_edit_cursor_col > 0 {
+            self.code_edit_cursor_col -= 1;
+        } else if self.code_edit_cursor_row > 0 {
+            self.code_edit_cursor_row -= 1;
+            self.code_edit_cursor_col = self.code_edit_line_len(self.code_edit_cursor_row);
+        }
+        self.adjust_code_edit_scroll();
+    }
+
+    fn move_code_edit_cursor_right(&mut self) {
+        self.clamp_code_edit_cursor();
+        let line_len = self.code_edit_line_len(self.code_edit_cursor_row);
+        if self.code_edit_cursor_col < line_len {
+            self.code_edit_cursor_col += 1;
+        } else if self.code_edit_cursor_row + 1 < self.code_edit_buffer.len() {
+            self.code_edit_cursor_row += 1;
+            self.code_edit_cursor_col = 0;
+        }
+        self.adjust_code_edit_scroll();
+    }
+
+    fn move_code_edit_cursor_up(&mut self) {
+        self.clamp_code_edit_cursor();
+        if self.code_edit_cursor_row > 0 {
+            self.code_edit_cursor_row -= 1;
+            let line_len = self.code_edit_line_len(self.code_edit_cursor_row);
+            self.code_edit_cursor_col = self.code_edit_cursor_col.min(line_len);
+        }
+        self.adjust_code_edit_scroll();
+    }
+
+    fn move_code_edit_cursor_down(&mut self) {
+        self.clamp_code_edit_cursor();
+        if self.code_edit_cursor_row + 1 < self.code_edit_buffer.len() {
+            self.code_edit_cursor_row += 1;
+            let line_len = self.code_edit_line_len(self.code_edit_cursor_row);
+            self.code_edit_cursor_col = self.code_edit_cursor_col.min(line_len);
+        }
+        self.adjust_code_edit_scroll();
+    }
+
+    fn insert_code_edit_character(&mut self, character: char) -> bool {
+        self.clamp_code_edit_cursor();
+        let Some(line) = self.code_edit_buffer.get_mut(self.code_edit_cursor_row) else {
+            return false;
+        };
+        let byte_index = char_to_byte_index(line, self.code_edit_cursor_col);
+        line.insert(byte_index, character);
+        self.code_edit_cursor_col += 1;
+        self.code_edit_dirty = true;
+        self.adjust_code_edit_scroll();
+        true
+    }
+
+    fn backspace_code_edit_character(&mut self) -> bool {
+        self.clamp_code_edit_cursor();
+
+        if self.code_edit_cursor_col > 0 {
+            let Some(line) = self.code_edit_buffer.get_mut(self.code_edit_cursor_row) else {
+                return false;
+            };
+            let remove_at = self.code_edit_cursor_col - 1;
+            let start = char_to_byte_index(line, remove_at);
+            let end = char_to_byte_index(line, remove_at + 1);
+            line.replace_range(start..end, "");
+            self.code_edit_cursor_col -= 1;
+            self.code_edit_dirty = true;
+            self.adjust_code_edit_scroll();
+            return true;
+        }
+
+        if self.code_edit_cursor_row == 0 {
+            return false;
+        }
+
+        let current = self.code_edit_buffer.remove(self.code_edit_cursor_row);
+        self.code_edit_cursor_row -= 1;
+        let Some(previous_line) = self.code_edit_buffer.get_mut(self.code_edit_cursor_row) else {
+            return false;
+        };
+        let previous_len = previous_line.chars().count();
+        previous_line.push_str(&current);
+        self.code_edit_cursor_col = previous_len;
+        self.code_edit_dirty = true;
+        self.adjust_code_edit_scroll();
+        true
+    }
+
+    fn insert_code_edit_newline(&mut self) -> bool {
+        self.clamp_code_edit_cursor();
+        let Some(line) = self.code_edit_buffer.get_mut(self.code_edit_cursor_row) else {
+            return false;
+        };
+        let byte_index = char_to_byte_index(line, self.code_edit_cursor_col);
+        let tail = line.split_off(byte_index);
+        self.code_edit_buffer
+            .insert(self.code_edit_cursor_row + 1, tail);
+        self.code_edit_cursor_row += 1;
+        self.code_edit_cursor_col = 0;
+        self.code_edit_dirty = true;
+        self.adjust_code_edit_scroll();
+        true
+    }
+
+    fn delete_code_edit_character(&mut self) -> bool {
+        self.clamp_code_edit_cursor();
+        let row = self.code_edit_cursor_row;
+        if row >= self.code_edit_buffer.len() {
+            return false;
+        }
+
+        let line_len = self.code_edit_line_len(row);
+        if self.code_edit_cursor_col < line_len {
+            let Some(line) = self.code_edit_buffer.get_mut(row) else {
+                return false;
+            };
+            let start = char_to_byte_index(line, self.code_edit_cursor_col);
+            let end = char_to_byte_index(line, self.code_edit_cursor_col + 1);
+            line.replace_range(start..end, "");
+            self.clamp_code_edit_cursor();
+            self.code_edit_dirty = true;
+            self.adjust_code_edit_scroll();
+            return true;
+        }
+
+        if self.code_edit_cursor_col == line_len && row + 1 < self.code_edit_buffer.len() {
+            let next = self.code_edit_buffer.remove(row + 1);
+            let Some(line) = self.code_edit_buffer.get_mut(row) else {
+                return false;
+            };
+            line.push_str(&next);
+            self.code_edit_dirty = true;
+            self.adjust_code_edit_scroll();
+            return true;
+        }
+
+        false
+    }
+
+    fn enter_code_edit_command_mode(&mut self) {
+        self.code_edit_mode = CodeEditMode::VimCommand;
+        self.code_edit_command_input.clear();
+        self.status = "command mode".to_string();
+    }
+
+    fn execute_code_edit_command(&mut self) {
+        let command = self.code_edit_command_input.trim().to_string();
+        self.code_edit_command_input.clear();
+        self.code_edit_mode = CodeEditMode::VimNormal;
+
+        if command.is_empty() {
+            self.status = "empty command".to_string();
+            return;
+        }
+
+        match command.as_str() {
+            "w" => {
+                let _ = self.save_code_edit_buffer();
+            }
+            "q!" => {
+                let target = self
+                    .code_edit_target
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<file>".to_string());
+                self.exit_code_edit_mode(format!("discarded unsaved changes for {target}"));
+            }
+            "q" => {
+                if self.code_edit_dirty {
+                    self.status = "unsaved changes, run :w, :wq, or :q!".to_string();
+                } else {
+                    let target = self
+                        .code_edit_target
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<file>".to_string());
+                    self.exit_code_edit_mode(format!("exit edit mode for {target}"));
+                }
+            }
+            "wq" => {
+                if self.save_code_edit_buffer() {
+                    let target = self
+                        .code_edit_target
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<file>".to_string());
+                    self.exit_code_edit_mode(format!("saved and exited {target}"));
+                }
+            }
+            _ => {
+                self.status = format!("unsupported command: :{command}");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1239,6 +1576,7 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         ui_page = ?state.ui_page,
         focus = ?state.focus,
         code_focus = ?state.code_focus,
+        code_edit_mode = ?state.code_edit_mode,
         palette_open = state.palette.open,
         search_active = state.search.active,
         "user key event"
@@ -1254,6 +1592,10 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
 
     if state.search.active {
         return handle_search_key_event(state, key);
+    }
+
+    if state.is_code_edit_active() {
+        return handle_code_edit_key_event(state, key);
     }
 
     if is_palette_open_shortcut(key) {
@@ -1282,6 +1624,9 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 && character.eq_ignore_ascii_case(&'n') =>
         {
             state.set_current_subscription_enabled(false);
+        }
+        KeyCode::Char('e') if matches!(state.ui_page, UiPage::CodeBrowser) => {
+            state.enter_code_edit_mode();
         }
         KeyCode::Tab => state.toggle_ui_page(),
         KeyCode::Char('j') => state.move_focus_previous(),
@@ -1340,6 +1685,100 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
     LoopAction::Continue
 }
 
+fn handle_code_edit_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
+    match state.code_edit_mode {
+        CodeEditMode::Browse => {}
+        CodeEditMode::VimNormal => match key.code {
+            KeyCode::Char('h') => state.move_code_edit_cursor_left(),
+            KeyCode::Char('j') => state.move_code_edit_cursor_down(),
+            KeyCode::Char('k') => state.move_code_edit_cursor_up(),
+            KeyCode::Char('l') => state.move_code_edit_cursor_right(),
+            KeyCode::Char('i') => {
+                state.code_edit_mode = CodeEditMode::VimInsert;
+                state.status = "insert mode".to_string();
+            }
+            KeyCode::Char('x') => {
+                if !state.delete_code_edit_character() {
+                    state.status = "nothing to delete".to_string();
+                }
+            }
+            KeyCode::Char('s') => {
+                let _ = state.save_code_edit_buffer();
+            }
+            KeyCode::Char(':')
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                state.enter_code_edit_command_mode();
+            }
+            KeyCode::Esc => {
+                if state.code_edit_dirty {
+                    state.status = "unsaved changes, run :w, :wq, or :q!".to_string();
+                } else {
+                    let target = state
+                        .code_edit_target
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "<file>".to_string());
+                    state.exit_code_edit_mode(format!("exit edit mode for {target}"));
+                }
+            }
+            _ => {}
+        },
+        CodeEditMode::VimInsert => match key.code {
+            KeyCode::Esc => {
+                state.code_edit_mode = CodeEditMode::VimNormal;
+                state.status = "normal mode".to_string();
+            }
+            KeyCode::Backspace => {
+                if !state.backspace_code_edit_character() {
+                    state.status = "nothing to delete".to_string();
+                }
+            }
+            KeyCode::Enter => {
+                let _ = state.insert_code_edit_newline();
+            }
+            KeyCode::Tab => {
+                for character in PREVIEW_TAB_SPACES.chars() {
+                    let _ = state.insert_code_edit_character(character);
+                }
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                let _ = state.insert_code_edit_character(character);
+            }
+            _ => {}
+        },
+        CodeEditMode::VimCommand => match key.code {
+            KeyCode::Esc => {
+                state.code_edit_command_input.clear();
+                state.code_edit_mode = CodeEditMode::VimNormal;
+                state.status = "command cancelled".to_string();
+            }
+            KeyCode::Backspace => {
+                state.code_edit_command_input.pop();
+            }
+            KeyCode::Enter => {
+                state.execute_code_edit_command();
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                state.code_edit_command_input.push(character);
+            }
+            _ => {}
+        },
+    }
+
+    LoopAction::Continue
+}
+
 fn handle_search_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
     match key.code {
         KeyCode::Esc => state.close_search(),
@@ -1387,7 +1826,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "quit" | "exit" => return LoopAction::Exit,
                 "restart" => return LoopAction::Restart,
                 "help" => {
-                    state.status = "commands: quit, exit, restart, help, sync [mailbox], config ..., !<local shell command> | keys: j/l focus, i/k move, y/n enable, a apply, d download, u undo apply".to_string();
+                    state.status = "commands: quit, exit, restart, help, sync [mailbox], config ..., !<local shell command> | keys: j/l focus, i/k move, y/n enable, a apply, d download, u undo apply, e edit source".to_string();
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
                     run_palette_sync(state, value);
@@ -2542,7 +2981,10 @@ fn draw(
 
     let shortcuts_text = match state.ui_page {
         UiPage::Mail => "/ search | Tab page | : palette | Enter open/toggle",
-        UiPage::CodeBrowser => "Tab page | : palette | Enter expand/collapse",
+        UiPage::CodeBrowser if state.is_code_edit_active() => {
+            "Esc normal/exit | h/j/k/l move | i insert | x delete | s save | :w :q :q! :wq"
+        }
+        UiPage::CodeBrowser => "Tab page | : palette | Enter expand/collapse | e edit",
     };
     let footer_sections = Layout::default()
         .direction(Direction::Horizontal)
@@ -2687,7 +3129,17 @@ fn draw_kernel_tree(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn draw_code_source_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Clear, area);
-    let block = panel_block_with_title("Source Preview", state.code_focus == CodePaneFocus::Source);
+    let title = if state.is_code_edit_active() {
+        let dirty = if state.code_edit_dirty { "*" } else { "-" };
+        format!(
+            "Source Preview [{} dirty:{}]",
+            state.code_edit_mode.label(),
+            dirty
+        )
+    } else {
+        "Source Preview".to_string()
+    };
+    let block = panel_block_with_title(&title, state.code_focus == CodePaneFocus::Source);
     let inner_area = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Clear, inner_area);
@@ -2695,6 +3147,10 @@ fn draw_code_source_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     let paragraph =
         Paragraph::new(load_code_source_preview(state)).scroll((state.code_preview_scroll, 0));
     frame.render_widget(paragraph, inner_area);
+
+    if let Some(cursor_position) = code_edit_cursor_position(state, inner_area) {
+        frame.set_cursor_position(cursor_position);
+    }
 }
 
 fn subscription_line(item: &SubscriptionItem) -> String {
@@ -3045,6 +3501,18 @@ fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn char_to_byte_index(value: &str, char_index: usize) -> usize {
+    if char_index == 0 {
+        return 0;
+    }
+
+    value
+        .char_indices()
+        .nth(char_index)
+        .map(|(byte_index, _)| byte_index)
+        .unwrap_or(value.len())
+}
+
 fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &RuntimeConfig) {
     let preview = if let Some(thread) = state.selected_thread() {
         let mut sections = Vec::new();
@@ -3139,6 +3607,10 @@ fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64)
 }
 
 fn load_code_source_preview(state: &AppState) -> String {
+    if state.is_code_edit_active() {
+        return render_code_edit_preview(state);
+    }
+
     if !state.supports_code_browser() {
         return "No kernel tree configured.\n\nSet [kernel].tree or [kernel].trees in config."
             .to_string();
@@ -3160,6 +3632,120 @@ fn load_code_source_preview(state: &AppState) -> String {
             row.path.display()
         ),
     }
+}
+
+fn render_code_edit_preview(state: &AppState) -> String {
+    let target = state
+        .code_edit_target
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<unknown file>".to_string());
+    let dirty = if state.code_edit_dirty { "yes" } else { "no" };
+    let mut lines = vec![
+        format!("File: {target}"),
+        format!(
+            "Mode: {} | dirty: {} | cursor: {}:{}",
+            state.code_edit_mode.label(),
+            dirty,
+            state.code_edit_cursor_row + 1,
+            state.code_edit_cursor_col + 1
+        ),
+        "Use h/j/k/l move, i insert, x delete, s save, : command".to_string(),
+        String::new(),
+    ];
+
+    if state.code_edit_buffer.is_empty() {
+        lines.push("<empty file>".to_string());
+    } else {
+        for (index, line) in state.code_edit_buffer.iter().enumerate() {
+            let marker = if index == state.code_edit_cursor_row {
+                ">"
+            } else {
+                " "
+            };
+            let rendered_line = sanitize_source_preview_text(line);
+            lines.push(format!("{:>4}{marker} {}", index + 1, rendered_line));
+        }
+    }
+
+    if matches!(state.code_edit_mode, CodeEditMode::VimCommand) {
+        lines.push(String::new());
+        lines.push(format!(":{}", state.code_edit_command_input));
+    }
+
+    lines.join("\n")
+}
+
+fn code_edit_cursor_position(state: &AppState, inner_area: Rect) -> Option<(u16, u16)> {
+    if !state.is_code_edit_active() || inner_area.width == 0 || inner_area.height == 0 {
+        return None;
+    }
+
+    let (logical_row, logical_col) = if matches!(state.code_edit_mode, CodeEditMode::VimCommand) {
+        (
+            code_edit_command_line_logical_row(state),
+            1 + state.code_edit_command_input.chars().count(),
+        )
+    } else {
+        let row = state
+            .code_edit_cursor_row
+            .min(state.code_edit_buffer.len().saturating_sub(1));
+        let line = state
+            .code_edit_buffer
+            .get(row)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let column = state.code_edit_cursor_col.min(line.chars().count());
+        (
+            code_edit_source_line_logical_row(row),
+            code_edit_source_line_prefix_width(row) + display_column(line, column),
+        )
+    };
+
+    let scroll = state.code_preview_scroll as usize;
+    if logical_row < scroll {
+        return None;
+    }
+    let visible_row = logical_row - scroll;
+    if visible_row >= inner_area.height as usize {
+        return None;
+    }
+
+    let clamped_col = logical_col.min(inner_area.width.saturating_sub(1) as usize);
+    Some((
+        inner_area.x.saturating_add(clamped_col as u16),
+        inner_area.y.saturating_add(visible_row as u16),
+    ))
+}
+
+fn code_edit_source_line_logical_row(buffer_row: usize) -> usize {
+    4 + buffer_row
+}
+
+fn code_edit_source_line_prefix_width(buffer_row: usize) -> usize {
+    let number_width = ((buffer_row + 1).to_string().chars().count()).max(4);
+    number_width + 2
+}
+
+fn code_edit_command_line_logical_row(state: &AppState) -> usize {
+    4 + state.code_edit_buffer.len() + 1
+}
+
+fn display_column(line: &str, char_col: usize) -> usize {
+    let mut display_col = 0usize;
+    for character in line.chars().take(char_col) {
+        match character {
+            '\t' => {
+                display_col += PREVIEW_TAB_SPACES.chars().count();
+            }
+            '\n' | '\r' => {}
+            _ if character.is_control() => {}
+            _ => {
+                display_col += 1;
+            }
+        }
+    }
+    display_col
 }
 
 fn load_source_file_preview(path: &Path) -> String {
@@ -3434,7 +4020,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::layout::Rect;
+    use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 
     use crate::infra::bootstrap::BootstrapState;
     use crate::infra::config::RuntimeConfig;
@@ -3442,10 +4028,11 @@ mod tests {
     use crate::infra::mail_store::ThreadRow;
 
     use super::{
-        AppState, CodePaneFocus, LoopAction, Pane, SubscriptionItem, UiPage, draw,
-        extract_mail_body_preview, extract_mail_preview, handle_key_event,
-        is_palette_open_shortcut, is_palette_toggle, load_source_file_preview, mail_page_panes,
-        matching_commands, resolve_palette_local_workdir, subscription_line, thread_line,
+        AppState, CodeEditMode, CodePaneFocus, LoopAction, Pane, SubscriptionItem, UiPage,
+        code_edit_cursor_position, draw, extract_mail_body_preview, extract_mail_preview,
+        handle_key_event, is_palette_open_shortcut, is_palette_toggle, load_source_file_preview,
+        mail_page_panes, matching_commands, resolve_palette_local_workdir, subscription_line,
+        thread_line,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -3995,6 +4582,399 @@ mailbox = "inbox"
         assert!(preview.contains("    if true {"));
         assert!(preview.contains("        return;"));
         assert!(!preview.contains('\t'));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_edit_mode_enters_only_on_source_file_focus() {
+        let tree_root = temp_dir("code-edit-enter");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "fn demo() {}\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+        state.code_focus = CodePaneFocus::Tree;
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+        assert!(state.status.contains("select a source file"));
+
+        state.code_focus = CodePaneFocus::Source;
+        state.kernel_tree_row_index = 0;
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+        assert!(state.status.contains("select a source file"));
+
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+        assert_eq!(state.code_edit_target.as_ref(), Some(&file_path));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_edit_insert_save_and_escape_exit_updates_file() {
+        let tree_root = temp_dir("code-edit-save-esc");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "alpha\nbeta\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimInsert));
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+        );
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        );
+        let saved = fs::read_to_string(&file_path).expect("read saved file");
+        assert!(saved.starts_with("!alpha"));
+
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+        let preview = load_source_file_preview(&file_path);
+        assert!(preview.contains("!alpha"));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_edit_command_mode_handles_dirty_q_w_and_wq() {
+        let tree_root = temp_dir("code-edit-command");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "hello\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+        assert!(state.code_edit_dirty);
+        assert!(state.status.contains("unsaved changes"));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(!state.code_edit_dirty);
+        let saved_once = fs::read_to_string(&file_path).expect("read saved file");
+        assert!(saved_once.starts_with("xhello"));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.code_edit_dirty);
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+        let saved_twice = fs::read_to_string(&file_path).expect("read saved file");
+        assert!(saved_twice.starts_with("xyhello"));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_edit_command_mode_rejects_unsupported_command() {
+        let tree_root = temp_dir("code-edit-unsupported-command");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "hello\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+        assert!(state.status.contains("unsupported command"));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_edit_command_mode_supports_force_quit_without_saving() {
+        let tree_root = temp_dir("code-edit-force-quit");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "hello\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.code_edit_dirty);
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+        assert!(state.status.contains("discarded unsaved changes"));
+        let disk = fs::read_to_string(&file_path).expect("read file");
+        assert_eq!(disk, "hello\n");
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_edit_draw_sets_terminal_cursor_position() {
+        let tree_root = temp_dir("code-edit-cursor");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "hello\nworld\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let bootstrap = test_bootstrap(&runtime);
+        let mut state = AppState::new(vec![], runtime.clone());
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+        let mut expected_cursor: Option<(u16, u16)> = None;
+        terminal
+            .draw(|frame| {
+                let areas = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(10),
+                        Constraint::Length(1),
+                    ])
+                    .split(frame.area());
+                let panes = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                    .split(areas[1]);
+                let inner_area = Rect::new(
+                    panes[1].x + 1,
+                    panes[1].y + 1,
+                    panes[1].width.saturating_sub(2),
+                    panes[1].height.saturating_sub(2),
+                );
+                expected_cursor = code_edit_cursor_position(&state, inner_area);
+                draw(frame, &state, &runtime, &bootstrap);
+            })
+            .expect("draw frame");
+
+        let expected = expected_cursor.expect("cursor position should be visible");
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(expected.0, expected.1));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_browser_navigation_keys_unchanged_when_not_editing() {
+        let tree_root = temp_dir("code-edit-regression");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "line1\nline2\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+        assert!(matches!(state.code_focus, CodePaneFocus::Tree));
+
+        state.code_focus = CodePaneFocus::Source;
+        state.code_preview_scroll = 2;
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.code_preview_scroll, 1);
+        assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.code_preview_scroll, 2);
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_focus, CodePaneFocus::Tree));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_focus, CodePaneFocus::Source));
 
         let _ = fs::remove_dir_all(tree_root);
     }
