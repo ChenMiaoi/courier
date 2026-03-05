@@ -25,6 +25,11 @@ filter = "info"
 # Optional lore base URL.
 # lore_base_url = "https://lore.kernel.org"
 
+[ui]
+# Optional. Whether to auto-sync enabled subscriptions after TUI starts.
+# Default: true
+# startup_sync = true
+
 [kernel]
 # Optional. Single kernel tree root path shown in left pane tree view (Tab toggles).
 # tree = "/path/to/linux"

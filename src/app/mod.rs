@@ -9,7 +9,6 @@ use crate::infra::bootstrap;
 use crate::infra::config;
 use crate::infra::error::Result;
 use crate::infra::logging;
-use crate::infra::ui_state;
 
 const DEFAULT_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
 
@@ -31,29 +30,6 @@ pub fn run() -> Result<()> {
 
     match command {
         cli::Command::Tui => loop {
-            let ui_state_path = ui_state::path_for_data_dir(&runtime.data_dir);
-            let startup_mailboxes = load_startup_mailboxes(&ui_state_path);
-
-            for mailbox in startup_mailboxes {
-                let startup_sync_request = sync::SyncRequest {
-                    mailbox: mailbox.clone(),
-                    fixture_dir: None,
-                    uidvalidity: None,
-                    reconnect_attempts: DEFAULT_SYNC_RECONNECT_ATTEMPTS,
-                };
-
-                if let Err(error) =
-                    run_sync_command(&runtime, &bootstrap_state, startup_sync_request, false)
-                {
-                    tracing::warn!(
-                        mailbox = %mailbox,
-                        error = %error,
-                        "startup sync failed, continuing with local cache"
-                    );
-                    eprintln!("warning: startup sync failed for {mailbox}: {error}");
-                }
-            }
-
             match crate::ui::run(&runtime, &bootstrap_state)? {
                 crate::ui::TuiAction::Exit => break Ok(()),
                 crate::ui::TuiAction::Restart => {
@@ -93,6 +69,7 @@ pub fn run() -> Result<()> {
             println!("  log_dir: {}", runtime.log_dir.display());
             println!("  imap_mailbox: {}", runtime.imap_mailbox);
             println!("  lore_base_url: {}", runtime.lore_base_url);
+            println!("  startup_sync: {}", runtime.startup_sync);
             if runtime.kernel_trees.is_empty() {
                 println!("  kernel_trees: <none>");
             } else {
@@ -133,21 +110,6 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         cli::Command::Version => Ok(()),
-    }
-}
-
-fn load_startup_mailboxes(ui_state_path: &std::path::Path) -> Vec<String> {
-    match ui_state::load(ui_state_path) {
-        Ok(Some(state)) => state.normalized_enabled_mailboxes(),
-        Ok(None) => Vec::new(),
-        Err(error) => {
-            tracing::warn!(
-                path = %ui_state_path.display(),
-                error = %error,
-                "failed to load ui state for startup sync"
-            );
-            Vec::new()
-        }
     }
 }
 

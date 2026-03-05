@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::app::patch as patch_worker;
@@ -119,6 +121,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
         name: "config",
         description: "Show or update runtime config",
     },
+    PaletteCommand {
+        name: "vim",
+        description: "Open selected source file in external vim",
+    },
 ];
 
 const PALETTE_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
@@ -141,6 +147,7 @@ const CONFIG_GET_KEYS: &[&str] = &[
     "source.mailbox",
     "imap.mailbox",
     "source.lore_base_url",
+    "ui.startup_sync",
     "kernel.tree",
     "kernel.trees",
 ];
@@ -155,9 +162,50 @@ const CONFIG_SET_KEYS: &[&str] = &[
     "source.mailbox",
     "imap.mailbox",
     "source.lore_base_url",
+    "ui.startup_sync",
     "kernel.tree",
     "kernel.trees",
 ];
+const CODE_EDIT_ENTRY_HINT: &str = "select a source file in Source pane, then press e";
+const EXTERNAL_EDITOR_ENTRY_HINT: &str = "select a source file in Source pane, then press E";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExternalEditorProcessResult {
+    success: bool,
+    exit_code: Option<i32>,
+}
+
+type ExternalEditorRunner =
+    fn(&str, &Path) -> std::result::Result<ExternalEditorProcessResult, String>;
+
+#[derive(Debug, Clone)]
+enum StartupSyncEvent {
+    MailboxStarted {
+        mailbox: String,
+        index: usize,
+        total: usize,
+    },
+    MailboxFinished {
+        mailbox: String,
+        fetched: usize,
+        inserted: usize,
+        updated: usize,
+    },
+    MailboxFailed {
+        mailbox: String,
+        error: String,
+    },
+    WorkerCompleted,
+}
+
+#[derive(Debug)]
+struct StartupSyncState {
+    receiver: Receiver<StartupSyncEvent>,
+    total: usize,
+    completed: usize,
+    succeeded: usize,
+    failed: usize,
+}
 
 #[derive(Debug, Default)]
 struct CommandPaletteState {
@@ -355,6 +403,9 @@ struct AppState {
     last_apply_snapshot: Option<LastApplySnapshot>,
     palette: CommandPaletteState,
     search: SearchState,
+    external_editor_runner: ExternalEditorRunner,
+    needs_terminal_refresh: bool,
+    startup_sync: Option<StartupSyncState>,
 }
 
 impl AppState {
@@ -427,6 +478,9 @@ impl AppState {
             last_apply_snapshot: None,
             palette: CommandPaletteState::default(),
             search: SearchState::default(),
+            external_editor_runner: run_external_editor_session,
+            needs_terminal_refresh: false,
+            startup_sync: None,
         };
         if let Some(index) = state
             .subscriptions
@@ -504,6 +558,188 @@ impl AppState {
             .filter(|item| item.enabled)
             .map(|item| item.mailbox.clone())
             .collect()
+    }
+
+    fn start_startup_sync_if_enabled(&mut self) {
+        if !self.runtime.startup_sync {
+            tracing::info!(
+                op = "startup_sync",
+                status = "disabled",
+                reason = "ui.startup_sync=false"
+            );
+            return;
+        }
+
+        let mailboxes = self.enabled_mailboxes();
+        if mailboxes.is_empty() {
+            tracing::info!(
+                op = "startup_sync",
+                status = "skipped",
+                reason = "no_enabled_subscriptions"
+            );
+            return;
+        }
+
+        let receiver = spawn_startup_sync_worker(self.runtime.clone(), mailboxes.clone());
+        self.startup_sync = Some(StartupSyncState {
+            receiver,
+            total: mailboxes.len(),
+            completed: 0,
+            succeeded: 0,
+            failed: 0,
+        });
+        self.status = format!(
+            "startup sync queued: {} mailbox(es): {}",
+            mailboxes.len(),
+            mailboxes.join(", ")
+        );
+        tracing::info!(
+            op = "startup_sync",
+            status = "started",
+            mailboxes = %mailboxes.join(",")
+        );
+    }
+
+    fn pump_startup_sync_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        {
+            let Some(sync_state) = self.startup_sync.as_ref() else {
+                return;
+            };
+            loop {
+                match sync_state.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            self.apply_startup_sync_event(event);
+        }
+
+        if disconnected && self.startup_sync.is_some() {
+            let (completed, total, succeeded, failed) = self
+                .startup_sync
+                .as_ref()
+                .map(|state| (state.completed, state.total, state.succeeded, state.failed))
+                .unwrap_or((0, 0, 0, 0));
+            self.startup_sync = None;
+            self.status = format!(
+                "startup sync worker disconnected (completed={completed}/{total} ok={succeeded} failed={failed})"
+            );
+            tracing::warn!(
+                op = "startup_sync",
+                status = "failed",
+                completed,
+                total,
+                succeeded,
+                failed,
+                "startup sync worker disconnected unexpectedly"
+            );
+        }
+    }
+
+    fn apply_startup_sync_event(&mut self, event: StartupSyncEvent) {
+        match event {
+            StartupSyncEvent::MailboxStarted {
+                mailbox,
+                index,
+                total,
+            } => {
+                self.status = format!("startup sync [{index}/{total}] syncing {mailbox}...");
+            }
+            StartupSyncEvent::MailboxFinished {
+                mailbox,
+                fetched,
+                inserted,
+                updated,
+            } => {
+                if let Some(sync_state) = self.startup_sync.as_mut() {
+                    sync_state.completed += 1;
+                    sync_state.succeeded += 1;
+                }
+
+                if mailbox == self.active_thread_mailbox {
+                    self.reload_active_mailbox_threads_after_sync();
+                }
+
+                tracing::info!(
+                    op = "startup_sync",
+                    status = "succeeded",
+                    mailbox = %mailbox,
+                    fetched,
+                    inserted,
+                    updated
+                );
+            }
+            StartupSyncEvent::MailboxFailed { mailbox, error } => {
+                if let Some(sync_state) = self.startup_sync.as_mut() {
+                    sync_state.completed += 1;
+                    sync_state.failed += 1;
+                }
+                self.status = format!("startup sync failed for {mailbox}: {error}");
+                tracing::error!(
+                    op = "startup_sync",
+                    status = "failed",
+                    mailbox = %mailbox,
+                    error = %error
+                );
+            }
+            StartupSyncEvent::WorkerCompleted => {}
+        }
+
+        self.maybe_finish_startup_sync();
+    }
+
+    fn maybe_finish_startup_sync(&mut self) {
+        let Some(sync_state) = self.startup_sync.as_ref() else {
+            return;
+        };
+        if sync_state.completed < sync_state.total {
+            return;
+        }
+
+        let succeeded = sync_state.succeeded;
+        let failed = sync_state.failed;
+        let total = sync_state.total;
+        self.startup_sync = None;
+        self.status =
+            format!("startup sync finished: ok={succeeded} failed={failed} total={total}");
+        tracing::info!(
+            op = "startup_sync",
+            status = if failed == 0 { "succeeded" } else { "partial" },
+            succeeded,
+            failed,
+            total
+        );
+    }
+
+    fn reload_active_mailbox_threads_after_sync(&mut self) {
+        match mail_store::load_thread_rows_by_mailbox(
+            &self.runtime.database_path,
+            &self.active_thread_mailbox,
+            500,
+        ) {
+            Ok(rows) => self.replace_threads(rows),
+            Err(error) => {
+                tracing::error!(
+                    op = "startup_sync",
+                    status = "failed",
+                    mailbox = %self.active_thread_mailbox,
+                    error = %error
+                );
+                self.status = format!(
+                    "startup sync ok but failed to reload threads for {}: {}",
+                    self.active_thread_mailbox, error
+                );
+            }
+        }
     }
 
     fn to_ui_state(&self) -> UiState {
@@ -797,7 +1033,11 @@ impl AppState {
     }
 
     fn run_patch_action(&mut self, action: patch_worker::PatchAction) {
-        tracing::debug!(action = action.name(), "user triggered patch action");
+        tracing::info!(
+            op = "patch.action",
+            status = "started",
+            action = action.name()
+        );
         if !matches!(self.ui_page, UiPage::Mail) {
             self.status = "patch action is only available on mail page".to_string();
             return;
@@ -848,21 +1088,27 @@ impl AppState {
                     result.timed_out
                 );
                 tracing::info!(
+                    op = "patch.action",
+                    status = "succeeded",
                     action = action.name(),
                     command = %result.command_line,
                     output_dir = %output_dir,
-                    "patch action completed"
                 );
             }
             Err(error) => {
-                tracing::error!(action = action.name(), error = %error, "patch action failed");
+                tracing::error!(
+                    op = "patch.action",
+                    status = "failed",
+                    action = action.name(),
+                    error = %error
+                );
                 self.status = format!("{} failed: {}", action.name(), error);
             }
         }
     }
 
     fn run_patch_undo_action(&mut self) {
-        tracing::debug!("user triggered patch undo action");
+        tracing::info!(op = "patch.undo", status = "started");
         if !matches!(self.ui_page, UiPage::Mail) {
             self.status = "undo is only available on mail page".to_string();
             return;
@@ -888,13 +1134,14 @@ impl AppState {
                     short_commit_id(&head_after_reset)
                 );
                 tracing::info!(
+                    op = "patch.undo",
+                    status = "succeeded",
                     thread_id = snapshot.thread_id,
-                    head = %head_after_reset,
-                    "patch apply undo completed"
+                    head = %head_after_reset
                 );
             }
             Err(error) => {
-                tracing::error!(error = %error, "patch apply undo failed");
+                tracing::error!(op = "patch.undo", status = "failed", error = %error);
                 self.status = format!("undo apply failed: {error}");
             }
         }
@@ -1161,34 +1408,34 @@ impl AppState {
         self.code_edit_mode.is_active()
     }
 
+    fn mark_terminal_refresh_needed(&mut self) {
+        self.needs_terminal_refresh = true;
+    }
+
+    fn take_terminal_refresh_needed(&mut self) -> bool {
+        std::mem::take(&mut self.needs_terminal_refresh)
+    }
+
     fn enter_code_edit_mode(&mut self) {
         if !matches!(self.ui_page, UiPage::CodeBrowser)
             || !matches!(self.code_focus, CodePaneFocus::Source)
         {
-            self.status = "select a source file in Source pane, then press e".to_string();
+            self.status = CODE_EDIT_ENTRY_HINT.to_string();
             return;
         }
 
         let Some(path) = self.selected_kernel_tree_file_path().map(Path::to_path_buf) else {
-            self.status = "select a source file in Source pane, then press e".to_string();
+            self.status = CODE_EDIT_ENTRY_HINT.to_string();
             return;
         };
 
-        let content = match fs::read(&path) {
-            Ok(value) => value,
+        let buffer = match load_code_edit_buffer_from_path(&path) {
+            Ok(buffer) => buffer,
             Err(error) => {
-                self.status = format!("failed to read {}: {}", path.display(), error);
+                self.status = error;
                 return;
             }
         };
-
-        let text = String::from_utf8_lossy(&content)
-            .replace("\r\n", "\n")
-            .replace('\r', "\n");
-        let mut buffer: Vec<String> = text.split('\n').map(ToOwned::to_owned).collect();
-        if buffer.is_empty() {
-            buffer.push(String::new());
-        }
 
         self.code_edit_mode = CodeEditMode::VimNormal;
         self.code_edit_target = Some(path.clone());
@@ -1199,9 +1446,19 @@ impl AppState {
         self.code_edit_command_input.clear();
         self.code_preview_scroll = 0;
         self.status = format!("editing {} (NORMAL)", path.display());
+        tracing::info!(
+            op = "code.edit",
+            status = "started",
+            file = %path.display()
+        );
     }
 
     fn exit_code_edit_mode(&mut self, status: String) {
+        let target_for_log = self
+            .code_edit_target
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
         self.code_edit_mode = CodeEditMode::Browse;
         self.code_edit_target = None;
         self.code_edit_buffer.clear();
@@ -1211,6 +1468,12 @@ impl AppState {
         self.code_edit_command_input.clear();
         self.code_preview_scroll = 0;
         self.status = status;
+        tracing::info!(
+            op = "code.edit",
+            status = "succeeded",
+            file = %target_for_log,
+            detail = %self.status
+        );
     }
 
     fn save_code_edit_buffer(&mut self) -> bool {
@@ -1224,11 +1487,159 @@ impl AppState {
             Ok(_) => {
                 self.code_edit_dirty = false;
                 self.status = format!("saved {}", path.display());
+                tracing::info!(
+                    op = "code.save",
+                    status = "succeeded",
+                    file = %path.display(),
+                    lines = self.code_edit_buffer.len()
+                );
                 true
             }
             Err(error) => {
                 self.status = format!("failed to save {}: {}", path.display(), error);
+                tracing::error!(
+                    op = "code.save",
+                    status = "failed",
+                    file = %path.display(),
+                    error = %error
+                );
                 false
+            }
+        }
+    }
+
+    fn current_external_editor_target(&self) -> Option<PathBuf> {
+        if self.is_code_edit_active() {
+            self.code_edit_target
+                .clone()
+                .or_else(|| self.selected_kernel_tree_file_path().map(Path::to_path_buf))
+        } else {
+            self.selected_kernel_tree_file_path().map(Path::to_path_buf)
+        }
+    }
+
+    fn reload_code_edit_target_from_disk(
+        &mut self,
+        path: &Path,
+    ) -> std::result::Result<(), String> {
+        let Some(target) = self.code_edit_target.as_ref() else {
+            return Ok(());
+        };
+        if target != path {
+            return Ok(());
+        }
+
+        let buffer = load_code_edit_buffer_from_path(path)?;
+        self.code_edit_buffer = buffer;
+        self.code_edit_dirty = false;
+        self.clamp_code_edit_cursor();
+        self.adjust_code_edit_scroll();
+        Ok(())
+    }
+
+    fn open_external_editor(&mut self) {
+        if !matches!(self.ui_page, UiPage::CodeBrowser)
+            || !matches!(self.code_focus, CodePaneFocus::Source)
+        {
+            tracing::info!(
+                op = "external_editor",
+                status = "blocked",
+                ui_page = ?self.ui_page,
+                code_focus = ?self.code_focus,
+                reason = "invalid_page_or_focus"
+            );
+            self.status = EXTERNAL_EDITOR_ENTRY_HINT.to_string();
+            return;
+        }
+
+        if self.code_edit_dirty {
+            tracing::info!(
+                op = "external_editor",
+                status = "blocked",
+                reason = "inline_buffer_dirty"
+            );
+            self.status = "unsaved changes, run :w before external vim".to_string();
+            return;
+        }
+
+        let Some(path) = self.current_external_editor_target() else {
+            tracing::info!(
+                op = "external_editor",
+                status = "blocked",
+                reason = "no_source_file_selected"
+            );
+            self.status = EXTERNAL_EDITOR_ENTRY_HINT.to_string();
+            return;
+        };
+
+        let editor = resolve_external_editor();
+        let from_inline_edit = self.is_code_edit_active();
+        tracing::info!(
+            op = "external_editor",
+            status = "started",
+            editor = %editor,
+            file = %path.display(),
+            from_inline_edit
+        );
+        let runner = self.external_editor_runner;
+        match runner(&editor, &path) {
+            Ok(result) => {
+                self.mark_terminal_refresh_needed();
+                let reload_status = self.reload_code_edit_target_from_disk(&path);
+                self.code_preview_scroll = 0;
+                self.status = match (result.success, result.exit_code) {
+                    (true, Some(code)) => format!(
+                        "external vim exited successfully (editor={} exit={} file={})",
+                        editor,
+                        code,
+                        path.display()
+                    ),
+                    (true, None) => format!(
+                        "external vim exited successfully (editor={} file={})",
+                        editor,
+                        path.display()
+                    ),
+                    (false, Some(code)) => format!(
+                        "external vim exited with code {} (editor={} file={})",
+                        code,
+                        editor,
+                        path.display()
+                    ),
+                    (false, None) => format!(
+                        "external vim terminated by signal (editor={} file={})",
+                        editor,
+                        path.display()
+                    ),
+                };
+
+                if let Err(error) = reload_status {
+                    self.status = format!(
+                        "{}; failed to reload {}: {}",
+                        self.status,
+                        path.display(),
+                        error
+                    );
+                }
+
+                tracing::info!(
+                    op = "external_editor",
+                    status = if result.success { "succeeded" } else { "failed" },
+                    editor = %editor,
+                    file = %path.display(),
+                    success = result.success,
+                    exit_code = ?result.exit_code
+                );
+            }
+            Err(error) => {
+                self.mark_terminal_refresh_needed();
+                self.status = format!("external vim failed for {}: {}", path.display(), error);
+                tracing::error!(
+                    op = "external_editor",
+                    status = "failed",
+                    editor = %editor,
+                    file = %path.display(),
+                    error = %error
+                );
             }
         }
     }
@@ -1417,6 +1828,17 @@ impl AppState {
             return;
         }
 
+        let target_for_log = self
+            .code_edit_target
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        tracing::info!(
+            op = "code.command",
+            status = "started",
+            command = %command,
+            file = %target_for_log
+        );
         match command.as_str() {
             "w" => {
                 let _ = self.save_code_edit_buffer();
@@ -1451,11 +1873,202 @@ impl AppState {
                     self.exit_code_edit_mode(format!("saved and exited {target}"));
                 }
             }
+            "vim" => {
+                self.open_external_editor();
+            }
             _ => {
                 self.status = format!("unsupported command: :{command}");
             }
         }
     }
+}
+
+fn spawn_startup_sync_worker(
+    runtime: RuntimeConfig,
+    mailboxes: Vec<String>,
+) -> Receiver<StartupSyncEvent> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let total = mailboxes.len();
+        for (index, mailbox) in mailboxes.into_iter().enumerate() {
+            if sender
+                .send(StartupSyncEvent::MailboxStarted {
+                    mailbox: mailbox.clone(),
+                    index: index + 1,
+                    total,
+                })
+                .is_err()
+            {
+                return;
+            }
+
+            let request = sync_worker::SyncRequest {
+                mailbox: mailbox.clone(),
+                fixture_dir: None,
+                uidvalidity: None,
+                reconnect_attempts: PALETTE_SYNC_RECONNECT_ATTEMPTS,
+            };
+            match sync_worker::run(&runtime, request) {
+                Ok(summary) => {
+                    if sender
+                        .send(StartupSyncEvent::MailboxFinished {
+                            mailbox,
+                            fetched: summary.fetched,
+                            inserted: summary.inserted,
+                            updated: summary.updated,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    if sender
+                        .send(StartupSyncEvent::MailboxFailed {
+                            mailbox,
+                            error: error.to_string(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        let _ = sender.send(StartupSyncEvent::WorkerCompleted);
+    });
+
+    receiver
+}
+
+fn load_code_edit_buffer_from_path(path: &Path) -> std::result::Result<Vec<String>, String> {
+    let content =
+        fs::read(path).map_err(|error| format!("failed to read {}: {}", path.display(), error))?;
+    let text = String::from_utf8_lossy(&content)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut buffer: Vec<String> = text.split('\n').map(ToOwned::to_owned).collect();
+    if buffer.is_empty() {
+        buffer.push(String::new());
+    }
+    Ok(buffer)
+}
+
+fn pick_external_editor(visual: Option<&str>, editor: Option<&str>) -> String {
+    visual
+        .and_then(normalized_external_editor_value)
+        .or_else(|| editor.and_then(normalized_external_editor_value))
+        .unwrap_or_else(|| "vim".to_string())
+}
+
+fn normalized_external_editor_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn resolve_external_editor() -> String {
+    let visual = env::var("VISUAL").ok();
+    let editor = env::var("EDITOR").ok();
+    pick_external_editor(visual.as_deref(), editor.as_deref())
+}
+
+fn run_external_editor_session(
+    editor_spec: &str,
+    file_path: &Path,
+) -> std::result::Result<ExternalEditorProcessResult, String> {
+    run_external_editor_session_with(
+        editor_spec,
+        file_path,
+        || disable_raw_mode().map_err(|error| error.to_string()),
+        || {
+            let mut stdout = io::stdout();
+            execute!(stdout, LeaveAlternateScreen).map_err(|error| error.to_string())
+        },
+        launch_external_editor_process,
+        || {
+            let mut stdout = io::stdout();
+            execute!(stdout, EnterAlternateScreen).map_err(|error| error.to_string())
+        },
+        || enable_raw_mode().map_err(|error| error.to_string()),
+    )
+}
+
+fn run_external_editor_session_with<DisableRaw, LeaveAlt, LaunchEditor, EnterAlt, EnableRaw>(
+    editor_spec: &str,
+    file_path: &Path,
+    mut disable_raw: DisableRaw,
+    mut leave_alternate_screen: LeaveAlt,
+    mut launch_editor: LaunchEditor,
+    mut enter_alternate_screen: EnterAlt,
+    mut enable_raw: EnableRaw,
+) -> std::result::Result<ExternalEditorProcessResult, String>
+where
+    DisableRaw: FnMut() -> std::result::Result<(), String>,
+    LeaveAlt: FnMut() -> std::result::Result<(), String>,
+    LaunchEditor: FnMut(&str, &Path) -> std::result::Result<ExternalEditorProcessResult, String>,
+    EnterAlt: FnMut() -> std::result::Result<(), String>,
+    EnableRaw: FnMut() -> std::result::Result<(), String>,
+{
+    disable_raw().map_err(|error| format!("failed to disable raw mode: {error}"))?;
+
+    if let Err(error) = leave_alternate_screen() {
+        let _ = enable_raw();
+        return Err(format!("failed to leave alternate screen: {error}"));
+    }
+
+    let launch_result = launch_editor(editor_spec, file_path);
+    let enter_result = enter_alternate_screen();
+    let enable_result = enable_raw();
+
+    let mut restore_errors = Vec::new();
+    if let Err(error) = enter_result {
+        restore_errors.push(format!("failed to re-enter alternate screen: {error}"));
+    }
+    if let Err(error) = enable_result {
+        restore_errors.push(format!("failed to re-enable raw mode: {error}"));
+    }
+
+    if !restore_errors.is_empty() {
+        return match launch_result {
+            Ok(result) => Err(format!(
+                "terminal restore failed after external editor session (exit={:?}): {}",
+                result.exit_code,
+                restore_errors.join("; ")
+            )),
+            Err(error) => Err(format!("{error}; {}", restore_errors.join("; "))),
+        };
+    }
+
+    launch_result
+}
+
+fn launch_external_editor_process(
+    editor_spec: &str,
+    file_path: &Path,
+) -> std::result::Result<ExternalEditorProcessResult, String> {
+    let (program, args) = split_external_editor_command(editor_spec)
+        .ok_or_else(|| "external editor command is empty".to_string())?;
+    let status = ProcessCommand::new(&program)
+        .args(args)
+        .arg(file_path)
+        .status()
+        .map_err(|error| format!("failed to launch {program}: {error}"))?;
+    Ok(ExternalEditorProcessResult {
+        success: status.success(),
+        exit_code: status.code(),
+    })
+}
+
+fn split_external_editor_command(editor_spec: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = editor_spec.split_whitespace();
+    let program = parts.next()?.to_string();
+    let args = parts.map(ToOwned::to_owned).collect();
+    Some((program, args))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1492,6 +2105,7 @@ pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiActi
     if state.filtered_thread_indices.is_empty() {
         state.status = "no synced thread data, run `courier sync` first".to_string();
     }
+    state.start_startup_sync_if_enabled();
 
     let result = tui_loop(&mut terminal, &mut state, config, bootstrap);
 
@@ -1542,6 +2156,17 @@ fn tui_loop(
     bootstrap: &BootstrapState,
 ) -> Result<TuiAction> {
     loop {
+        state.pump_startup_sync_events();
+
+        if state.take_terminal_refresh_needed() {
+            terminal.clear().map_err(|error| {
+                CourierError::with_source(ErrorCode::Tui, "failed to clear terminal", error)
+            })?;
+            terminal.hide_cursor().map_err(|error| {
+                CourierError::with_source(ErrorCode::Tui, "failed to hide terminal cursor", error)
+            })?;
+        }
+
         terminal
             .draw(|frame| draw(frame, state, config, bootstrap))
             .map_err(|error| {
@@ -1628,6 +2253,9 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         KeyCode::Char('e') if matches!(state.ui_page, UiPage::CodeBrowser) => {
             state.enter_code_edit_mode();
         }
+        KeyCode::Char('E') if matches!(state.ui_page, UiPage::CodeBrowser) => {
+            state.open_external_editor();
+        }
         KeyCode::Tab => state.toggle_ui_page(),
         KeyCode::Char('j') => state.move_focus_previous(),
         KeyCode::Char('l') => state.move_focus_next(),
@@ -1704,6 +2332,9 @@ fn handle_code_edit_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction
             }
             KeyCode::Char('s') => {
                 let _ = state.save_code_edit_buffer();
+            }
+            KeyCode::Char('E') => {
+                state.open_external_editor();
             }
             KeyCode::Char(':')
                 if !key.modifiers.intersects(
@@ -1826,13 +2457,16 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "quit" | "exit" => return LoopAction::Exit,
                 "restart" => return LoopAction::Restart,
                 "help" => {
-                    state.status = "commands: quit, exit, restart, help, sync [mailbox], config ..., !<local shell command> | keys: j/l focus, i/k move, y/n enable, a apply, d download, u undo apply, e edit source".to_string();
+                    state.status = "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: j/l focus, i/k move, y/n enable, a apply, d download, u undo apply, e inline edit, E external vim".to_string();
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
                     run_palette_sync(state, value);
                 }
                 value if value.split_whitespace().next() == Some("config") => {
                     run_palette_config(state, value);
+                }
+                "vim" => {
+                    state.open_external_editor();
                 }
                 _ => {
                     state.status = format!("unknown command: {command}");
@@ -1873,12 +2507,21 @@ fn run_palette_local_command(state: &mut AppState, local_command: &str) {
         state.status = "empty local command after !".to_string();
         return;
     }
-    tracing::debug!(command = %local_command, "user triggered local shell command");
+    tracing::info!(
+        op = "local_command",
+        status = "started",
+        command = %local_command
+    );
 
     let cwd = match resolve_palette_local_workdir(state) {
         Ok(path) => path,
         Err(message) => {
-            tracing::error!(command = %local_command, error = %message, "local command setup failed");
+            tracing::error!(
+                op = "local_command",
+                status = "failed",
+                command = %local_command,
+                error = %message
+            );
             state.palette.clear_local_result();
             state.status = format!("local command setup failed: {message}");
             return;
@@ -1919,10 +2562,11 @@ fn run_palette_local_command(state: &mut AppState, local_command: &str) {
                     summary
                 );
                 tracing::info!(
+                    op = "local_command",
+                    status = "succeeded",
                     command = local_command,
                     cwd = %cwd.display(),
-                    exit_code = %exit_code,
-                    "local command executed from command palette"
+                    exit_code = %exit_code
                 );
             } else {
                 state.status = format!(
@@ -1932,19 +2576,21 @@ fn run_palette_local_command(state: &mut AppState, local_command: &str) {
                     summary
                 );
                 tracing::error!(
+                    op = "local_command",
+                    status = "failed",
                     command = local_command,
                     cwd = %cwd.display(),
-                    exit_code = %exit_code,
-                    "local command failed from command palette"
+                    exit_code = %exit_code
                 );
             }
         }
         Err(error) => {
             tracing::error!(
+                op = "local_command",
+                status = "failed",
                 command = %local_command,
                 cwd = %cwd.display(),
-                error = %error,
-                "failed to launch local command from command palette"
+                error = %error
             );
             state.palette.last_local_result = Some(LocalCommandResult {
                 command: local_command.to_string(),
@@ -2026,6 +2672,12 @@ fn run_palette_sync(state: &mut AppState, command: &str) {
             enabled
         }
     };
+    tracing::info!(
+        op = "sync",
+        status = "started",
+        command = %command,
+        mailboxes = %mailboxes.join(",")
+    );
 
     let mut success = 0usize;
     let mut failed = 0usize;
@@ -2087,13 +2739,32 @@ fn run_palette_sync(state: &mut AppState, command: &str) {
         )
     };
 
+    tracing::info!(
+        op = "sync",
+        status = if failed == 0 {
+            "succeeded"
+        } else if success == 0 {
+            "failed"
+        } else {
+            "partial"
+        },
+        command = %command,
+        success,
+        failed,
+        fetched = total_fetched,
+        inserted = total_inserted,
+        updated = total_updated,
+        first_error = %first_error_text
+    );
+
     if failed > 0 {
         tracing::error!(
+            op = "sync",
+            status = "failed",
             command = %command,
             success,
             failed,
-            first_error = %first_error_text,
-            "palette sync command finished with errors"
+            first_error = %first_error_text
         );
     }
 }
@@ -2133,23 +2804,42 @@ fn run_palette_config(state: &mut AppState, command: &str) {
                 return;
             }
 
+            tracing::info!(
+                op = "config.set",
+                status = "started",
+                key = %key,
+                value_literal = %value_literal
+            );
             match update_config_key_in_file(&state.runtime.config_path, key, &value_literal) {
                 Ok(rendered_value) => match reload_runtime_from_config(state) {
                     Ok(()) => {
                         state.status = format!("config updated: {key} = {rendered_value}");
+                        tracing::info!(
+                            op = "config.set",
+                            status = "succeeded",
+                            key = %key,
+                            value = %rendered_value,
+                            config = %state.runtime.config_path.display()
+                        );
                     }
                     Err(error) => {
                         tracing::error!(
+                            op = "config.set",
+                            status = "failed",
                             key = %key,
-                            error = %error,
-                            "config file updated but runtime reload failed"
+                            error = %error
                         );
                         state.status =
                             format!("config file updated but runtime reload failed: {error}");
                     }
                 },
                 Err(error) => {
-                    tracing::error!(key = %key, error = %error, "failed to update config key");
+                    tracing::error!(
+                        op = "config.set",
+                        status = "failed",
+                        key = %key,
+                        error = %error
+                    );
                     state.status = format!("failed to set config key {key}: {error}");
                 }
             }
@@ -2346,6 +3036,7 @@ fn effective_config_value(state: &AppState, key: &str) -> Option<String> {
         ),
         "source.mailbox" | "imap.mailbox" => Some(state.runtime.imap_mailbox.clone()),
         "source.lore_base_url" => Some(state.runtime.lore_base_url.clone()),
+        "ui.startup_sync" => Some(state.runtime.startup_sync.to_string()),
         "kernel.trees" => Some(format!(
             "[{}]",
             state
@@ -2852,6 +3543,13 @@ fn config_value_suggestions(state: &AppState, key: Option<&String>) -> Vec<Palet
             value: format!("\"{}\"", state.runtime.log_dir.display()),
             description: Some("Current log dir".to_string()),
         }],
+        "ui.startup_sync" => ["true", "false"]
+            .iter()
+            .map(|value| PaletteSuggestion {
+                value: (*value).to_string(),
+                description: Some("Auto-sync on TUI startup".to_string()),
+            })
+            .collect(),
         "b4.path" => vec![PaletteSuggestion {
             value: "\"/usr/bin/b4\"".to_string(),
             description: Some("Path to b4 executable".to_string()),
@@ -2982,9 +3680,11 @@ fn draw(
     let shortcuts_text = match state.ui_page {
         UiPage::Mail => "/ search | Tab page | : palette | Enter open/toggle",
         UiPage::CodeBrowser if state.is_code_edit_active() => {
-            "Esc normal/exit | h/j/k/l move | i insert | x delete | s save | :w :q :q! :wq"
+            "Esc normal/exit | h/j/k/l move | i insert | x delete | s save | E external vim | :w :q :q! :wq :vim"
         }
-        UiPage::CodeBrowser => "Tab page | : palette | Enter expand/collapse | e edit",
+        UiPage::CodeBrowser => {
+            "Tab page | : palette | Enter expand/collapse | e inline edit | E external vim"
+        }
     };
     let footer_sections = Layout::default()
         .direction(Direction::Horizontal)
@@ -3650,7 +4350,7 @@ fn render_code_edit_preview(state: &AppState) -> String {
             state.code_edit_cursor_row + 1,
             state.code_edit_cursor_col + 1
         ),
-        "Use h/j/k/l move, i insert, x delete, s save, : command".to_string(),
+        "Use h/j/k/l move, i insert, x delete, s save, E external vim, : command".to_string(),
         String::new(),
     ];
 
@@ -4014,7 +4714,7 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4028,10 +4728,11 @@ mod tests {
     use crate::infra::mail_store::ThreadRow;
 
     use super::{
-        AppState, CodeEditMode, CodePaneFocus, LoopAction, Pane, SubscriptionItem, UiPage,
-        code_edit_cursor_position, draw, extract_mail_body_preview, extract_mail_preview,
-        handle_key_event, is_palette_open_shortcut, is_palette_toggle, load_source_file_preview,
-        mail_page_panes, matching_commands, resolve_palette_local_workdir, subscription_line,
+        AppState, CodeEditMode, CodePaneFocus, ExternalEditorProcessResult, LoopAction, Pane,
+        SubscriptionItem, UiPage, code_edit_cursor_position, draw, extract_mail_body_preview,
+        extract_mail_preview, handle_key_event, is_palette_open_shortcut, is_palette_toggle,
+        load_source_file_preview, mail_page_panes, matching_commands, pick_external_editor,
+        resolve_palette_local_workdir, run_external_editor_session_with, subscription_line,
         thread_line,
     };
 
@@ -4111,6 +4812,7 @@ mod tests {
             log_filter: "info".to_string(),
             imap_mailbox: "inbox".to_string(),
             lore_base_url: "https://lore.kernel.org".to_string(),
+            startup_sync: true,
             kernel_trees: Vec::new(),
         }
     }
@@ -4133,15 +4835,46 @@ mod tests {
     }
 
     #[test]
+    fn startup_sync_is_not_started_when_disabled_in_config() {
+        let mut runtime = test_runtime();
+        runtime.startup_sync = false;
+        let mut state = AppState::new(vec![], runtime);
+
+        state.start_startup_sync_if_enabled();
+
+        assert!(state.startup_sync.is_none());
+    }
+
+    fn external_editor_mock_success(
+        _editor: &str,
+        file_path: &Path,
+    ) -> std::result::Result<ExternalEditorProcessResult, String> {
+        fs::write(file_path, "externally edited\n")
+            .map_err(|error| format!("failed to write fixture: {error}"))?;
+        Ok(ExternalEditorProcessResult {
+            success: true,
+            exit_code: Some(0),
+        })
+    }
+
+    fn external_editor_mock_failure(
+        _editor: &str,
+        _file_path: &Path,
+    ) -> std::result::Result<ExternalEditorProcessResult, String> {
+        Err("mock launch failure".to_string())
+    }
+
+    #[test]
     fn empty_query_returns_all_palette_commands() {
         let all = matching_commands("");
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 7);
         assert_eq!(all[0].name, "config");
         assert_eq!(all[1].name, "exit");
         assert_eq!(all[2].name, "help");
         assert_eq!(all[3].name, "quit");
         assert_eq!(all[4].name, "restart");
         assert_eq!(all[5].name, "sync");
+        assert_eq!(all[6].name, "vim");
     }
 
     #[test]
@@ -4154,6 +4887,83 @@ mod tests {
     fn bang_mode_is_not_matched_as_builtin_command() {
         let commands = matching_commands("!pwd");
         assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn external_editor_selection_prefers_visual_then_editor_then_vim() {
+        assert_eq!(
+            pick_external_editor(Some("nvim"), Some("vim")),
+            "nvim".to_string()
+        );
+        assert_eq!(
+            pick_external_editor(Some("  "), Some("hx")),
+            "hx".to_string()
+        );
+        assert_eq!(pick_external_editor(None, Some("nano")), "nano".to_string());
+        assert_eq!(pick_external_editor(None, None), "vim".to_string());
+    }
+
+    #[test]
+    fn external_editor_session_restores_terminal_after_editor_exit() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let steps: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+        let result = run_external_editor_session_with(
+            "vim",
+            Path::new("/tmp/demo.rs"),
+            {
+                let steps = steps.clone();
+                move || {
+                    steps.borrow_mut().push("disable_raw");
+                    Ok(())
+                }
+            },
+            {
+                let steps = steps.clone();
+                move || {
+                    steps.borrow_mut().push("leave_alt");
+                    Ok(())
+                }
+            },
+            {
+                let steps = steps.clone();
+                move |_, _| {
+                    steps.borrow_mut().push("launch");
+                    Ok(ExternalEditorProcessResult {
+                        success: true,
+                        exit_code: Some(0),
+                    })
+                }
+            },
+            {
+                let steps = steps.clone();
+                move || {
+                    steps.borrow_mut().push("enter_alt");
+                    Ok(())
+                }
+            },
+            {
+                let steps = steps.clone();
+                move || {
+                    steps.borrow_mut().push("enable_raw");
+                    Ok(())
+                }
+            },
+        )
+        .expect("external editor session should succeed");
+
+        assert!(result.success);
+        assert_eq!(
+            *steps.borrow(),
+            vec![
+                "disable_raw",
+                "leave_alt",
+                "launch",
+                "enter_alt",
+                "enable_raw"
+            ]
+        );
     }
 
     #[test]
@@ -4875,6 +5685,236 @@ mailbox = "inbox"
         assert!(state.status.contains("discarded unsaved changes"));
         let disk = fs::read_to_string(&file_path).expect("read file");
         assert_eq!(disk, "hello\n");
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_browser_external_vim_key_updates_selected_file_preview() {
+        let tree_root = temp_dir("external-vim-key");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "before\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        state.external_editor_runner = external_editor_mock_success;
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+        );
+
+        assert!(state.status.contains("external vim exited successfully"));
+        let preview = load_source_file_preview(&file_path);
+        assert!(preview.contains("externally edited"));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_edit_external_vim_rejects_dirty_buffer() {
+        let tree_root = temp_dir("external-vim-dirty");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "hello\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        state.external_editor_runner = external_editor_mock_success;
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.code_edit_dirty);
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+        );
+
+        assert!(
+            state
+                .status
+                .contains("unsaved changes, run :w before external vim")
+        );
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+        assert!(state.code_edit_dirty);
+        let disk = fs::read_to_string(&file_path).expect("read file");
+        assert_eq!(disk, "hello\n");
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn code_edit_command_mode_vim_reloads_buffer_after_external_edit() {
+        let tree_root = temp_dir("external-vim-command");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "hello\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        state.external_editor_runner = external_editor_mock_success;
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+        );
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+        assert!(!state.code_edit_dirty);
+        assert_eq!(
+            state.code_edit_buffer.first().map(String::as_str),
+            Some("externally edited")
+        );
+        assert!(state.status.contains("external vim exited successfully"));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn command_palette_vim_runs_external_editor() {
+        let tree_root = temp_dir("external-vim-palette");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "before\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        state.external_editor_runner = external_editor_mock_success;
+        state.palette.open = true;
+        state.palette.input = "vim".to_string();
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(state.status.contains("external vim exited successfully"));
+        let preview = load_source_file_preview(&file_path);
+        assert!(preview.contains("externally edited"));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn external_vim_launch_failure_keeps_tui_interactive() {
+        let tree_root = temp_dir("external-vim-failure");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "before\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        state.external_editor_runner = external_editor_mock_failure;
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+        );
+        assert!(state.status.contains("external vim failed"));
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.code_focus, CodePaneFocus::Tree));
+
+        let _ = fs::remove_dir_all(tree_root);
+    }
+
+    #[test]
+    fn external_vim_marks_terminal_refresh_needed_after_return() {
+        let tree_root = temp_dir("external-vim-refresh");
+        let file_path = tree_root.join("demo.rs");
+        fs::write(&file_path, "before\n").expect("write demo file");
+
+        let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+        let mut state = AppState::new(vec![], runtime);
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        state.code_focus = CodePaneFocus::Source;
+        let file_index = state
+            .kernel_tree_rows
+            .iter()
+            .position(|row| row.path == file_path)
+            .expect("find source file");
+        state.kernel_tree_row_index = file_index;
+        state.external_editor_runner = external_editor_mock_success;
+
+        assert!(!state.needs_terminal_refresh);
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+        );
+        assert!(state.needs_terminal_refresh);
+        assert!(state.take_terminal_refresh_needed());
+        assert!(!state.needs_terminal_refresh);
 
         let _ = fs::remove_dir_all(tree_root);
     }

@@ -1111,6 +1111,7 @@ mod tests {
             log_filter: "info".to_string(),
             imap_mailbox: "io-uring".to_string(),
             lore_base_url: "https://lore.kernel.org".to_string(),
+            startup_sync: true,
             kernel_trees,
         }
     }

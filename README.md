@@ -2,20 +2,24 @@
 
 Courier 是一个基于 Rust 的终端内核 patch 邮件工作流工具，面向 Linux kernel 邮件列表协作场景。
 
-当前实现（M4）支持：
+当前实现（M5）支持：
 - CLI: `tui` / `sync` / `doctor` / `version`
 - SQLite 初始化与迁移
 - 从 `lore.kernel.org` 同步邮件并构建线程
 - 空库首次同步仅拉取最近 20 个 threads
 - 后续按 checkpoint 做增量更新
 - TUI 订阅启用状态与分组展开状态持久化
-- 启动 TUI 时自动同步已启用订阅
+- 启动 TUI 后后台自动同步已启用订阅（不阻塞首屏），并显示同步进度与完成摘要
+- 启动自动同步支持配置项 `ui.startup_sync`（默认开启）
 - patch series 识别（`[PATCH vN M/N]`）、完整性校验（缺片/重复/乱序）
 - TUI `a`（apply）/`d`（download）/`u`（undo 上次 apply）封装调用 b4 + git
 - patch 执行状态与日志回写（`new/reviewing/applied/failed/conflict`）
 - 代码浏览页（Kernel Tree + Source Preview）
 - Code Preview VM1 内联 Vim-like 编辑（`Browse/Normal/Insert/Command`）
 - VM1 最小命令集：`s`、`:w`、`:q`、`:q!`、`:wq`（含 dirty 规则）
+- Code Preview VM2 外部 Vim 编辑（`E`/`:vim`），支持 `VISUAL -> EDITOR -> vim` 选择顺序
+- 外部 Vim 退出后自动恢复终端状态并刷新预览内容
+- 关键用户操作日志统一为 `op/status` 结构（apply/undo/sync/config/vim/local command 等）
 - 命令栏支持本地命令（`!<shell command>`）与路径补全
 
 详细设计与里程碑见：
@@ -61,6 +65,9 @@ cargo run -- doctor
 
 最小配置示例见 [docs/config.example.toml](docs/config.example.toml)。
 
+可选项：
+- `[ui].startup_sync = true|false`（默认 `true`）
+
 ## 同步与 TUI
 
 ### 1. 手动同步（在线）
@@ -76,8 +83,8 @@ cargo run -- tui
 ```
 
 说明：
-- 打开 TUI 前会自动同步“已启用订阅”。
-- 命令栏（`:`）可用命令：`help`、`sync`、`sync <mailbox>`、`config`、`restart`、`quit`、`exit`、`!<shell command>`。
+- 打开 TUI 后会在后台自动同步“已启用订阅”，状态栏显示正在同步的 mailbox 与完成汇总。
+- 命令栏（`:`）可用命令：`help`、`sync`、`sync <mailbox>`、`config`、`vim`、`restart`、`quit`、`exit`、`!<shell command>`。
 - 命令栏支持 `Tab` 补全命令与参数；同一位置再按一次 `Tab` 会在下方列出可选参数；`!` 本地命令同样支持路径补全。
 - `help` 会显示命令与常用键位（`j/l`、`i/k`、`y/n`、`a/d/u`）。
 - 在线程列表选中 patch series 后：
@@ -87,8 +94,9 @@ cargo run -- tui
 - `Tab` 可以在 Mail 页和 Code Browser 页之间切换。
 - 在 Code Browser 页，焦点位于 Source 且选中文件时：
   - 按 `e` 进入 VM1 编辑态
+  - 按 `E` 进入 VM2 外部 Vim 编辑
   - `h/j/k/l` 移动，`i` 进入插入，`x` 删除当前字符，`s` 保存
-  - `:w` 保存，`:q` 退出（dirty 时拒绝），`:q!` 强制丢弃退出，`:wq` 保存并退出
+  - `:w` 保存，`:q` 退出（dirty 时拒绝），`:q!` 强制丢弃退出，`:wq` 保存并退出，`:vim` 打开外部 Vim
 
 ## 本地 fixture 测试（可选）
 
