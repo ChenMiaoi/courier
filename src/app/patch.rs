@@ -619,7 +619,27 @@ fn analyze_thread_series(
     })
 }
 
+pub(crate) fn subject_is_patch_related(subject: &str) -> bool {
+    parse_patch_subject_with_reply_mode(subject, true).is_some()
+}
+
 fn parse_patch_subject(subject: &str) -> Option<ParsedPatchSubject> {
+    parse_patch_subject_with_reply_mode(subject, false)
+}
+
+fn parse_patch_subject_with_reply_mode(
+    subject: &str,
+    allow_reply_or_forward_prefixes: bool,
+) -> Option<ParsedPatchSubject> {
+    let (trimmed, has_reply_or_forward_prefix) = strip_reply_or_forward_prefixes(subject);
+    if has_reply_or_forward_prefix && !allow_reply_or_forward_prefixes {
+        return None;
+    }
+
+    parse_patch_subject_core(trimmed)
+}
+
+fn strip_reply_or_forward_prefixes(subject: &str) -> (&str, bool) {
     let mut trimmed = subject.trim();
     let mut has_reply_or_forward_prefix = false;
     loop {
@@ -638,10 +658,11 @@ fn parse_patch_subject(subject: &str) -> Option<ParsedPatchSubject> {
         }
         break;
     }
-    if has_reply_or_forward_prefix {
-        return None;
-    }
 
+    (trimmed, has_reply_or_forward_prefix)
+}
+
+fn parse_patch_subject_core(trimmed: &str) -> Option<ParsedPatchSubject> {
     if !trimmed.starts_with('[') {
         return None;
     }
@@ -1085,7 +1106,7 @@ mod tests {
         APPLY_ARTIFACTS_DIR, PatchAction, SeriesIntegrity, action_args, action_subcommand,
         action_working_dir, build_series_index, download_series_name, parse_patch_subject,
         parse_seq_total_token, parse_version_token, relocate_new_apply_artifacts,
-        snapshot_apply_artifacts, undo_last_apply,
+        snapshot_apply_artifacts, subject_is_patch_related, undo_last_apply,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1109,7 +1130,8 @@ mod tests {
             log_dir: root.join("data/logs"),
             b4_path: None,
             log_filter: "info".to_string(),
-            imap_mailbox: "io-uring".to_string(),
+            source_mailbox: "io-uring".to_string(),
+            imap: crate::infra::config::ImapConfig::default(),
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
             kernel_trees,
@@ -1206,6 +1228,16 @@ mod tests {
     fn ignores_reply_or_forward_prefix_for_patch_series_detection() {
         assert!(parse_patch_subject("Re: [PATCH v5 2/9] io_uring: demo").is_none());
         assert!(parse_patch_subject("fwd: [PATCH 1/1] io_uring: demo").is_none());
+    }
+
+    #[test]
+    fn patch_related_helper_keeps_patch_replies() {
+        assert!(subject_is_patch_related("[PATCH v5 2/9] io_uring: demo"));
+        assert!(subject_is_patch_related(
+            "Re: [PATCH v5 2/9] io_uring: demo"
+        ));
+        assert!(subject_is_patch_related("fwd: [PATCH 1/1] io_uring: demo"));
+        assert!(!subject_is_patch_related("Weekly status update"));
     }
 
     #[test]

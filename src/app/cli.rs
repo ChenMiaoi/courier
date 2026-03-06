@@ -20,6 +20,7 @@ pub enum Command {
     /// Execute mailbox sync worker.
     Sync {
         /// Mailbox name to sync (defaults to [source].mailbox or linux-kernel).
+        /// Use INBOX to trigger real IMAP sync when [imap] config is complete.
         #[arg(long)]
         mailbox: Option<String>,
         /// Local fixture directory for offline/local test (.eml files).

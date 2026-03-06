@@ -15,6 +15,8 @@ pub struct UiState {
     #[serde(default = "default_true")]
     pub disabled_group_expanded: bool,
     #[serde(default)]
+    pub imap_defaults_initialized: bool,
+    #[serde(default)]
     pub active_mailbox: Option<String>,
 }
 
@@ -28,6 +30,7 @@ impl Default for UiState {
             enabled_mailboxes: Vec::new(),
             enabled_group_expanded: true,
             disabled_group_expanded: true,
+            imap_defaults_initialized: false,
             active_mailbox: None,
         }
     }
@@ -135,6 +138,7 @@ mod tests {
             enabled_mailboxes: vec!["bpf".to_string(), "linux-mm".to_string(), "bpf".to_string()],
             enabled_group_expanded: false,
             disabled_group_expanded: true,
+            imap_defaults_initialized: true,
             active_mailbox: Some("bpf".to_string()),
         };
 
@@ -147,7 +151,26 @@ mod tests {
         );
         assert!(!loaded.enabled_group_expanded);
         assert!(loaded.disabled_group_expanded);
+        assert!(loaded.imap_defaults_initialized);
         assert_eq!(loaded.active_mailbox.as_deref(), Some("bpf"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_imap_defaults_marker_defaults_to_false() {
+        let root = temp_dir("legacy-marker");
+        let path = path_for_data_dir(&root);
+
+        fs::write(
+            &path,
+            "enabled_mailboxes = [\"bpf\"]\nenabled_group_expanded = true\ndisabled_group_expanded = true\nactive_mailbox = \"bpf\"\n",
+        )
+        .expect("write legacy ui state");
+
+        let loaded = load(&path).expect("load state").expect("state exists");
+
+        assert!(!loaded.imap_defaults_initialized);
 
         let _ = fs::remove_dir_all(root);
     }

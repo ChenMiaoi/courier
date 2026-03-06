@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Stdout};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -18,6 +19,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Text;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use toml::Value as TomlValue;
@@ -25,7 +27,7 @@ use toml::value::Table as TomlTable;
 
 use crate::domain::subscriptions::VGER_SUBSCRIPTIONS;
 use crate::infra::bootstrap::BootstrapState;
-use crate::infra::config::RuntimeConfig;
+use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CourierError, ErrorCode, Result};
 use crate::infra::mail_store::{self, ThreadRow};
 use crate::infra::ui_state::{self, UiState};
@@ -119,7 +121,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
     },
     PaletteCommand {
         name: "config",
-        description: "Show or update runtime config",
+        description: "Open visual config editor or update runtime config",
     },
     PaletteCommand {
         name: "vim",
@@ -135,6 +137,7 @@ const THREAD_LINE_MAX_CHARS: usize = 120;
 const KERNEL_TREE_MAX_ROWS: usize = 2048;
 const CODE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
 const CODE_PREVIEW_MAX_LINES: usize = 800;
+const MY_INBOX_LABEL: &str = "My Inbox";
 const CONFIG_GET_KEYS: &[&str] = &[
     "config.path",
     "storage.data_dir",
@@ -146,6 +149,13 @@ const CONFIG_GET_KEYS: &[&str] = &[
     "b4.path",
     "source.mailbox",
     "imap.mailbox",
+    "imap.email",
+    "imap.user",
+    "imap.pass",
+    "imap.server",
+    "imap.serverport",
+    "imap.encryption",
+    "imap.proxy",
     "source.lore_base_url",
     "ui.startup_sync",
     "kernel.tree",
@@ -161,10 +171,95 @@ const CONFIG_SET_KEYS: &[&str] = &[
     "b4.path",
     "source.mailbox",
     "imap.mailbox",
+    "imap.email",
+    "imap.user",
+    "imap.pass",
+    "imap.server",
+    "imap.serverport",
+    "imap.encryption",
+    "imap.proxy",
     "source.lore_base_url",
     "ui.startup_sync",
     "kernel.tree",
     "kernel.trees",
+];
+const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
+    ConfigEditorField {
+        key: "source.mailbox",
+        description: "Default lore mailbox used when sync runs without an explicit mailbox.",
+    },
+    ConfigEditorField {
+        key: "source.lore_base_url",
+        description: "Base URL used for lore links and message lookups.",
+    },
+    ConfigEditorField {
+        key: "ui.startup_sync",
+        description: "Whether enabled subscriptions start syncing automatically after TUI launch.",
+    },
+    ConfigEditorField {
+        key: "logging.filter",
+        description: "Tracing/logging filter level for Courier runtime logs.",
+    },
+    ConfigEditorField {
+        key: "logging.dir",
+        description: "Directory where Courier writes runtime log files.",
+    },
+    ConfigEditorField {
+        key: "storage.data_dir",
+        description: "Runtime data root used for db, mail cache, patches and UI state defaults.",
+    },
+    ConfigEditorField {
+        key: "storage.database",
+        description: "SQLite database path used for synced mail and patch metadata.",
+    },
+    ConfigEditorField {
+        key: "storage.raw_mail_dir",
+        description: "Directory where raw downloaded .eml files are stored.",
+    },
+    ConfigEditorField {
+        key: "storage.patch_dir",
+        description: "Directory where downloaded patch files are written.",
+    },
+    ConfigEditorField {
+        key: "b4.path",
+        description: "Optional explicit path to the b4 executable or wrapper script.",
+    },
+    ConfigEditorField {
+        key: "imap.email",
+        description: "Self email address for matching your own mail; also used as login when imap.user is omitted.",
+    },
+    ConfigEditorField {
+        key: "imap.user",
+        description: "IMAP login account. Gmail usually expects the full email address.",
+    },
+    ConfigEditorField {
+        key: "imap.pass",
+        description: "IMAP login password or app password.",
+    },
+    ConfigEditorField {
+        key: "imap.server",
+        description: "IMAP server host name.",
+    },
+    ConfigEditorField {
+        key: "imap.serverport",
+        description: "IMAP server port number.",
+    },
+    ConfigEditorField {
+        key: "imap.encryption",
+        description: "Connection security mode. Gmail 993 uses ssl/tls here.",
+    },
+    ConfigEditorField {
+        key: "imap.proxy",
+        description: "Optional proxy URL for IMAP. Supports http://, socks5:// and socks5h://.",
+    },
+    ConfigEditorField {
+        key: "kernel.tree",
+        description: "Single kernel tree root shown in the code browser pane.",
+    },
+    ConfigEditorField {
+        key: "kernel.trees",
+        description: "Multiple kernel tree roots, written as a TOML array of paths.",
+    },
 ];
 const CODE_EDIT_ENTRY_HINT: &str = "select a source file in Source pane, then press e";
 const EXTERNAL_EDITOR_ENTRY_HINT: &str = "select a source file in Source pane, then press E";
@@ -198,13 +293,103 @@ enum StartupSyncEvent {
     WorkerCompleted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupSyncMailboxStatus {
+    Pending,
+    InFlight,
+    Finished,
+    Failed,
+}
+
+impl StartupSyncMailboxStatus {
+    fn ui_suffix(self) -> &'static str {
+        match self {
+            Self::Pending => " [queued]",
+            Self::InFlight => " [sync]",
+            Self::Finished => " [done]",
+            Self::Failed => " [failed]",
+        }
+    }
+
+    fn log_label(self) -> &'static str {
+        match self {
+            Self::Pending => "queued",
+            Self::InFlight => "syncing",
+            Self::Finished => "done",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct StartupSyncState {
     receiver: Receiver<StartupSyncEvent>,
+    mailbox_order: Vec<String>,
+    mailboxes: HashMap<String, StartupSyncMailboxStatus>,
     total: usize,
     completed: usize,
     succeeded: usize,
     failed: usize,
+}
+
+impl StartupSyncState {
+    fn pending_count(&self) -> usize {
+        self.mailbox_order
+            .iter()
+            .filter(|mailbox| {
+                matches!(
+                    self.mailboxes.get(mailbox.as_str()),
+                    Some(StartupSyncMailboxStatus::Pending)
+                )
+            })
+            .count()
+    }
+
+    fn inflight_mailboxes_display(&self) -> String {
+        let running: Vec<&str> = self
+            .mailbox_order
+            .iter()
+            .filter_map(|mailbox| {
+                matches!(
+                    self.mailboxes.get(mailbox.as_str()),
+                    Some(StartupSyncMailboxStatus::InFlight)
+                )
+                .then_some(mailbox.as_str())
+            })
+            .collect();
+        if running.is_empty() {
+            "-".to_string()
+        } else {
+            running.join(",")
+        }
+    }
+
+    fn mailbox_states_display(&self) -> String {
+        self.mailbox_order
+            .iter()
+            .map(|mailbox| {
+                let status = self
+                    .mailboxes
+                    .get(mailbox.as_str())
+                    .copied()
+                    .unwrap_or(StartupSyncMailboxStatus::Pending);
+                format!("{mailbox}:{}", status.log_label())
+            })
+            .collect::<Vec<String>>()
+            .join(" ")
+    }
+
+    fn progress_summary(&self) -> String {
+        format!(
+            "{}/{} ok={} fail={} queued={} running={}",
+            self.completed,
+            self.total,
+            self.succeeded,
+            self.failed,
+            self.pending_count(),
+            self.inflight_mailboxes_display()
+        )
+    }
 }
 
 #[derive(Debug, Default)]
@@ -236,9 +421,31 @@ struct SearchState {
     applied_query: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ConfigEditorMode {
+    #[default]
+    Browse,
+    Edit,
+}
+
+#[derive(Debug, Default)]
+struct ConfigEditorState {
+    open: bool,
+    selected_field: usize,
+    mode: ConfigEditorMode,
+    input: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConfigEditorField {
+    key: &'static str,
+    description: &'static str,
+}
+
 #[derive(Debug, Clone)]
 struct SubscriptionItem {
     mailbox: String,
+    label: String,
     enabled: bool,
 }
 
@@ -374,6 +581,7 @@ struct AppState {
     runtime: RuntimeConfig,
     ui_state_path: PathBuf,
     active_thread_mailbox: String,
+    imap_defaults_initialized: bool,
     ui_page: UiPage,
     focus: Pane,
     code_focus: CodePaneFocus,
@@ -403,6 +611,7 @@ struct AppState {
     last_apply_snapshot: Option<LastApplySnapshot>,
     palette: CommandPaletteState,
     search: SearchState,
+    config_editor: ConfigEditorState,
     external_editor_runner: ExternalEditorRunner,
     needs_terminal_refresh: bool,
     startup_sync: Option<StartupSyncState>,
@@ -419,6 +628,10 @@ impl AppState {
         persisted: Option<UiState>,
     ) -> Self {
         let ui_state_path = ui_state::path_for_data_dir(&runtime.data_dir);
+        let persisted_imap_defaults_initialized = persisted
+            .as_ref()
+            .map(|state| state.imap_defaults_initialized)
+            .unwrap_or(false);
         let enabled_mailboxes = persisted
             .as_ref()
             .map(UiState::normalized_enabled_mailboxes)
@@ -430,11 +643,12 @@ impl AppState {
             .map(|mailbox| mailbox.trim())
             .filter(|mailbox| !mailbox.is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| runtime.imap_mailbox.clone());
+            .unwrap_or_else(|| runtime.default_active_mailbox().to_string());
         let subscriptions = default_subscriptions(
-            &runtime.imap_mailbox,
+            &runtime,
             &enabled_mailboxes,
             Some(active_thread_mailbox.as_str()),
+            runtime.imap.is_complete() && !persisted_imap_defaults_initialized,
         );
         let kernel_tree_expanded_paths = default_kernel_tree_expanded_paths(&runtime.kernel_trees);
         let kernel_tree_rows =
@@ -443,6 +657,7 @@ impl AppState {
             active_thread_mailbox,
             runtime,
             ui_state_path,
+            imap_defaults_initialized: persisted_imap_defaults_initialized,
             ui_page: UiPage::Mail,
             focus: Pane::Subscriptions,
             code_focus: CodePaneFocus::Tree,
@@ -478,10 +693,14 @@ impl AppState {
             last_apply_snapshot: None,
             palette: CommandPaletteState::default(),
             search: SearchState::default(),
+            config_editor: ConfigEditorState::default(),
             external_editor_runner: run_external_editor_session,
             needs_terminal_refresh: false,
             startup_sync: None,
         };
+        if state.runtime.imap.is_complete() {
+            state.imap_defaults_initialized = true;
+        }
         if let Some(index) = state
             .subscriptions
             .iter()
@@ -536,6 +755,93 @@ impl AppState {
         self.apply_thread_filter();
     }
 
+    fn show_mailbox_threads(
+        &mut self,
+        mailbox: &str,
+        threads: Vec<ThreadRow>,
+        status: String,
+        persist_ui_state: bool,
+    ) {
+        self.active_thread_mailbox = mailbox.to_string();
+        if let Some(index) = self
+            .subscriptions
+            .iter()
+            .position(|item| item.mailbox == mailbox)
+        {
+            self.subscription_index = index;
+            self.sync_subscription_row_to_selected_item();
+        }
+        self.replace_threads(threads);
+        self.status = status;
+        if persist_ui_state {
+            self.persist_ui_state();
+        }
+    }
+
+    fn recover_from_empty_active_mailbox(&mut self, reason: &str) -> bool {
+        if !self.threads.is_empty() {
+            return false;
+        }
+
+        let current_mailbox = self.active_thread_mailbox.clone();
+        let mut candidates = self.enabled_mailboxes();
+        if !candidates
+            .iter()
+            .any(|mailbox| mailbox == &self.runtime.source_mailbox)
+        {
+            candidates.push(self.runtime.source_mailbox.clone());
+        }
+        candidates.retain(|mailbox| mailbox != &current_mailbox);
+        candidates.dedup();
+
+        for mailbox in candidates {
+            match mail_store::load_thread_rows_by_mailbox(
+                &self.runtime.database_path,
+                &mailbox,
+                500,
+            ) {
+                Ok(rows) if !rows.is_empty() => {
+                    self.show_mailbox_threads(
+                        &mailbox,
+                        rows,
+                        format!("{reason}; showing threads for {mailbox}"),
+                        true,
+                    );
+                    return true;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        mailbox = %mailbox,
+                        error = %error,
+                        "failed to load fallback mailbox thread rows"
+                    );
+                }
+            }
+        }
+
+        false
+    }
+
+    fn startup_sync_mailbox_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
+        self.startup_sync
+            .as_ref()
+            .and_then(|state| state.mailboxes.get(mailbox).copied())
+    }
+
+    fn startup_sync_mailbox_pending(&self, mailbox: &str) -> bool {
+        matches!(
+            self.startup_sync_mailbox_status(mailbox),
+            Some(StartupSyncMailboxStatus::Pending | StartupSyncMailboxStatus::InFlight)
+        )
+    }
+
+    fn startup_sync_progress_text(&self) -> Option<String> {
+        self.startup_sync
+            .as_ref()
+            .map(|state| format!("sync: {}", state.progress_summary()))
+    }
+
     fn refresh_series_summaries(&mut self) {
         self.series_summaries =
             patch_worker::build_series_index(&self.active_thread_mailbox, &self.threads);
@@ -583,6 +889,12 @@ impl AppState {
         let receiver = spawn_startup_sync_worker(self.runtime.clone(), mailboxes.clone());
         self.startup_sync = Some(StartupSyncState {
             receiver,
+            mailbox_order: mailboxes.clone(),
+            mailboxes: mailboxes
+                .iter()
+                .cloned()
+                .map(|mailbox| (mailbox, StartupSyncMailboxStatus::Pending))
+                .collect(),
             total: mailboxes.len(),
             completed: 0,
             succeeded: 0,
@@ -593,11 +905,20 @@ impl AppState {
             mailboxes.len(),
             mailboxes.join(", ")
         );
-        tracing::info!(
-            op = "startup_sync",
-            status = "started",
-            mailboxes = %mailboxes.join(",")
-        );
+        if let Some(sync_state) = self.startup_sync.as_ref() {
+            tracing::info!(
+                op = "startup_sync",
+                status = "started",
+                total = sync_state.total,
+                completed = sync_state.completed,
+                succeeded = sync_state.succeeded,
+                failed = sync_state.failed,
+                queued = sync_state.pending_count(),
+                running = %sync_state.inflight_mailboxes_display(),
+                mailbox_states = %sync_state.mailbox_states_display(),
+                mailboxes = %mailboxes.join(",")
+            );
+        }
     }
 
     fn pump_startup_sync_events(&mut self) {
@@ -652,7 +973,28 @@ impl AppState {
                 index,
                 total,
             } => {
+                if let Some(sync_state) = self.startup_sync.as_mut() {
+                    sync_state
+                        .mailboxes
+                        .insert(mailbox.clone(), StartupSyncMailboxStatus::InFlight);
+                }
                 self.status = format!("startup sync [{index}/{total}] syncing {mailbox}...");
+                if let Some(sync_state) = self.startup_sync.as_ref() {
+                    tracing::info!(
+                        op = "startup_sync",
+                        status = "progress",
+                        phase = "started",
+                        mailbox = %mailbox,
+                        index,
+                        total,
+                        completed = sync_state.completed,
+                        succeeded = sync_state.succeeded,
+                        failed = sync_state.failed,
+                        queued = sync_state.pending_count(),
+                        running = %sync_state.inflight_mailboxes_display(),
+                        mailbox_states = %sync_state.mailbox_states_display()
+                    );
+                }
             }
             StartupSyncEvent::MailboxFinished {
                 mailbox,
@@ -661,6 +1003,9 @@ impl AppState {
                 updated,
             } => {
                 if let Some(sync_state) = self.startup_sync.as_mut() {
+                    sync_state
+                        .mailboxes
+                        .insert(mailbox.clone(), StartupSyncMailboxStatus::Finished);
                     sync_state.completed += 1;
                     sync_state.succeeded += 1;
                 }
@@ -668,28 +1013,63 @@ impl AppState {
                 if mailbox == self.active_thread_mailbox {
                     self.reload_active_mailbox_threads_after_sync();
                 }
+                if self.threads.is_empty()
+                    && !self.startup_sync_mailbox_pending(&self.active_thread_mailbox)
+                {
+                    let _ = self.recover_from_empty_active_mailbox(&format!(
+                        "startup sync ready for {mailbox}"
+                    ));
+                }
 
-                tracing::info!(
-                    op = "startup_sync",
-                    status = "succeeded",
-                    mailbox = %mailbox,
-                    fetched,
-                    inserted,
-                    updated
-                );
+                if let Some(sync_state) = self.startup_sync.as_ref() {
+                    tracing::info!(
+                        op = "startup_sync",
+                        status = "succeeded",
+                        phase = "finished",
+                        mailbox = %mailbox,
+                        fetched,
+                        inserted,
+                        updated,
+                        completed = sync_state.completed,
+                        total = sync_state.total,
+                        succeeded = sync_state.succeeded,
+                        failed = sync_state.failed,
+                        queued = sync_state.pending_count(),
+                        running = %sync_state.inflight_mailboxes_display(),
+                        mailbox_states = %sync_state.mailbox_states_display()
+                    );
+                }
             }
             StartupSyncEvent::MailboxFailed { mailbox, error } => {
                 if let Some(sync_state) = self.startup_sync.as_mut() {
+                    sync_state
+                        .mailboxes
+                        .insert(mailbox.clone(), StartupSyncMailboxStatus::Failed);
                     sync_state.completed += 1;
                     sync_state.failed += 1;
                 }
                 self.status = format!("startup sync failed for {mailbox}: {error}");
-                tracing::error!(
-                    op = "startup_sync",
-                    status = "failed",
-                    mailbox = %mailbox,
-                    error = %error
-                );
+                if mailbox == self.active_thread_mailbox && self.threads.is_empty() {
+                    let _ = self.recover_from_empty_active_mailbox(&format!(
+                        "startup sync failed for {mailbox}: {error}"
+                    ));
+                }
+                if let Some(sync_state) = self.startup_sync.as_ref() {
+                    tracing::error!(
+                        op = "startup_sync",
+                        status = "failed",
+                        phase = "finished",
+                        mailbox = %mailbox,
+                        error = %error,
+                        completed = sync_state.completed,
+                        total = sync_state.total,
+                        succeeded = sync_state.succeeded,
+                        failed = sync_state.failed,
+                        queued = sync_state.pending_count(),
+                        running = %sync_state.inflight_mailboxes_display(),
+                        mailbox_states = %sync_state.mailbox_states_display()
+                    );
+                }
             }
             StartupSyncEvent::WorkerCompleted => {}
         }
@@ -708,6 +1088,7 @@ impl AppState {
         let succeeded = sync_state.succeeded;
         let failed = sync_state.failed;
         let total = sync_state.total;
+        let mailbox_states = sync_state.mailbox_states_display();
         self.startup_sync = None;
         self.status =
             format!("startup sync finished: ok={succeeded} failed={failed} total={total}");
@@ -716,7 +1097,8 @@ impl AppState {
             status = if failed == 0 { "succeeded" } else { "partial" },
             succeeded,
             failed,
-            total
+            total,
+            mailbox_states = %mailbox_states
         );
     }
 
@@ -747,6 +1129,7 @@ impl AppState {
             enabled_mailboxes: self.enabled_mailboxes(),
             enabled_group_expanded: self.enabled_group_expanded,
             disabled_group_expanded: self.disabled_group_expanded,
+            imap_defaults_initialized: self.imap_defaults_initialized,
             active_mailbox: Some(self.active_thread_mailbox.clone()),
         }
     }
@@ -789,7 +1172,10 @@ impl AppState {
             {
                 rows.push(SubscriptionRow {
                     kind: SubscriptionRowKind::Item(index),
-                    text: format!("  {}", subscription_line(item)),
+                    text: format!(
+                        "  {}",
+                        subscription_line(item, self.startup_sync_mailbox_status(&item.mailbox))
+                    ),
                 });
             }
         }
@@ -813,7 +1199,10 @@ impl AppState {
             {
                 rows.push(SubscriptionRow {
                     kind: SubscriptionRowKind::Item(index),
-                    text: format!("  {}", subscription_line(item)),
+                    text: format!(
+                        "  {}",
+                        subscription_line(item, self.startup_sync_mailbox_status(&item.mailbox))
+                    ),
                 });
             }
         }
@@ -880,13 +1269,14 @@ impl AppState {
         };
 
         let mailbox = self.subscriptions[selected_index].mailbox.clone();
+        let label = self.subscriptions[selected_index].label.clone();
         if let Some(item) = self.subscriptions.get_mut(selected_index) {
             item.enabled = enabled;
         }
 
         self.sort_subscriptions_keep_selected(&mailbox);
         let marker = if enabled { "enabled" } else { "disabled" };
-        self.status = format!("{marker} subscription {mailbox}");
+        self.status = format!("{marker} subscription {label}");
         self.persist_ui_state();
     }
 
@@ -895,6 +1285,7 @@ impl AppState {
             right
                 .enabled
                 .cmp(&left.enabled)
+                .then_with(|| left.label.cmp(&right.label))
                 .then_with(|| left.mailbox.cmp(&right.mailbox))
         });
 
@@ -964,12 +1355,29 @@ impl AppState {
 
         match mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, &mailbox, 500) {
             Ok(rows) if !rows.is_empty() => {
-                self.active_thread_mailbox = mailbox.clone();
-                self.replace_threads(rows);
-                self.status = format!("showing threads for {}", mailbox);
-                self.persist_ui_state();
+                self.show_mailbox_threads(
+                    &mailbox,
+                    rows,
+                    format!("showing threads for {}", mailbox),
+                    true,
+                );
             }
             Ok(_) => {
+                if self.startup_sync_mailbox_pending(&mailbox) {
+                    self.show_mailbox_threads(
+                        &mailbox,
+                        Vec::new(),
+                        format!("{mailbox} is syncing in background; page stays responsive"),
+                        true,
+                    );
+                    return;
+                }
+
+                tracing::info!(
+                    op = "subscription_sync",
+                    status = "started",
+                    mailbox = %mailbox
+                );
                 let request = sync_worker::SyncRequest {
                     mailbox: mailbox.clone(),
                     fixture_dir: None,
@@ -977,20 +1385,30 @@ impl AppState {
                     reconnect_attempts: PALETTE_SYNC_RECONNECT_ATTEMPTS,
                 };
 
-                match sync_worker::run(&self.runtime, request) {
+                match run_sync_request_guarded(&self.runtime, request) {
                     Ok(summary) => match mail_store::load_thread_rows_by_mailbox(
                         &self.runtime.database_path,
                         &mailbox,
                         500,
                     ) {
                         Ok(fresh_rows) => {
-                            self.active_thread_mailbox = mailbox.clone();
-                            self.replace_threads(fresh_rows);
-                            self.status = format!(
-                                "synced {}: fetched={} inserted={} updated={}",
-                                mailbox, summary.fetched, summary.inserted, summary.updated
+                            tracing::info!(
+                                op = "subscription_sync",
+                                status = "succeeded",
+                                mailbox = %mailbox,
+                                fetched = summary.fetched,
+                                inserted = summary.inserted,
+                                updated = summary.updated
                             );
-                            self.persist_ui_state();
+                            self.show_mailbox_threads(
+                                &mailbox,
+                                fresh_rows,
+                                format!(
+                                    "synced {}: fetched={} inserted={} updated={}",
+                                    mailbox, summary.fetched, summary.inserted, summary.updated
+                                ),
+                                true,
+                            );
                         }
                         Err(error) => {
                             tracing::error!(
@@ -1005,7 +1423,13 @@ impl AppState {
                         }
                     },
                     Err(error) => {
-                        tracing::error!(mailbox = %mailbox, error = %error, "subscription sync failed");
+                        tracing::error!(
+                            op = "subscription_sync",
+                            status = "failed",
+                            mailbox = %mailbox,
+                            error = %error,
+                            "subscription sync failed"
+                        );
                         self.status = format!("failed to sync {}: {error}", mailbox);
                     }
                 }
@@ -1402,6 +1826,238 @@ impl AppState {
         self.palette.clear_completion();
         self.palette.clear_local_result();
         self.status = "command palette closed".to_string();
+    }
+
+    fn open_config_editor(&mut self, key_hint: Option<&str>) {
+        self.palette.open = false;
+        self.palette.input.clear();
+        self.palette.clear_completion();
+        self.palette.clear_local_result();
+        self.config_editor.open = true;
+        self.config_editor.mode = ConfigEditorMode::Browse;
+        self.config_editor.input.clear();
+        if let Some(key) = key_hint {
+            if let Some(index) = config_editor_field_index(key) {
+                self.config_editor.selected_field = index;
+            } else {
+                self.status = format!(
+                    "config editor does not support {key}; opened {}",
+                    self.selected_config_editor_field().key
+                );
+                return;
+            }
+        }
+        self.status = format!(
+            "config editor opened: {}",
+            self.selected_config_editor_field().key
+        );
+    }
+
+    fn close_config_editor(&mut self) {
+        self.config_editor.open = false;
+        self.config_editor.mode = ConfigEditorMode::Browse;
+        self.config_editor.input.clear();
+        self.status = "config editor closed".to_string();
+    }
+
+    fn selected_config_editor_field(&self) -> &'static ConfigEditorField {
+        let index = self
+            .config_editor
+            .selected_field
+            .min(CONFIG_EDITOR_FIELDS.len().saturating_sub(1));
+        &CONFIG_EDITOR_FIELDS[index]
+    }
+
+    fn move_config_editor_up(&mut self) {
+        if self.config_editor.selected_field > 0 {
+            self.config_editor.selected_field -= 1;
+        }
+    }
+
+    fn move_config_editor_down(&mut self) {
+        if self.config_editor.selected_field + 1 < CONFIG_EDITOR_FIELDS.len() {
+            self.config_editor.selected_field += 1;
+        }
+    }
+
+    fn config_editor_seed_input(&self, key: &str) -> String {
+        match read_config_key_from_file(&self.runtime.config_path, key) {
+            Ok(Some(value)) => render_toml_value(&value),
+            Ok(None) => config_value_suggestions(self, Some(&key.to_string()))
+                .into_iter()
+                .next()
+                .map(|suggestion| suggestion.value)
+                .unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
+
+    fn start_config_editor_edit(&mut self) {
+        let key = self.selected_config_editor_field().key;
+        self.config_editor.mode = ConfigEditorMode::Edit;
+        self.config_editor.input = self.config_editor_seed_input(key);
+        self.status = format!("editing config {key}");
+    }
+
+    fn cycle_config_editor_value(&mut self) {
+        let key = self.selected_config_editor_field().key;
+        let suggestions = config_value_suggestions(self, Some(&key.to_string()));
+        if suggestions.is_empty() {
+            self.status = format!("no preset values for {key}");
+            return;
+        }
+
+        let current = if matches!(self.config_editor.mode, ConfigEditorMode::Edit) {
+            self.config_editor.input.trim().to_string()
+        } else {
+            self.config_editor_seed_input(key)
+        };
+
+        let next_index = suggestions
+            .iter()
+            .position(|suggestion| suggestion.value == current)
+            .map(|index| (index + 1) % suggestions.len())
+            .unwrap_or(0);
+        let next_value = suggestions[next_index].value.clone();
+
+        if matches!(self.config_editor.mode, ConfigEditorMode::Edit) {
+            self.config_editor.input = next_value;
+            self.status = format!("preset value selected for {key}");
+            return;
+        }
+
+        tracing::info!(
+            op = "config.set",
+            status = "started",
+            key = %key,
+            value_literal = %next_value,
+            source = "config_editor_cycle"
+        );
+        match update_config_key_in_file(&self.runtime.config_path, key, &next_value) {
+            Ok(rendered_value) => match reload_runtime_from_config(self) {
+                Ok(()) => {
+                    self.status = format!("config updated: {key} = {rendered_value}");
+                    tracing::info!(
+                        op = "config.set",
+                        status = "succeeded",
+                        key = %key,
+                        value = %rendered_value,
+                        config = %self.runtime.config_path.display(),
+                        source = "config_editor_cycle"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        op = "config.set",
+                        status = "failed",
+                        key = %key,
+                        error = %error,
+                        source = "config_editor_cycle"
+                    );
+                    self.status = format!("config file updated but runtime reload failed: {error}");
+                }
+            },
+            Err(error) => {
+                tracing::error!(
+                    op = "config.set",
+                    status = "failed",
+                    key = %key,
+                    error = %error,
+                    source = "config_editor_cycle"
+                );
+                self.status = format!("failed to set config key {key}: {error}");
+            }
+        }
+    }
+
+    fn save_config_editor_value(&mut self) {
+        let key = self.selected_config_editor_field().key;
+        let value_literal = self.config_editor.input.trim().to_string();
+        if value_literal.is_empty() {
+            self.status = format!("empty value for {key}; press x to unset instead");
+            return;
+        }
+
+        tracing::info!(
+            op = "config.set",
+            status = "started",
+            key = %key,
+            value_literal = %value_literal,
+            source = "config_editor"
+        );
+        match update_config_key_in_file(&self.runtime.config_path, key, &value_literal) {
+            Ok(rendered_value) => match reload_runtime_from_config(self) {
+                Ok(()) => {
+                    self.config_editor.mode = ConfigEditorMode::Browse;
+                    self.config_editor.input.clear();
+                    self.status = format!("config updated: {key} = {rendered_value}");
+                    tracing::info!(
+                        op = "config.set",
+                        status = "succeeded",
+                        key = %key,
+                        value = %rendered_value,
+                        config = %self.runtime.config_path.display(),
+                        source = "config_editor"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        op = "config.set",
+                        status = "failed",
+                        key = %key,
+                        error = %error,
+                        source = "config_editor"
+                    );
+                    self.status = format!("config file updated but runtime reload failed: {error}");
+                }
+            },
+            Err(error) => {
+                tracing::error!(
+                    op = "config.set",
+                    status = "failed",
+                    key = %key,
+                    error = %error,
+                    source = "config_editor"
+                );
+                self.status = format!("failed to set config key {key}: {error}");
+            }
+        }
+    }
+
+    fn unset_selected_config_key(&mut self) {
+        let key = self.selected_config_editor_field().key;
+        tracing::info!(op = "config.unset", status = "started", key = %key);
+        match remove_config_key_from_file(&self.runtime.config_path, key) {
+            Ok(true) => match reload_runtime_from_config(self) {
+                Ok(()) => {
+                    self.config_editor.mode = ConfigEditorMode::Browse;
+                    self.config_editor.input.clear();
+                    self.status = format!("config key unset: {key}");
+                    tracing::info!(
+                        op = "config.unset",
+                        status = "succeeded",
+                        key = %key,
+                        config = %self.runtime.config_path.display()
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        op = "config.unset",
+                        status = "failed",
+                        key = %key,
+                        error = %error
+                    );
+                    self.status = format!("config file updated but runtime reload failed: {error}");
+                }
+            },
+            Ok(false) => {
+                self.status = format!("config key already unset: {key}");
+            }
+            Err(error) => {
+                tracing::error!(op = "config.unset", status = "failed", key = %key, error = %error);
+                self.status = format!("failed to unset config key {key}: {error}");
+            }
+        }
     }
 
     fn is_code_edit_active(&self) -> bool {
@@ -1908,7 +2564,7 @@ fn spawn_startup_sync_worker(
                 uidvalidity: None,
                 reconnect_attempts: PALETTE_SYNC_RECONNECT_ATTEMPTS,
             };
-            match sync_worker::run(&runtime, request) {
+            match run_sync_request_guarded(&runtime, request) {
                 Ok(summary) => {
                     if sender
                         .send(StartupSyncEvent::MailboxFinished {
@@ -1940,6 +2596,37 @@ fn spawn_startup_sync_worker(
     });
 
     receiver
+}
+
+fn run_sync_request_guarded(
+    runtime: &RuntimeConfig,
+    request: sync_worker::SyncRequest,
+) -> Result<sync_worker::SyncSummary> {
+    let mailbox = request.mailbox.clone();
+    catch_sync_panic(&mailbox, || sync_worker::run(runtime, request))
+}
+
+fn catch_sync_panic<T, F>(mailbox: &str, operation: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    match panic::catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else if let Some(message) = payload.downcast_ref::<&str>() {
+                (*message).to_string()
+            } else {
+                "unknown panic payload".to_string()
+            };
+
+            Err(CourierError::new(
+                ErrorCode::Tui,
+                format!("sync panicked for {mailbox}: {message}"),
+            ))
+        }
+    }
 }
 
 fn load_code_edit_buffer_from_path(path: &Path) -> std::result::Result<Vec<String>, String> {
@@ -2086,13 +2773,18 @@ enum LoopAction {
 pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiAction> {
     let ui_state_path = ui_state::path_for_data_dir(&config.data_dir);
     let persisted_ui_state = load_persisted_ui_state(&ui_state_path);
+    let should_persist_imap_defaults = config.imap.is_complete()
+        && !persisted_ui_state
+            .as_ref()
+            .map(|state| state.imap_defaults_initialized)
+            .unwrap_or(false);
     let initial_mailbox = persisted_ui_state
         .as_ref()
         .and_then(|state| state.active_mailbox.as_ref())
         .map(|mailbox| mailbox.trim())
         .filter(|mailbox| !mailbox.is_empty())
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| config.imap_mailbox.clone());
+        .unwrap_or_else(|| config.default_active_mailbox().to_string());
     let threads =
         mail_store::load_thread_rows_by_mailbox(&config.database_path, &initial_mailbox, 500)?;
     let mut terminal = setup_terminal()?;
@@ -2102,7 +2794,12 @@ pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiActi
     } else {
         AppState::new(threads, config.clone())
     };
-    if state.filtered_thread_indices.is_empty() {
+    if should_persist_imap_defaults {
+        state.persist_ui_state();
+    }
+    if state.filtered_thread_indices.is_empty()
+        && !state.recover_from_empty_active_mailbox("active mailbox has no local data")
+    {
         state.status = "no synced thread data, run `courier sync` first".to_string();
     }
     state.start_startup_sync_if_enabled();
@@ -2202,10 +2899,15 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         focus = ?state.focus,
         code_focus = ?state.code_focus,
         code_edit_mode = ?state.code_edit_mode,
+        config_editor_open = state.config_editor.open,
         palette_open = state.palette.open,
         search_active = state.search.active,
         "user key event"
     );
+
+    if state.config_editor.open {
+        return handle_config_editor_key_event(state, key);
+    }
 
     if state.palette.open {
         if is_palette_toggle(key) {
@@ -2308,6 +3010,42 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
             state.status = "Ctrl+C is disabled, use command palette quit/exit".to_string();
         }
         _ => {}
+    }
+
+    LoopAction::Continue
+}
+
+fn handle_config_editor_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
+    match state.config_editor.mode {
+        ConfigEditorMode::Browse => match key.code {
+            KeyCode::Esc => state.close_config_editor(),
+            KeyCode::Up | KeyCode::Char('i') => state.move_config_editor_up(),
+            KeyCode::Down | KeyCode::Char('k') => state.move_config_editor_down(),
+            KeyCode::Enter | KeyCode::Char('e') => state.start_config_editor_edit(),
+            KeyCode::Tab => state.cycle_config_editor_value(),
+            KeyCode::Char('x') => state.unset_selected_config_key(),
+            _ => {}
+        },
+        ConfigEditorMode::Edit => match key.code {
+            KeyCode::Esc => {
+                state.config_editor.mode = ConfigEditorMode::Browse;
+                state.config_editor.input.clear();
+                state.status = "config edit cancelled".to_string();
+            }
+            KeyCode::Enter => state.save_config_editor_value(),
+            KeyCode::Tab => state.cycle_config_editor_value(),
+            KeyCode::Backspace => {
+                state.config_editor.input.pop();
+            }
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                state.config_editor.input.push(character);
+            }
+            _ => {}
+        },
     }
 
     LoopAction::Continue
@@ -2667,7 +3405,7 @@ fn run_palette_sync(state: &mut AppState, command: &str) {
     } else {
         let enabled = state.enabled_mailboxes();
         if enabled.is_empty() {
-            vec![state.runtime.imap_mailbox.clone()]
+            vec![state.runtime.default_active_mailbox().to_string()]
         } else {
             enabled
         }
@@ -2685,8 +3423,20 @@ fn run_palette_sync(state: &mut AppState, command: &str) {
     let mut total_inserted = 0usize;
     let mut total_updated = 0usize;
     let mut first_error: Option<String> = None;
+    let total = mailboxes.len();
 
-    for mailbox in mailboxes {
+    for (index, mailbox) in mailboxes.into_iter().enumerate() {
+        tracing::info!(
+            op = "sync",
+            status = "progress",
+            phase = "started",
+            mailbox = %mailbox,
+            index = index + 1,
+            total,
+            completed = success + failed,
+            succeeded = success,
+            failed
+        );
         let request = sync_worker::SyncRequest {
             mailbox: mailbox.clone(),
             fixture_dir: None,
@@ -2694,18 +3444,44 @@ fn run_palette_sync(state: &mut AppState, command: &str) {
             reconnect_attempts: PALETTE_SYNC_RECONNECT_ATTEMPTS,
         };
 
-        match sync_worker::run(&state.runtime, request) {
+        match run_sync_request_guarded(&state.runtime, request) {
             Ok(summary) => {
                 success += 1;
                 total_fetched += summary.fetched;
                 total_inserted += summary.inserted;
                 total_updated += summary.updated;
+                tracing::info!(
+                    op = "sync",
+                    status = "succeeded",
+                    phase = "finished",
+                    mailbox = %mailbox,
+                    index = index + 1,
+                    total,
+                    completed = success + failed,
+                    succeeded = success,
+                    failed,
+                    fetched = summary.fetched,
+                    inserted = summary.inserted,
+                    updated = summary.updated
+                );
             }
             Err(error) => {
                 failed += 1;
                 if first_error.is_none() {
                     first_error = Some(format!("{mailbox}: {error}"));
                 }
+                tracing::error!(
+                    op = "sync",
+                    status = "failed",
+                    phase = "finished",
+                    mailbox = %mailbox,
+                    index = index + 1,
+                    total,
+                    completed = success + failed,
+                    succeeded = success,
+                    failed,
+                    error = %error
+                );
             }
         }
     }
@@ -2780,11 +3556,11 @@ fn run_palette_config(state: &mut AppState, command: &str) {
             if let Some(key) = segments.next() {
                 show_config_key(state, key);
             } else {
-                state.status = format!(
-                    "config file: {} | use: config get <key>, config set <key> <value>",
-                    state.runtime.config_path.display()
-                );
+                state.open_config_editor(None);
             }
+        }
+        "edit" => {
+            state.open_config_editor(segments.next());
         }
         "get" => {
             let Some(key) = segments.next() else {
@@ -2845,10 +3621,12 @@ fn run_palette_config(state: &mut AppState, command: &str) {
             }
         }
         "help" => {
-            state.status = "config usage: show [key] | get <key> | set <key> <value>".to_string();
+            state.status =
+                "config usage: show [key] | edit [key] | get <key> | set <key> <value>".to_string();
         }
         _ => {
-            state.status = "config usage: show [key] | get <key> | set <key> <value>".to_string();
+            state.status =
+                "config usage: show [key] | edit [key] | get <key> | set <key> <value>".to_string();
         }
     }
 }
@@ -2900,6 +3678,15 @@ fn update_config_key_in_file(
         .map(render_toml_value)
         .unwrap_or_else(|| "<unknown>".to_string());
     Ok(rendered)
+}
+
+fn remove_config_key_from_file(config_path: &Path, key: &str) -> std::result::Result<bool, String> {
+    let mut table = read_config_table(config_path)?;
+    let removed = remove_config_key(&mut table, key)?;
+    if removed {
+        write_config_table(config_path, &table)?;
+    }
+    Ok(removed)
 }
 
 fn read_config_table(config_path: &Path) -> std::result::Result<TomlTable, String> {
@@ -2980,6 +3767,39 @@ fn set_config_key(
     Ok(())
 }
 
+fn remove_config_key(table: &mut TomlTable, key: &str) -> std::result::Result<bool, String> {
+    let key_parts: Vec<&str> = key.split('.').filter(|part| !part.is_empty()).collect();
+    if key_parts.is_empty() {
+        return Err("empty key".to_string());
+    }
+
+    Ok(remove_config_key_segments(table, &key_parts))
+}
+
+fn remove_config_key_segments(table: &mut TomlTable, segments: &[&str]) -> bool {
+    if segments.len() == 1 {
+        return table.remove(segments[0]).is_some();
+    }
+
+    let key = segments[0];
+    let (removed, prune_child) = if let Some(child) = table.get_mut(key) {
+        if let Some(child_table) = child.as_table_mut() {
+            let removed = remove_config_key_segments(child_table, &segments[1..]);
+            (removed, removed && child_table.is_empty())
+        } else {
+            (false, false)
+        }
+    } else {
+        (false, false)
+    };
+
+    if prune_child {
+        table.remove(key);
+    }
+
+    removed
+}
+
 fn parse_toml_value_literal(value_literal: &str) -> TomlValue {
     let literal = value_literal.trim();
     if literal.is_empty() {
@@ -3000,12 +3820,38 @@ fn render_toml_value(value: &TomlValue) -> String {
     value.to_string()
 }
 
+fn config_editor_field_index(key: &str) -> Option<usize> {
+    CONFIG_EDITOR_FIELDS
+        .iter()
+        .position(|field| field.key.eq_ignore_ascii_case(key))
+}
+
 fn reload_runtime_from_config(state: &mut AppState) -> std::result::Result<(), String> {
     let selected_path_hint = state.selected_kernel_tree_path();
     match crate::infra::config::load(Some(&state.runtime.config_path)) {
         Ok(runtime) => {
+            let enabled_mailboxes: HashSet<String> =
+                state.enabled_mailboxes().into_iter().collect();
+            let active_mailbox = state.active_thread_mailbox.clone();
             state.runtime = runtime;
             state.ui_state_path = ui_state::path_for_data_dir(&state.runtime.data_dir);
+            state.subscriptions = default_subscriptions(
+                &state.runtime,
+                &enabled_mailboxes,
+                Some(active_mailbox.as_str()),
+                state.runtime.imap.is_complete() && !state.imap_defaults_initialized,
+            );
+            if state.runtime.imap.is_complete() {
+                state.imap_defaults_initialized = true;
+            }
+            if let Some(index) = state
+                .subscriptions
+                .iter()
+                .position(|item| item.mailbox == state.active_thread_mailbox)
+            {
+                state.subscription_index = index;
+                state.sync_subscription_row_to_selected_item();
+            }
             state.refresh_kernel_tree_rows(selected_path_hint.as_deref());
             if matches!(state.ui_page, UiPage::CodeBrowser) && !state.supports_code_browser() {
                 state.ui_page = UiPage::Mail;
@@ -3034,7 +3880,22 @@ fn effective_config_value(state: &AppState, key: &str) -> Option<String> {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "<none>".to_string()),
         ),
-        "source.mailbox" | "imap.mailbox" => Some(state.runtime.imap_mailbox.clone()),
+        "source.mailbox" | "imap.mailbox" => Some(state.runtime.source_mailbox.clone()),
+        "imap.email" => state.runtime.imap.email.clone(),
+        "imap.user" => state.runtime.imap.user.clone(),
+        "imap.pass" => state.runtime.imap.pass.clone(),
+        "imap.server" => state.runtime.imap.server.clone(),
+        "imap.serverport" => state
+            .runtime
+            .imap
+            .server_port
+            .map(|value| value.to_string()),
+        "imap.encryption" => state
+            .runtime
+            .imap
+            .encryption
+            .map(|value| value.as_str().to_string()),
+        "imap.proxy" => state.runtime.imap.proxy.clone(),
         "source.lore_base_url" => Some(state.runtime.lore_base_url.clone()),
         "ui.startup_sync" => Some(state.runtime.startup_sync.to_string()),
         "kernel.trees" => Some(format!(
@@ -3449,6 +4310,10 @@ fn config_completion_suggestions(
     match context.active_index {
         1 => vec![
             PaletteSuggestion {
+                value: "edit".to_string(),
+                description: Some("Open visual config editor".to_string()),
+            },
+            PaletteSuggestion {
                 value: "get".to_string(),
                 description: Some("Read one config key".to_string()),
             },
@@ -3466,8 +4331,12 @@ fn config_completion_suggestions(
             },
         ],
         2 => {
+            let owned_editor_keys: Vec<&str>;
             let keys = if action == "set" {
                 CONFIG_SET_KEYS
+            } else if action == "edit" {
+                owned_editor_keys = CONFIG_EDITOR_FIELDS.iter().map(|field| field.key).collect();
+                &owned_editor_keys
             } else {
                 CONFIG_GET_KEYS
             };
@@ -3504,6 +4373,75 @@ fn config_value_suggestions(state: &AppState, key: Option<&String>) -> Vec<Palet
                 description: Some("Mailbox".to_string()),
             })
             .collect(),
+        "imap.email" => vec![PaletteSuggestion {
+            value: state
+                .runtime
+                .imap
+                .email
+                .as_ref()
+                .map(|value| format!("\"{value}\""))
+                .unwrap_or_else(|| "\"you@example.com\"".to_string()),
+            description: Some("Self email; also default IMAP login".to_string()),
+        }],
+        "imap.user" => vec![PaletteSuggestion {
+            value: state
+                .runtime
+                .imap
+                .user
+                .as_ref()
+                .map(|value| format!("\"{value}\""))
+                .or_else(|| {
+                    state
+                        .runtime
+                        .imap
+                        .email
+                        .as_ref()
+                        .map(|value| format!("\"{value}\""))
+                })
+                .unwrap_or_else(|| "\"you@example.com\"".to_string()),
+            description: Some("IMAP login account; Gmail usually needs full email".to_string()),
+        }],
+        "imap.pass" => vec![PaletteSuggestion {
+            value: "\"imap-pass\"".to_string(),
+            description: Some("IMAP login password".to_string()),
+        }],
+        "imap.server" => vec![PaletteSuggestion {
+            value: state
+                .runtime
+                .imap
+                .server
+                .as_ref()
+                .map(|value| format!("\"{value}\""))
+                .unwrap_or_else(|| "\"imap.example.com\"".to_string()),
+            description: Some("IMAP server host".to_string()),
+        }],
+        "imap.serverport" => vec![PaletteSuggestion {
+            value: state
+                .runtime
+                .imap
+                .server_port
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "993".to_string()),
+            description: Some("IMAP server port".to_string()),
+        }],
+        "imap.encryption" => ["tls", "ssl", "starttls", "none"]
+            .iter()
+            .map(|value| PaletteSuggestion {
+                value: format!("\"{value}\""),
+                description: Some("IMAP encryption".to_string()),
+            })
+            .collect(),
+        "imap.proxy" => [
+            "socks5://127.0.0.1:7890",
+            "socks5://10.0.2.2:7890",
+            "http://127.0.0.1:7890",
+        ]
+        .iter()
+        .map(|value| PaletteSuggestion {
+            value: format!("\"{value}\""),
+            description: Some("IMAP proxy URL".to_string()),
+        })
+        .collect(),
         "source.lore_base_url" => vec![PaletteSuggestion {
             value: "https://lore.kernel.org".to_string(),
             description: Some("Lore base URL".to_string()),
@@ -3572,7 +4510,7 @@ fn sync_completion_suggestions(
         .map(|subscription| subscription.mailbox.clone())
         .collect();
     candidates.push(state.active_thread_mailbox.clone());
-    candidates.push(state.runtime.imap_mailbox.clone());
+    candidates.push(state.runtime.source_mailbox.clone());
     candidates.sort();
     candidates.dedup();
     candidates
@@ -3661,6 +4599,12 @@ fn draw(
         state.filtered_thread_indices.len(),
         uptime
     );
+    let header = if let Some(progress) = state.startup_sync_progress_text() {
+        format!("{header} | {progress}")
+    } else {
+        header
+    };
+    let header = sanitize_inline_ui_text(&header);
     let header_widget =
         Paragraph::new(header).style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_widget(header_widget, areas[0]);
@@ -3686,29 +4630,55 @@ fn draw(
             "Tab page | : palette | Enter expand/collapse | e inline edit | E external vim"
         }
     };
-    let footer_sections = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(shortcuts_text.chars().count() as u16),
-            Constraint::Min(1),
-        ])
-        .split(areas[2]);
+    let sync_progress_text = state
+        .startup_sync_progress_text()
+        .map(|value| sanitize_inline_ui_text(&value));
+    let footer_sections = if let Some(progress_text) = sync_progress_text.as_ref() {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(shortcuts_text.chars().count() as u16),
+                Constraint::Length(progress_text.chars().count().min(48) as u16),
+                Constraint::Min(1),
+            ])
+            .split(areas[2])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(shortcuts_text.chars().count() as u16),
+                Constraint::Min(1),
+            ])
+            .split(areas[2])
+    };
 
     let shortcuts =
         Paragraph::new(shortcuts_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(shortcuts, footer_sections[0]);
 
-    let status_line = format!("status: {}", state.status);
+    let status_area = if let Some(progress_text) = sync_progress_text {
+        let progress = Paragraph::new(progress_text)
+            .style(Style::default().fg(Color::Yellow).bg(Color::DarkGray));
+        frame.render_widget(progress, footer_sections[1]);
+        footer_sections[2]
+    } else {
+        footer_sections[1]
+    };
+
+    let status_line = format!("status: {}", sanitize_inline_ui_text(&state.status));
     let status = Paragraph::new(status_line)
         .alignment(Alignment::Right)
         .style(Style::default().fg(Color::White).bg(Color::DarkGray));
-    frame.render_widget(status, footer_sections[1]);
+    frame.render_widget(status, status_area);
 
     if state.palette.open {
         draw_command_palette(frame, state);
     }
     if state.search.active {
         draw_search_overlay(frame, state);
+    }
+    if state.config_editor.open {
+        draw_config_editor(frame, state);
     }
 }
 
@@ -3853,9 +4823,15 @@ fn draw_code_source_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     }
 }
 
-fn subscription_line(item: &SubscriptionItem) -> String {
+fn subscription_line(
+    item: &SubscriptionItem,
+    startup_sync_status: Option<StartupSyncMailboxStatus>,
+) -> String {
     let marker = if item.enabled { "y" } else { "n" };
-    format!("[{marker}] {}", item.mailbox)
+    let suffix = startup_sync_status
+        .map(StartupSyncMailboxStatus::ui_suffix)
+        .unwrap_or("");
+    format!("[{marker}] {}{suffix}", item.label)
 }
 
 fn default_kernel_tree_expanded_paths(root_paths: &[PathBuf]) -> HashSet<PathBuf> {
@@ -4029,29 +5005,43 @@ fn has_child_entries(path: &Path) -> bool {
 }
 
 fn default_subscriptions(
-    default_mailbox: &str,
+    runtime: &RuntimeConfig,
     enabled_mailboxes: &HashSet<String>,
     active_mailbox: Option<&str>,
+    allow_default_my_inbox: bool,
 ) -> Vec<SubscriptionItem> {
-    let default_enabled = false;
     let mut items: Vec<SubscriptionItem> = VGER_SUBSCRIPTIONS
         .iter()
         .map(|entry| SubscriptionItem {
             mailbox: entry.mailbox.to_string(),
-            enabled: if default_enabled {
-                entry.mailbox == default_mailbox
-            } else {
-                enabled_mailboxes.contains(entry.mailbox)
-            },
+            label: entry.mailbox.to_string(),
+            enabled: enabled_mailboxes.contains(entry.mailbox),
         })
         .collect();
 
-    if items.iter().all(|item| item.mailbox != default_mailbox) {
+    if runtime.imap.is_complete() {
+        let enable_my_inbox = enabled_mailboxes.contains(IMAP_INBOX_MAILBOX)
+            || (allow_default_my_inbox && !enabled_mailboxes.contains(IMAP_INBOX_MAILBOX));
         items.insert(
             0,
             SubscriptionItem {
-                mailbox: default_mailbox.to_string(),
-                enabled: default_enabled || enabled_mailboxes.contains(default_mailbox),
+                mailbox: IMAP_INBOX_MAILBOX.to_string(),
+                label: MY_INBOX_LABEL.to_string(),
+                enabled: enable_my_inbox,
+            },
+        );
+    }
+
+    if items
+        .iter()
+        .all(|item| item.mailbox != runtime.source_mailbox)
+    {
+        items.insert(
+            0,
+            SubscriptionItem {
+                mailbox: runtime.source_mailbox.clone(),
+                label: runtime.source_mailbox.clone(),
+                enabled: enabled_mailboxes.contains(runtime.source_mailbox.as_str()),
             },
         );
     }
@@ -4062,6 +5052,11 @@ fn default_subscriptions(
         }
         items.push(SubscriptionItem {
             mailbox: mailbox.clone(),
+            label: if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                MY_INBOX_LABEL.to_string()
+            } else {
+                mailbox.clone()
+            },
             enabled: true,
         });
     }
@@ -4072,6 +5067,11 @@ fn default_subscriptions(
     {
         items.push(SubscriptionItem {
             mailbox: mailbox.to_string(),
+            label: if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                MY_INBOX_LABEL.to_string()
+            } else {
+                mailbox.to_string()
+            },
             enabled: enabled_mailboxes.contains(mailbox),
         });
     }
@@ -4080,6 +5080,7 @@ fn default_subscriptions(
         right
             .enabled
             .cmp(&left.enabled)
+            .then_with(|| left.label.cmp(&right.label))
             .then_with(|| left.mailbox.cmp(&right.mailbox))
     });
 
@@ -4201,6 +5202,26 @@ fn truncate_with_ellipsis(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+fn sanitize_inline_ui_text(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut pending_space = false;
+
+    for character in value.chars() {
+        if character.is_control() || character.is_whitespace() {
+            pending_space = !sanitized.is_empty();
+            continue;
+        }
+
+        if pending_space {
+            sanitized.push(' ');
+            pending_space = false;
+        }
+        sanitized.push(character);
+    }
+
+    sanitized.trim().to_string()
+}
+
 fn char_to_byte_index(value: &str, char_index: usize) -> usize {
     if char_index == 0 {
         return 0;
@@ -4214,18 +5235,22 @@ fn char_to_byte_index(value: &str, char_index: usize) -> usize {
 }
 
 fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &RuntimeConfig) {
-    let preview = if let Some(thread) = state.selected_thread() {
+    let (warning, preview) = if let Some(thread) = state.selected_thread() {
         let mut sections = Vec::new();
         if let Some(series_details) = load_series_preview(state, config, thread.thread_id) {
             sections.push(series_details);
         }
-        sections.push(load_mail_preview(thread));
-        sections.join("\n\n")
+        let mail_preview = load_mail_preview(thread);
+        sections.push(mail_preview.content);
+        (mail_preview.warning, sections.join("\n\n"))
     } else {
-        format!(
-            "No synced thread data\n\nRun:\n  courier sync --fixture-dir <DIR>\n\nConfig: {}\nDatabase: {}",
-            config.config_path.display(),
-            config.database_path.display(),
+        (
+            None,
+            format!(
+                "No synced thread data\n\nRun:\n  courier sync --fixture-dir <DIR>\n\nConfig: {}\nDatabase: {}",
+                config.config_path.display(),
+                config.database_path.display(),
+            ),
         )
     };
 
@@ -4234,11 +5259,34 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
     frame.render_widget(block, area);
     frame.render_widget(Clear, inner_area);
 
+    let content_area = if let Some(warning_text) = warning {
+        let warning_height = warning_text
+            .lines()
+            .count()
+            .min(inner_area.height.saturating_sub(1) as usize) as u16;
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(warning_height), Constraint::Min(1)])
+            .split(inner_area);
+        let warning = Paragraph::new(Text::from(warning_text))
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(warning, sections[0]);
+        sections[1]
+    } else {
+        inner_area
+    };
+
     let paragraph = Paragraph::new(preview)
         .scroll((state.preview_scroll, 0))
         .wrap(Wrap { trim: false });
 
-    frame.render_widget(paragraph, inner_area);
+    frame.render_widget(paragraph, content_area);
 }
 
 fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64) -> Option<String> {
@@ -4616,6 +5664,180 @@ fn draw_command_palette(frame: &mut Frame<'_>, state: &AppState) {
     }
 }
 
+fn draw_config_editor(frame: &mut Frame<'_>, state: &AppState) {
+    let area = centered_rect(88, 76, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title("Runtime Config")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightGreen));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(
+                if matches!(state.config_editor.mode, ConfigEditorMode::Edit) {
+                    3
+                } else {
+                    2
+                },
+            ),
+        ])
+        .split(inner);
+
+    let header = format!(
+        "file: {} | :config opens this editor | changes are written back immediately",
+        state.runtime.config_path.display()
+    );
+    frame.render_widget(Paragraph::new(header), sections[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(sections[1]);
+
+    let file_table = read_config_table(&state.runtime.config_path).ok();
+    let selected_index = state
+        .config_editor
+        .selected_field
+        .min(CONFIG_EDITOR_FIELDS.len().saturating_sub(1));
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected_index));
+
+    let list_width = body[0].width.saturating_sub(4) as usize;
+    let items: Vec<ListItem> = CONFIG_EDITOR_FIELDS
+        .iter()
+        .map(|field| {
+            let file_value = file_table
+                .as_ref()
+                .and_then(|table| lookup_config_key(table, field.key))
+                .map(render_toml_value);
+            let effective_value = effective_config_value(state, field.key);
+            let (value, source) = if let Some(value) = file_value {
+                (value, "file")
+            } else if let Some(value) = effective_value {
+                (value, "default")
+            } else {
+                ("<unset>".to_string(), "unset")
+            };
+            let line = format!("{} = {} [{}]", field.key, value, source);
+            ListItem::new(truncate_with_ellipsis(&line, list_width))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .title("Fields")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray)),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_stateful_widget(list, body[0], &mut list_state);
+
+    let field = state.selected_config_editor_field();
+    let file_value = file_table
+        .as_ref()
+        .and_then(|table| lookup_config_key(table, field.key))
+        .map(render_toml_value)
+        .unwrap_or_else(|| "<unset>".to_string());
+    let effective_value =
+        effective_config_value(state, field.key).unwrap_or_else(|| "<unset>".to_string());
+    let suggestions = config_value_suggestions(state, Some(&field.key.to_string()));
+    let mut details = vec![
+        format!("Key: {}", field.key),
+        format!("About: {}", field.description),
+        String::new(),
+        format!("File value: {}", file_value),
+        format!("Effective: {}", effective_value),
+        format!(
+            "Source: {}",
+            if file_value == "<unset>" {
+                "runtime default / derived fallback"
+            } else {
+                "explicit value from config file"
+            }
+        ),
+    ];
+    if !suggestions.is_empty() {
+        details.push(String::new());
+        details.push("Presets:".to_string());
+        for suggestion in suggestions.iter().take(6) {
+            match suggestion.description.as_deref() {
+                Some(description) if !description.is_empty() => {
+                    details.push(format!("  {}  ({description})", suggestion.value));
+                }
+                _ => details.push(format!("  {}", suggestion.value)),
+            }
+        }
+    }
+    details.push(String::new());
+    details.push("Unset removes the explicit key and falls back to runtime defaults.".to_string());
+
+    let detail = Paragraph::new(details.join("\n"))
+        .block(
+            Block::default()
+                .title("Selected Field")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail, body[1]);
+
+    if matches!(state.config_editor.mode, ConfigEditorMode::Edit) {
+        let footer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(sections[2]);
+        frame.render_widget(
+            Paragraph::new(format!("Editing {} as TOML literal", field.key)),
+            footer[0],
+        );
+        let prompt = format!("> {}", state.config_editor.input);
+        frame.render_widget(Paragraph::new(prompt), footer[1]);
+        frame.render_widget(
+            Paragraph::new(
+                "Enter save | Esc cancel | Tab cycle presets | strings may be bare or quoted",
+            ),
+            footer[2],
+        );
+        if footer[1].width > 0 {
+            let cursor_col =
+                (2 + state.config_editor.input.chars().count()).min(footer[1].width as usize - 1);
+            frame.set_cursor_position((footer[1].x + cursor_col as u16, footer[1].y));
+        }
+    } else {
+        let footer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(sections[2]);
+        frame.render_widget(
+            Paragraph::new("i/k or ↑/↓ move | Enter/e edit | Tab presets | x unset | Esc close"),
+            footer[0],
+        );
+        frame.render_widget(
+            Paragraph::new(
+                "Use TOML literals for arrays/paths when needed, e.g. [\"/path/to/linux\"].",
+            ),
+            footer[1],
+        );
+    }
+}
+
 fn palette_overlay_suggestions(state: &AppState) -> Vec<PaletteSuggestion> {
     if state.palette.show_suggestions && !state.palette.suggestions.is_empty() {
         return state.palette.suggestions.clone();
@@ -4715,6 +5937,7 @@ impl Drop for TerminalGuard {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -4723,17 +5946,22 @@ mod tests {
     use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 
     use crate::infra::bootstrap::BootstrapState;
-    use crate::infra::config::RuntimeConfig;
+    use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
+    use crate::infra::db;
     use crate::infra::db::DatabaseState;
-    use crate::infra::mail_store::ThreadRow;
+    use crate::infra::mail_parser;
+    use crate::infra::mail_store::{self, IncomingMail, SyncBatch, ThreadRow};
+    use crate::infra::ui_state::UiState;
 
+    use super::preview::preview_warning_message;
     use super::{
-        AppState, CodeEditMode, CodePaneFocus, ExternalEditorProcessResult, LoopAction, Pane,
-        SubscriptionItem, UiPage, code_edit_cursor_position, draw, extract_mail_body_preview,
-        extract_mail_preview, handle_key_event, is_palette_open_shortcut, is_palette_toggle,
-        load_source_file_preview, mail_page_panes, matching_commands, pick_external_editor,
-        resolve_palette_local_workdir, run_external_editor_session_with, subscription_line,
-        thread_line,
+        AppState, CodeEditMode, CodePaneFocus, ExternalEditorProcessResult, LoopAction,
+        MY_INBOX_LABEL, Pane, StartupSyncEvent, StartupSyncMailboxStatus, StartupSyncState,
+        SubscriptionItem, UiPage, catch_sync_panic, code_edit_cursor_position, draw,
+        extract_mail_body_preview, extract_mail_preview, handle_key_event,
+        is_palette_open_shortcut, is_palette_toggle, load_source_file_preview, mail_page_panes,
+        matching_commands, pick_external_editor, resolve_palette_local_workdir,
+        run_external_editor_session_with, sanitize_inline_ui_text, subscription_line, thread_line,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -4799,8 +6027,7 @@ mod tests {
         }
     }
 
-    fn test_runtime() -> RuntimeConfig {
-        let root = PathBuf::from("/tmp/courier-ui-test");
+    fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
         RuntimeConfig {
             config_path: root.join("config.toml"),
             data_dir: root.join("data"),
@@ -4810,17 +6037,106 @@ mod tests {
             log_dir: root.join("data/logs"),
             b4_path: None,
             log_filter: "info".to_string(),
-            imap_mailbox: "inbox".to_string(),
+            source_mailbox: "inbox".to_string(),
+            imap: crate::infra::config::ImapConfig::default(),
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
             kernel_trees: Vec::new(),
         }
     }
 
+    fn test_runtime() -> RuntimeConfig {
+        test_runtime_in(PathBuf::from("/tmp/courier-ui-test"))
+    }
+
     fn test_runtime_with_kernel_tree(tree: PathBuf) -> RuntimeConfig {
         let mut runtime = test_runtime();
         runtime.kernel_trees = vec![tree];
         runtime
+    }
+
+    fn test_runtime_with_imap_in(root: PathBuf) -> RuntimeConfig {
+        let mut runtime = test_runtime_in(root);
+        runtime.imap = crate::infra::config::ImapConfig {
+            email: Some("me@example.com".to_string()),
+            user: Some("imap-user".to_string()),
+            pass: Some("imap-pass".to_string()),
+            server: Some("imap.example.com".to_string()),
+            server_port: Some(993),
+            encryption: Some(crate::infra::config::ImapEncryption::Tls),
+            proxy: None,
+        };
+        runtime
+    }
+
+    fn test_runtime_with_imap() -> RuntimeConfig {
+        test_runtime_with_imap_in(PathBuf::from("/tmp/courier-ui-test"))
+    }
+
+    fn seed_mailbox_thread(
+        db_path: &Path,
+        mailbox: &str,
+        uid: u32,
+        message_id: &str,
+        subject: &str,
+    ) {
+        fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+        db::initialize(db_path).expect("initialize db");
+        let batch = SyncBatch {
+            mailbox: mailbox.to_string(),
+            uidvalidity: 1,
+            highest_uid: uid,
+            highest_modseq: Some(uid as u64),
+            mails: vec![IncomingMail {
+                mailbox: mailbox.to_string(),
+                uid,
+                modseq: Some(uid as u64),
+                flags: vec!["Seen".to_string()],
+                raw_path: PathBuf::from(format!("/tmp/{mailbox}-{uid}.eml")),
+                parsed: mail_parser::parse_headers(
+                    format!(
+                        "Message-ID: <{message_id}>\nSubject: {subject}\nFrom: Alice <alice@example.com>\n\nbody\n"
+                    )
+                    .as_bytes(),
+                    format!("synthetic-{mailbox}-{uid}@local"),
+                ),
+            }],
+        };
+
+        mail_store::apply_sync_batch(db_path, batch).expect("apply mailbox sync batch");
+    }
+
+    fn startup_sync_state(mailboxes: &[(&str, StartupSyncMailboxStatus)]) -> StartupSyncState {
+        let (_sender, receiver) = mpsc::channel();
+        StartupSyncState {
+            receiver,
+            mailbox_order: mailboxes
+                .iter()
+                .map(|(mailbox, _)| (*mailbox).to_string())
+                .collect(),
+            mailboxes: mailboxes
+                .iter()
+                .map(|(mailbox, status)| ((*mailbox).to_string(), *status))
+                .collect(),
+            total: mailboxes.len(),
+            completed: mailboxes
+                .iter()
+                .filter(|(_, status)| {
+                    matches!(
+                        status,
+                        StartupSyncMailboxStatus::Finished | StartupSyncMailboxStatus::Failed
+                    )
+                })
+                .count(),
+            succeeded: mailboxes
+                .iter()
+                .filter(|(_, status)| matches!(status, StartupSyncMailboxStatus::Finished))
+                .count(),
+            failed: mailboxes
+                .iter()
+                .filter(|(_, status)| matches!(status, StartupSyncMailboxStatus::Failed))
+                .count(),
+        }
     }
 
     fn test_bootstrap(runtime: &RuntimeConfig) -> BootstrapState {
@@ -4843,6 +6159,24 @@ mod tests {
         state.start_startup_sync_if_enabled();
 
         assert!(state.startup_sync.is_none());
+    }
+
+    #[test]
+    fn startup_sync_progress_summary_renders_counts_and_running_mailbox() {
+        let sync_state = startup_sync_state(&[
+            ("INBOX", StartupSyncMailboxStatus::InFlight),
+            ("io-uring", StartupSyncMailboxStatus::Pending),
+            ("kvm", StartupSyncMailboxStatus::Finished),
+        ]);
+
+        assert_eq!(
+            sync_state.progress_summary(),
+            "1/3 ok=1 fail=0 queued=1 running=INBOX"
+        );
+        assert_eq!(
+            sync_state.mailbox_states_display(),
+            "INBOX:syncing io-uring:queued kvm:done"
+        );
     }
 
     fn external_editor_mock_success(
@@ -4990,15 +6324,35 @@ mod tests {
     fn subscription_line_shows_marker_and_mailbox_name_only() {
         let enabled = SubscriptionItem {
             mailbox: "io-uring".to_string(),
+            label: "io-uring".to_string(),
             enabled: true,
         };
         let disabled = SubscriptionItem {
             mailbox: "linux-mm".to_string(),
+            label: "linux-mm".to_string(),
             enabled: false,
         };
 
-        assert_eq!(subscription_line(&enabled), "[y] io-uring");
-        assert_eq!(subscription_line(&disabled), "[n] linux-mm");
+        assert_eq!(subscription_line(&enabled, None), "[y] io-uring");
+        assert_eq!(subscription_line(&disabled, None), "[n] linux-mm");
+    }
+
+    #[test]
+    fn subscription_line_shows_sync_suffix_when_progress_is_active() {
+        let enabled = SubscriptionItem {
+            mailbox: "INBOX".to_string(),
+            label: "My Inbox".to_string(),
+            enabled: true,
+        };
+
+        assert_eq!(
+            subscription_line(&enabled, Some(StartupSyncMailboxStatus::Pending)),
+            "[y] My Inbox [queued]"
+        );
+        assert_eq!(
+            subscription_line(&enabled, Some(StartupSyncMailboxStatus::InFlight)),
+            "[y] My Inbox [sync]"
+        );
     }
 
     #[test]
@@ -5106,7 +6460,7 @@ mailbox = "inbox"
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
         assert!(state.status.contains("config updated"));
-        assert_eq!(state.runtime.imap_mailbox, "io-uring");
+        assert_eq!(state.runtime.source_mailbox, "io-uring");
 
         let persisted = fs::read_to_string(&config_path).expect("read config file");
         assert!(persisted.contains("mailbox = \"io-uring\""));
@@ -5120,6 +6474,132 @@ mailbox = "inbox"
         assert!(state.status.contains("io-uring"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_command_opens_visual_editor() {
+        let mut state = AppState::new(vec![], test_runtime());
+        state.palette.open = true;
+        state.palette.input = "config".to_string();
+
+        let action = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(action, LoopAction::Continue));
+        assert!(state.config_editor.open);
+        assert!(!state.palette.open);
+        assert_eq!(state.selected_config_editor_field().key, "source.mailbox");
+    }
+
+    #[test]
+    fn config_editor_saves_selected_value() {
+        let root = temp_dir("config-editor-save");
+        let config_path = root.join("courier-config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[source]
+mailbox = "inbox"
+"#,
+        )
+        .expect("write config file");
+
+        let mut runtime = test_runtime();
+        runtime.config_path = config_path.clone();
+        let mut state = AppState::new(vec![], runtime);
+
+        state.open_config_editor(Some("source.mailbox"));
+        state.start_config_editor_edit();
+        state.config_editor.input = "io-uring".to_string();
+
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert_eq!(state.runtime.source_mailbox, "io-uring");
+        assert!(!state.config_editor.open || state.config_editor.input.is_empty());
+        let persisted = fs::read_to_string(&config_path).expect("read config file");
+        assert!(persisted.contains("mailbox = \"io-uring\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_editor_tab_cycles_boolean_presets() {
+        let root = temp_dir("config-editor-toggle");
+        let config_path = root.join("courier-config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[ui]
+startup_sync = true
+"#,
+        )
+        .expect("write config file");
+
+        let mut runtime = test_runtime();
+        runtime.config_path = config_path.clone();
+        let mut state = AppState::new(vec![], runtime);
+
+        state.open_config_editor(Some("ui.startup_sync"));
+        let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert!(!state.runtime.startup_sync);
+        let persisted = fs::read_to_string(&config_path).expect("read config file");
+        assert!(persisted.contains("startup_sync = false"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_editor_can_unset_optional_key() {
+        let root = temp_dir("config-editor-unset");
+        let config_path = root.join("courier-config.toml");
+        fs::write(
+            &config_path,
+            r#"
+[b4]
+path = "/usr/bin/b4"
+"#,
+        )
+        .expect("write config file");
+
+        let mut runtime = test_runtime();
+        runtime.config_path = config_path.clone();
+        let mut state = AppState::new(vec![], runtime);
+
+        state.open_config_editor(Some("b4.path"));
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+
+        assert!(state.runtime.b4_path.is_none());
+        let persisted = fs::read_to_string(&config_path).expect("read config file");
+        assert!(!persisted.contains("path = "));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn config_editor_overlay_is_rendered() {
+        let runtime = test_runtime();
+        let bootstrap = test_bootstrap(&runtime);
+        let mut state = AppState::new(vec![], runtime.clone());
+        state.open_config_editor(Some("source.mailbox"));
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+            .expect("draw config editor");
+        let rendered = format!("{}", terminal.backend());
+
+        assert!(rendered.contains("Runtime Config"));
+        assert!(rendered.contains("source.mailbox"));
+        assert!(rendered.contains("Selected Field"));
     }
 
     #[test]
@@ -6064,6 +7544,221 @@ mailbox = "inbox"
     }
 
     #[test]
+    fn first_open_with_complete_imap_enables_my_inbox() {
+        let state = AppState::new(vec![], test_runtime_with_imap());
+        let my_inbox = state
+            .subscriptions
+            .iter()
+            .find(|item| item.mailbox == IMAP_INBOX_MAILBOX)
+            .expect("my inbox subscription exists");
+
+        assert!(my_inbox.enabled);
+        assert_eq!(my_inbox.label, MY_INBOX_LABEL);
+        assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    }
+
+    #[test]
+    fn legacy_ui_state_with_complete_imap_enables_my_inbox_once() {
+        let state = AppState::new_with_ui_state(
+            vec![],
+            test_runtime_with_imap(),
+            Some(UiState {
+                enabled_mailboxes: vec!["io-uring".to_string()],
+                enabled_group_expanded: true,
+                disabled_group_expanded: true,
+                imap_defaults_initialized: false,
+                active_mailbox: Some("io-uring".to_string()),
+            }),
+        );
+
+        let my_inbox = state
+            .subscriptions
+            .iter()
+            .find(|item| item.mailbox == IMAP_INBOX_MAILBOX)
+            .expect("my inbox subscription exists");
+
+        assert!(my_inbox.enabled);
+        assert!(state.imap_defaults_initialized);
+    }
+
+    #[test]
+    fn initialized_ui_state_keeps_my_inbox_disabled_when_user_opted_out() {
+        let state = AppState::new_with_ui_state(
+            vec![],
+            test_runtime_with_imap(),
+            Some(UiState {
+                enabled_mailboxes: vec!["io-uring".to_string()],
+                enabled_group_expanded: true,
+                disabled_group_expanded: true,
+                imap_defaults_initialized: true,
+                active_mailbox: Some("io-uring".to_string()),
+            }),
+        );
+
+        let my_inbox = state
+            .subscriptions
+            .iter()
+            .find(|item| item.mailbox == IMAP_INBOX_MAILBOX)
+            .expect("my inbox subscription exists");
+
+        assert!(!my_inbox.enabled);
+        assert!(state.imap_defaults_initialized);
+    }
+
+    #[test]
+    fn catch_sync_panic_converts_panics_into_errors() {
+        let error = catch_sync_panic("INBOX", || -> crate::infra::error::Result<()> {
+            panic!("boom");
+        })
+        .expect_err("panic should become courier error");
+
+        assert!(error.to_string().contains("sync panicked for INBOX: boom"));
+    }
+
+    #[test]
+    fn empty_active_inbox_recovers_to_cached_enabled_mailbox() {
+        let root = temp_dir("imap-fallback-cache");
+        let runtime = test_runtime_with_imap_in(root.clone());
+        seed_mailbox_thread(
+            &runtime.database_path,
+            "kvm",
+            1,
+            "kvm@example.com",
+            "kvm thread",
+        );
+
+        let mut state = AppState::new_with_ui_state(
+            vec![],
+            runtime,
+            Some(UiState {
+                enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "kvm".to_string()],
+                enabled_group_expanded: true,
+                disabled_group_expanded: true,
+                imap_defaults_initialized: true,
+                active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            }),
+        );
+
+        assert!(state.recover_from_empty_active_mailbox("inbox unavailable"));
+        assert_eq!(state.active_thread_mailbox, "kvm");
+        assert_eq!(state.threads.len(), 1);
+        assert!(state.status.contains("showing threads for kvm"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_sync_failure_for_empty_inbox_falls_back_to_cached_mailbox() {
+        let root = temp_dir("imap-fallback-startup");
+        let runtime = test_runtime_with_imap_in(root.clone());
+        seed_mailbox_thread(
+            &runtime.database_path,
+            "io-uring",
+            1,
+            "io-uring@example.com",
+            "io_uring thread",
+        );
+
+        let mut state = AppState::new_with_ui_state(
+            vec![],
+            runtime,
+            Some(UiState {
+                enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "io-uring".to_string()],
+                enabled_group_expanded: true,
+                disabled_group_expanded: true,
+                imap_defaults_initialized: true,
+                active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            }),
+        );
+
+        state.apply_startup_sync_event(StartupSyncEvent::MailboxFailed {
+            mailbox: IMAP_INBOX_MAILBOX.to_string(),
+            error: "imap unavailable".to_string(),
+        });
+
+        assert_eq!(state.active_thread_mailbox, "io-uring");
+        assert_eq!(state.threads.len(), 1);
+        assert!(state.status.contains("showing threads for io-uring"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enter_on_mailbox_pending_startup_sync_stays_non_blocking() {
+        let root = temp_dir("imap-pending-enter");
+        let runtime = test_runtime_with_imap_in(root.clone());
+        fs::create_dir_all(runtime.database_path.parent().expect("db parent"))
+            .expect("create db parent");
+        db::initialize(&runtime.database_path).expect("initialize db");
+
+        let mut state = AppState::new_with_ui_state(
+            vec![],
+            runtime,
+            Some(UiState {
+                enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string()],
+                enabled_group_expanded: true,
+                disabled_group_expanded: true,
+                imap_defaults_initialized: true,
+                active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            }),
+        );
+        state.focus = Pane::Subscriptions;
+        state.startup_sync = Some(startup_sync_state(&[(
+            IMAP_INBOX_MAILBOX,
+            StartupSyncMailboxStatus::InFlight,
+        )]));
+
+        state.open_threads_for_selected_subscription();
+
+        assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+        assert!(state.threads.is_empty());
+        assert!(state.status.contains("syncing in background"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn background_success_does_not_steal_focus_from_pending_inbox() {
+        let root = temp_dir("imap-pending-focus");
+        let runtime = test_runtime_with_imap_in(root.clone());
+        seed_mailbox_thread(
+            &runtime.database_path,
+            "kvm",
+            1,
+            "kvm@example.com",
+            "kvm thread",
+        );
+
+        let mut state = AppState::new_with_ui_state(
+            vec![],
+            runtime,
+            Some(UiState {
+                enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "kvm".to_string()],
+                enabled_group_expanded: true,
+                disabled_group_expanded: true,
+                imap_defaults_initialized: true,
+                active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            }),
+        );
+        state.startup_sync = Some(startup_sync_state(&[
+            (IMAP_INBOX_MAILBOX, StartupSyncMailboxStatus::InFlight),
+            ("kvm", StartupSyncMailboxStatus::Pending),
+        ]));
+
+        state.apply_startup_sync_event(StartupSyncEvent::MailboxFinished {
+            mailbox: "kvm".to_string(),
+            fetched: 1,
+            inserted: 1,
+            updated: 0,
+        });
+
+        assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+        assert!(state.threads.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn y_and_n_toggle_subscription_and_keep_grouped_sort_order() {
         let mut state = AppState::new(vec![], test_runtime());
         state.focus = Pane::Subscriptions;
@@ -6246,6 +7941,18 @@ mailbox = "inbox"
     }
 
     #[test]
+    fn inline_ui_text_collapses_multiline_errors() {
+        let sanitized = sanitize_inline_ui_text(
+            "sync failed:\nCould not automatically determine provider\r\n\tline2",
+        );
+
+        assert_eq!(
+            sanitized,
+            "sync failed: Could not automatically determine provider line2"
+        );
+    }
+
+    #[test]
     fn preview_hides_rfc_headers_and_keeps_body() {
         let raw = b"Message-ID: <a@example.com>\r\nSubject: test\r\nFrom: a@example.com\r\n\r\nhello\nworld\n";
         let preview = extract_mail_body_preview(raw);
@@ -6299,6 +8006,48 @@ mailbox = "inbox"
         assert!(preview.contains("Cc: X <x@example.com>; Y <y@example.com>; ..."));
         assert!(!preview.contains("C <c@example.com>"));
         assert!(!preview.contains("Z <z@example.com>"));
+    }
+
+    #[test]
+    fn preview_warns_for_multipart_mail() {
+        let raw = b"Content-Type: multipart/alternative; boundary=\"abc\"\r\n\r\n--abc\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nplain body line\r\n--abc--\r\n";
+        let warning = preview_warning_message(raw).expect("warning expected");
+
+        assert!(warning.contains("NON-PLAIN-TEXT MAIL"));
+        assert!(warning.contains("Parse artifacts/errors are normal"));
+        assert!(warning.contains("Content-Type: multipart/alternative; boundary=\"abc\""));
+    }
+
+    #[test]
+    fn preview_warns_for_encoded_html_mail() {
+        let raw = b"Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<html><body>hello</body></html>\r\n";
+        let warning = preview_warning_message(raw).expect("warning expected");
+
+        assert!(warning.contains("NON-PLAIN-TEXT MAIL"));
+        assert!(warning.contains("Content-Type: text/html; charset=utf-8"));
+        assert!(warning.contains("Transfer-Encoding: quoted-printable"));
+    }
+
+    #[test]
+    fn multiline_sync_error_does_not_break_footer_or_palette_render() {
+        let runtime = test_runtime();
+        let bootstrap = test_bootstrap(&runtime);
+        let mut state = AppState::new(vec![], runtime.clone());
+        state.status =
+            "sync failed: E1007:\nCould not automatically determine provider".to_string();
+        state.palette.open = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 35)).expect("create test terminal");
+        terminal
+            .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+            .expect("draw multiline status");
+        let rendered = format!("{}", terminal.backend());
+
+        assert!(
+            rendered
+                .contains("status: sync failed: E1007: Could not automatically determine provider")
+        );
+        assert!(rendered.contains("Command Palette"));
     }
 
     #[test]

@@ -4,45 +4,72 @@ use crate::infra::mail_store::ThreadRow;
 
 use super::{PREVIEW_RECIPIENT_PREVIEW_LIMIT, PREVIEW_TAB_SPACES};
 
-pub(super) fn load_mail_preview(thread: &ThreadRow) -> String {
+pub(super) struct MailPreview {
+    pub warning: Option<String>,
+    pub content: String,
+}
+
+pub(super) fn load_mail_preview(thread: &ThreadRow) -> MailPreview {
     let subject = normalized_subject_or_default(&thread.subject);
     let fallback_from = normalized_header_or_default(&thread.from_addr, "<unknown sender>");
     let fallback_sent = thread.date.as_deref().and_then(non_empty_normalized_header);
 
     let Some(path) = thread.raw_path.as_ref() else {
-        return format_preview_with_headers(
-            &fallback_from,
-            fallback_sent.as_deref().unwrap_or("<unknown sent time>"),
-            "<none>",
-            "<none>",
-            &subject,
-            "<raw mail file unavailable>",
-        );
-    };
-
-    let content = match fs::read(path) {
-        Ok(value) => value,
-        Err(error) => {
-            return format_preview_with_headers(
+        return MailPreview {
+            warning: None,
+            content: format_preview_with_headers(
                 &fallback_from,
                 fallback_sent.as_deref().unwrap_or("<unknown sent time>"),
                 "<none>",
                 "<none>",
                 &subject,
-                &format!("<failed to read {}: {}>", path.display(), error),
-            );
+                "<raw mail file unavailable>",
+            ),
+        };
+    };
+
+    let content = match fs::read(path) {
+        Ok(value) => value,
+        Err(error) => {
+            return MailPreview {
+                warning: None,
+                content: format_preview_with_headers(
+                    &fallback_from,
+                    fallback_sent.as_deref().unwrap_or("<unknown sent time>"),
+                    "<none>",
+                    "<none>",
+                    &subject,
+                    &format!("<failed to read {}: {}>", path.display(), error),
+                ),
+            };
         }
     };
 
-    extract_mail_preview(&content, &subject, &fallback_from, fallback_sent.as_deref())
+    build_mail_preview(&content, &subject, &fallback_from, fallback_sent.as_deref())
 }
 
+#[cfg(test)]
 pub(super) fn extract_mail_preview(
     raw: &[u8],
     fallback_subject: &str,
     fallback_from: &str,
     fallback_sent: Option<&str>,
 ) -> String {
+    build_mail_preview(raw, fallback_subject, fallback_from, fallback_sent).content
+}
+
+#[cfg(test)]
+pub(super) fn preview_warning_message(raw: &[u8]) -> Option<String> {
+    let headers = parse_preview_header_block(raw);
+    build_preview_warning(&headers)
+}
+
+fn build_mail_preview(
+    raw: &[u8],
+    fallback_subject: &str,
+    fallback_from: &str,
+    fallback_sent: Option<&str>,
+) -> MailPreview {
     let headers = parse_preview_header_block(raw);
 
     let from = preview_header_value(&headers, "from")
@@ -58,7 +85,10 @@ pub(super) fn extract_mail_preview(
         .unwrap_or_else(|| "(no subject)".to_string());
     let body = extract_mail_body_preview(raw);
 
-    format_preview_with_headers(&from, &sent, &to, &cc, &subject, &body)
+    MailPreview {
+        warning: build_preview_warning(&headers),
+        content: format_preview_with_headers(&from, &sent, &to, &cc, &subject, &body),
+    }
 }
 
 fn format_preview_with_headers(
@@ -223,6 +253,45 @@ fn split_recipient_list(value: &str) -> Vec<String> {
 
 fn normalize_preview_header_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_preview_warning(headers: &[(String, String)]) -> Option<String> {
+    let content_type = preview_header_value(headers, "content-type");
+    let transfer_encoding = preview_header_value(headers, "content-transfer-encoding");
+    let content_type_lower = content_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let transfer_encoding_lower = transfer_encoding
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let non_plain_content = (!content_type_lower.is_empty()
+        && !content_type_lower.starts_with("text/plain")
+        && !content_type_lower.starts_with("message/rfc822"))
+        || content_type_lower.contains("multipart/")
+        || content_type_lower.contains("text/html");
+    let encoded_content = transfer_encoding_lower.contains("base64")
+        || transfer_encoding_lower.contains("quoted-printable");
+
+    if !non_plain_content && !encoded_content {
+        return None;
+    }
+
+    let mut lines = vec![
+        "[!] NON-PLAIN-TEXT MAIL".to_string(),
+        "[!] Preview is best-effort only.".to_string(),
+        "[!] Parse artifacts/errors are normal here.".to_string(),
+    ];
+    if let Some(value) = content_type {
+        lines.push(format!("[!] Content-Type: {value}"));
+    }
+    if let Some(value) = transfer_encoding {
+        lines.push(format!("[!] Transfer-Encoding: {value}"));
+    }
+
+    Some(lines.join("\n"))
 }
 
 pub(super) fn extract_mail_body_preview(raw: &[u8]) -> String {

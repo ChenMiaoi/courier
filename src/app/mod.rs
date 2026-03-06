@@ -6,8 +6,9 @@ use clap::Parser;
 
 use crate::infra::b4::{self, B4Status};
 use crate::infra::bootstrap;
-use crate::infra::config;
+use crate::infra::config::{self, IMAP_INBOX_MAILBOX};
 use crate::infra::error::Result;
+use crate::infra::imap::{ImapClient, RemoteImapClient};
 use crate::infra::logging;
 
 const DEFAULT_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
@@ -49,7 +50,7 @@ pub fn run() -> Result<()> {
             reconnect_attempts,
         } => {
             let request = sync::SyncRequest {
-                mailbox: mailbox.unwrap_or_else(|| runtime.imap_mailbox.clone()),
+                mailbox: mailbox.unwrap_or_else(|| runtime.source_mailbox.clone()),
                 fixture_dir,
                 uidvalidity,
                 reconnect_attempts: reconnect_attempts.unwrap_or(DEFAULT_SYNC_RECONNECT_ATTEMPTS),
@@ -67,7 +68,11 @@ pub fn run() -> Result<()> {
             println!("  raw_mail_dir: {}", runtime.raw_mail_dir.display());
             println!("  patch_dir: {}", runtime.patch_dir.display());
             println!("  log_dir: {}", runtime.log_dir.display());
-            println!("  imap_mailbox: {}", runtime.imap_mailbox);
+            println!("  source_mailbox: {}", runtime.source_mailbox);
+            println!(
+                "  default_active_mailbox: {}",
+                runtime.default_active_mailbox()
+            );
             println!("  lore_base_url: {}", runtime.lore_base_url);
             println!("  startup_sync: {}", runtime.startup_sync);
             if runtime.kernel_trees.is_empty() {
@@ -90,6 +95,74 @@ pub fn run() -> Result<()> {
                 "  database_created_this_run: {}",
                 bootstrap_state.db.created
             );
+            let self_email = config::resolve_self_email(&runtime);
+            println!(
+                "  self_email: {}",
+                self_email.email.as_deref().unwrap_or("<missing>")
+            );
+            println!(
+                "  self_email_source: {}",
+                self_email
+                    .source
+                    .map(|source| source.as_str())
+                    .unwrap_or("<none>")
+            );
+            if let Some(error) = self_email.git_error.as_deref() {
+                println!("  self_email_lookup: error ({error})");
+            }
+            println!(
+                "  imap_config_status: {}",
+                if runtime.imap.is_complete() {
+                    "complete"
+                } else {
+                    "incomplete"
+                }
+            );
+            if runtime.imap.is_complete() {
+                println!(
+                    "  imap_connection_target: {}:{} ({})",
+                    runtime.imap.server.as_deref().unwrap_or("<missing>"),
+                    runtime.imap.server_port.unwrap_or_default(),
+                    runtime
+                        .imap
+                        .encryption
+                        .map(|value| value.as_str())
+                        .unwrap_or("<missing>")
+                );
+
+                match RemoteImapClient::new(runtime.imap.clone()).and_then(|mut client| {
+                    client.connect()?;
+                    client.select_mailbox(IMAP_INBOX_MAILBOX)
+                }) {
+                    Ok(snapshot) => {
+                        println!("  imap_connect_status: ok");
+                        println!("  imap_select_mailbox: {}", IMAP_INBOX_MAILBOX);
+                        println!("  imap_uidvalidity: {}", snapshot.uidvalidity);
+                        println!("  imap_highest_uid: {}", snapshot.highest_uid);
+                        println!(
+                            "  imap_highest_modseq: {}",
+                            snapshot
+                                .highest_modseq
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "<none>".to_string())
+                        );
+                    }
+                    Err(error) => {
+                        println!("  imap_connect_status: error ({error})");
+                    }
+                }
+            } else {
+                let missing = runtime.imap.missing_required_fields();
+                println!(
+                    "  imap_missing_fields: {}",
+                    if missing.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        missing.join(", ")
+                    }
+                );
+                println!("  imap_connect_status: skipped");
+            }
 
             match b4_status.status {
                 B4Status::Available { path, version } => {

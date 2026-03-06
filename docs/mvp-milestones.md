@@ -207,7 +207,66 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 - “选中文件 -> 触发 VM2 -> 外部编辑 -> 退出 -> 预览更新”链路可演示并通过测试。
 
-## M6：回信编辑与预览（必须）
+## M6：真实 IMAP 接入与自邮箱订阅（必须，已完成）
+
+### 阶段目标
+
+在 M2 已有 checkpoint / threading / 幂等模型基础上接入真实 IMAP 账号，
+并在订阅栏中新增一个默认开启的“自己收件箱”订阅，打通配置 -> 自动同步 -> 展示闭环。
+
+### 前置依赖
+
+1. M2 已完成（同步 checkpoint、JWZ threading、订阅驱动浏览已可用）。
+2. M5 已完成（当前 TUI 交互与状态持久化能力稳定）。
+
+### 任务拆分
+
+1. 配置模型：新增 `[imap]` 配置段，首版固定字段 `email`、`user`、
+   `pass`、`server`、`serverport`、`encryption`，并兼容 legacy alias
+   `imapuser`、`imappass`、`imapserver`、`imapserverport`、`imapencryption`；
+   同时补齐字段级校验。
+2. 邮箱地址解析：IMAP 相关“自己邮箱”地址按 `[imap].email -> git config user.email`
+   优先级解析；若 Courier 配置显式设置，则覆盖 git 结果，并在诊断信息中标明来源。
+3. 连接与认证：实现真实 IMAP 会话建立、`SELECT INBOX`、最小 `LOGIN` 认证路径，
+   支持 `tls` / `starttls` / `none` 三种加密模式。
+4. 默认订阅：左栏新增一个内置 `My Inbox`（命名可实现期微调）订阅，映射当前账号
+   的 `INBOX`，在 IMAP 配置完整时首次默认开启。
+5. 订阅联动：`My Inbox` 与现有订阅使用同一启停、排序、折叠、状态持久化模型；
+   但仅 `My Inbox` 走 IMAP，同步启动时应包含该默认开启项。
+6. 子系统订阅保持现状：vger 等子系统订阅继续沿用 M2 的网页/lore 抓取同步路径，
+   不切换到 IMAP。
+7. 同步复用：真实 IMAP 路径仅负责 `My Inbox`（或未来显式 `imap` 源订阅），
+   并复用 M2 的 `mail` / `thread` / `imap_mailbox_state` 写入模型，保持
+   `(imap_mailbox, imap_uid)` 幂等约束与 `UIDVALIDITY` 重建逻辑。
+8. 诊断与错误：`doctor` 增加 IMAP 配置完整性、邮箱地址来源、连接/认证结果检查；
+   对认证失败、TLS 配置错误、邮箱地址缺失给出明确提示。
+9. 测试补齐：覆盖邮箱地址优先级、默认订阅开启、配置缺失、认证失败、
+   `My Inbox` 的 IMAP 同步幂等，以及子系统订阅仍走 lore/web 路径等场景。
+
+### 交付物
+
+- 真实 IMAP 配置模型与校验逻辑。
+- IMAP 会话适配器（连接、认证、选择 mailbox、增量同步）。
+- 左栏内置 `My Inbox` 默认订阅及其状态持久化。
+- 子系统订阅继续走 lore/web 抓取的设计约束说明。
+- `doctor` 的 IMAP 诊断项与错误提示。
+
+### 验收标准
+
+1. 当 `[imap].email` 存在且与 git email 不同时，系统使用 Courier 配置中的值。
+2. 当 `[imap].email` 缺失时，系统自动回退到 `git config user.email`。
+3. IMAP 配置完整时，左栏出现默认开启的 `My Inbox` 订阅，并在进入 TUI 后自动同步。
+4. `user`、`pass`、`server`、`serverport`、`encryption`
+   （兼容 legacy alias `imapuser`、`imappass`、`imapserver`、
+   `imapserverport`、`imapencryption`）可驱动真实 IMAP 建连并读取 `INBOX`。
+5. 子系统订阅继续通过此前的 lore/web 抓取方式同步，不依赖 IMAP。
+6. 重复同步不会产生重复邮件记录，`UIDVALIDITY` 变化后仍可完成 `My Inbox` mailbox 重建。
+
+### 退出条件
+
+- “配置 IMAP -> 启动 TUI -> 自动同步 `My Inbox` -> 展示 threads”链路可端到端演示。
+
+## M7：回信编辑与预览（必须）
 
 ### 阶段目标
 
@@ -252,16 +311,16 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 - “阅读 -> Patch Preview -> Vim -> 回复编辑 -> Send Preview”链路可端到端演示。
 
-## M7：Send Email 发送链路（MVP，必须）
+## M8：Send Email 发送链路（MVP，必须）
 
 ### 阶段目标
 
-在 M6 的预览闭环上接入真实发送能力：对用户只暴露统一 `Send` 体验，
+在 M7 的预览闭环上接入真实发送能力：对用户只暴露统一 `Send` 体验，
 底层先使用 `git send-email` 适配实现。
 
 ### 前置依赖
 
-1. M6 已完成（可稳定生成并确认发送预览）。
+1. M7 已完成（可稳定生成并确认发送预览）。
 2. 发送环境可用（MVP 阶段可直接调用 `git send-email`）。
 
 ### 任务拆分
@@ -294,7 +353,7 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 - “阅读 -> Patch Preview -> Vim -> 回复编辑 -> Send Preview -> Send”链路可端到端演示。
 
-## M8：过滤规则（必须）
+## M9：过滤规则（必须）
 
 ### 阶段目标
 
@@ -324,7 +383,7 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 - “收取 -> 过滤 -> 阅读 -> 回复 -> 发送”链路可端到端演示。
 
-## M9：配置体验增强（可选，低优先）
+## M10：配置体验增强（可选，低优先）
 
 ### 阶段目标
 
@@ -352,7 +411,7 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 ### 退出条件
 
-- 配置体验优化完成且不影响 M1-M8 既有行为。
+- 配置体验优化完成且不影响 M1-M9 既有行为。
 
 ## 维护规则
 

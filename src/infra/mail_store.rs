@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -125,6 +126,117 @@ pub fn mailbox_message_count(path: &Path, mailbox: &str) -> Result<usize> {
         })?;
 
     Ok(count.max(0) as usize)
+}
+
+pub fn prune_mailbox_subjects<F>(path: &Path, mailbox: &str, mut keep_subject: F) -> Result<usize>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut connection = open_connection(path)?;
+    let tx = connection.transaction().map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Database,
+            "failed to open mailbox prune transaction",
+            error,
+        )
+    })?;
+
+    let mut pruned_mail_ids = Vec::new();
+    {
+        let mut statement = tx
+            .prepare(
+                "SELECT id, subject, raw_path FROM mail WHERE imap_mailbox = ?1 AND is_expunged = 0",
+            )
+            .map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to prepare mailbox prune query for '{mailbox}'"),
+                    error,
+                )
+            })?;
+
+        let rows = statement
+            .query_map(params![mailbox], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to query mailbox prune candidates for '{mailbox}'"),
+                    error,
+                )
+            })?;
+
+        for row in rows {
+            let (mail_id, subject, raw_path) = row.map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Database,
+                    "failed to decode mailbox prune candidate row",
+                    error,
+                )
+            })?;
+            if !keep_subject(&subject) {
+                pruned_mail_ids.push((mail_id, raw_path.map(PathBuf::from)));
+            }
+        }
+    }
+
+    if pruned_mail_ids.is_empty() {
+        tx.commit().map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Database,
+                "failed to commit no-op mailbox prune transaction",
+                error,
+            )
+        })?;
+        return Ok(0);
+    }
+
+    for (mail_id, _) in &pruned_mail_ids {
+        tx.execute("DELETE FROM mail WHERE id = ?1", params![mail_id])
+            .map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Database,
+                    format!("failed to delete pruned mail {}", mail_id),
+                    error,
+                )
+            })?;
+    }
+
+    let build = build_thread_index_tx(&tx)?;
+    let _ = rebuild_all_threads_tx(&tx, &build)?;
+
+    tx.commit().map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Database,
+            format!("failed to commit mailbox prune for '{mailbox}'"),
+            error,
+        )
+    })?;
+
+    for (_, raw_path) in &pruned_mail_ids {
+        let Some(raw_path) = raw_path.as_ref() else {
+            continue;
+        };
+        match fs::remove_file(raw_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    mailbox = %mailbox,
+                    path = %raw_path.display(),
+                    error = %error,
+                    "failed to delete pruned raw mail file"
+                );
+            }
+        }
+    }
+
+    Ok(pruned_mail_ids.len())
 }
 
 pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult> {
@@ -987,6 +1099,7 @@ mod tests {
 
     use super::{
         IncomingMail, SyncBatch, apply_sync_batch, load_mailbox_state, load_thread_rows_by_mailbox,
+        prune_mailbox_subjects,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1151,6 +1264,49 @@ mod tests {
             .expect("checkpoint exists");
         assert_eq!(checkpoint.last_seen_uid, 3);
         assert_eq!(checkpoint.highest_modseq, Some(3));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_mailbox_subjects_removes_non_matching_rows() {
+        let root = temp_dir("prune-mailbox");
+        let db_path = root.join("courier.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let batch = SyncBatch {
+            mailbox: "INBOX".to_string(),
+            uidvalidity: 1,
+            highest_uid: 3,
+            highest_modseq: Some(3),
+            mails: vec![
+                incoming(
+                    "INBOX",
+                    1,
+                    "Message-ID: <patch@example.com>\nSubject: [PATCH 1/1] demo\nFrom: a@example.com\n\nbody\n",
+                ),
+                incoming(
+                    "INBOX",
+                    2,
+                    "Message-ID: <reply@example.com>\nSubject: Re: [PATCH 1/1] demo\nFrom: b@example.com\nIn-Reply-To: <patch@example.com>\nReferences: <patch@example.com>\n\nbody\n",
+                ),
+                incoming(
+                    "INBOX",
+                    3,
+                    "Message-ID: <status@example.com>\nSubject: Weekly status update\nFrom: c@example.com\n\nbody\n",
+                ),
+            ],
+        };
+        apply_sync_batch(&db_path, batch).expect("seed mailbox");
+
+        let pruned =
+            prune_mailbox_subjects(&db_path, "INBOX", |subject| subject.contains("[PATCH"))
+                .expect("prune mailbox");
+        assert_eq!(pruned, 1);
+
+        let rows = load_thread_rows_by_mailbox(&db_path, "INBOX", 20).expect("load pruned rows");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.subject.contains("[PATCH")));
 
         let _ = fs::remove_dir_all(root);
     }

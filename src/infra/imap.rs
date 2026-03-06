@@ -1,16 +1,26 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use chrono::DateTime;
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use webpki_roots::TLS_SERVER_ROOTS;
 
+use crate::infra::config::{ImapConfig, ImapEncryption};
 use crate::infra::error::{CourierError, ErrorCode, Result};
 
 const LORE_BASE_URL: &str = "https://lore.kernel.org";
 const LORE_HTTP_TIMEOUT_SECS: u64 = 20;
+const REMOTE_IMAP_TIMEOUT_SECS: u64 = 20;
+const HTTP_PROXY_RESPONSE_MAX_BYTES: usize = 8 * 1024;
+const IMAP_FETCH_BATCH_SIZE: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -45,6 +55,22 @@ pub trait ImapClient {
         after_uid: u32,
         since_modseq: Option<u64>,
     ) -> Result<Vec<RemoteMail>>;
+
+    fn fetch_header_candidates(
+        &mut self,
+        mailbox: &str,
+        after_uid: u32,
+        since_modseq: Option<u64>,
+    ) -> Result<Vec<RemoteMail>> {
+        self.fetch_incremental(mailbox, after_uid, since_modseq)
+    }
+
+    fn fetch_full_uids(&mut self, mailbox: &str, uids: &[u32]) -> Result<Vec<RemoteMail>> {
+        let wanted: HashSet<u32> = uids.iter().copied().collect();
+        let mut mails = self.fetch_incremental(mailbox, 0, None)?;
+        mails.retain(|mail| wanted.contains(&mail.uid));
+        Ok(mails)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -450,6 +476,1086 @@ impl ImapClient for LoreImapClient {
     }
 }
 
+pub struct RemoteImapClient {
+    config: ImapConfig,
+    session: Option<ImapSession>,
+}
+
+impl RemoteImapClient {
+    pub fn new(config: ImapConfig) -> Result<Self> {
+        let missing = config.missing_required_fields();
+        if !missing.is_empty() {
+            return Err(imap_error(
+                ImapErrorKind::Connection,
+                format!("incomplete IMAP config: missing {}", missing.join(", ")),
+            ));
+        }
+
+        Ok(Self {
+            config,
+            session: None,
+        })
+    }
+
+    fn session_mut(&mut self) -> Result<&mut ImapSession> {
+        self.session.as_mut().ok_or_else(|| {
+            imap_error(
+                ImapErrorKind::Connection,
+                "remote IMAP session is not connected",
+            )
+        })
+    }
+}
+
+impl ImapClient for RemoteImapClient {
+    fn connect(&mut self) -> Result<()> {
+        let session = ImapSession::connect(&self.config)?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    fn select_mailbox(&mut self, mailbox: &str) -> Result<MailboxSnapshot> {
+        self.session_mut()?.select_mailbox(mailbox)
+    }
+
+    fn fetch_incremental(
+        &mut self,
+        mailbox: &str,
+        after_uid: u32,
+        since_modseq: Option<u64>,
+    ) -> Result<Vec<RemoteMail>> {
+        let session = self.session_mut()?;
+        let snapshot = session.select_mailbox(mailbox)?;
+        let uids = collect_incremental_uids(session, snapshot, after_uid, since_modseq)?;
+        session.fetch_uids(&uids, "BODY.PEEK[]")
+    }
+
+    fn fetch_header_candidates(
+        &mut self,
+        mailbox: &str,
+        after_uid: u32,
+        since_modseq: Option<u64>,
+    ) -> Result<Vec<RemoteMail>> {
+        let session = self.session_mut()?;
+        let snapshot = session.select_mailbox(mailbox)?;
+        let uids = collect_incremental_uids(session, snapshot, after_uid, since_modseq)?;
+        session.fetch_uids(
+            &uids,
+            "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM DATE IN-REPLY-TO REFERENCES LIST-ID)]",
+        )
+    }
+
+    fn fetch_full_uids(&mut self, mailbox: &str, uids: &[u32]) -> Result<Vec<RemoteMail>> {
+        let session = self.session_mut()?;
+        let _ = session.select_mailbox(mailbox)?;
+        session.fetch_uids(uids, "BODY.PEEK[]")
+    }
+}
+
+fn collect_incremental_uids(
+    session: &mut ImapSession,
+    snapshot: MailboxSnapshot,
+    after_uid: u32,
+    since_modseq: Option<u64>,
+) -> Result<Vec<u32>> {
+    let mut uids = BTreeSet::new();
+
+    if snapshot.highest_uid > after_uid {
+        for uid in session.search_uid_range(after_uid.saturating_add(1))? {
+            uids.insert(uid);
+        }
+    }
+
+    if let Some(modseq) = since_modseq
+        && snapshot.highest_modseq.is_some()
+    {
+        for uid in session.search_modseq(modseq)? {
+            uids.insert(uid);
+        }
+    }
+
+    Ok(uids.into_iter().collect())
+}
+
+enum ImapTransport {
+    Plain(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImapProxyScheme {
+    Http,
+    Socks5,
+}
+
+impl ImapProxyScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Socks5 => "socks5",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImapProxy {
+    scheme: ImapProxyScheme,
+    host: String,
+    port: u16,
+}
+
+impl ImapProxy {
+    fn redacted_url(&self) -> String {
+        format!("{}://{}:{}", self.scheme.as_str(), self.host, self.port)
+    }
+}
+
+impl Read for ImapTransport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for ImapTransport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+struct ImapSession {
+    transport: ImapTransport,
+    read_buffer: Vec<u8>,
+    next_tag: u32,
+    capabilities: HashSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GreetingKind {
+    Ok,
+    Preauth,
+}
+
+impl ImapSession {
+    fn connect(config: &ImapConfig) -> Result<Self> {
+        let server = config.server.as_deref().ok_or_else(|| {
+            imap_error(
+                ImapErrorKind::Connection,
+                "missing imap.server in runtime config",
+            )
+        })?;
+        let port = config.server_port.ok_or_else(|| {
+            imap_error(
+                ImapErrorKind::Connection,
+                "missing imap.serverport in runtime config",
+            )
+        })?;
+        let encryption = config.encryption.ok_or_else(|| {
+            imap_error(
+                ImapErrorKind::Connection,
+                "missing imap.encryption in runtime config",
+            )
+        })?;
+
+        let tcp_stream = connect_tcp(config, server, port)?;
+        let transport = match encryption {
+            ImapEncryption::Tls => ImapTransport::Tls(Box::new(connect_tls(server, tcp_stream)?)),
+            ImapEncryption::Starttls | ImapEncryption::None => ImapTransport::Plain(tcp_stream),
+        };
+
+        let mut session = Self {
+            transport,
+            read_buffer: Vec::new(),
+            next_tag: 1,
+            capabilities: HashSet::new(),
+        };
+
+        let greeting = session.read_greeting()?;
+        if matches!(encryption, ImapEncryption::Starttls) {
+            session.command_ok("STARTTLS", ImapErrorKind::Connection)?;
+            session.transport = match session.transport {
+                ImapTransport::Plain(stream) => {
+                    ImapTransport::Tls(Box::new(connect_tls(server, stream)?))
+                }
+                ImapTransport::Tls(_) => {
+                    return Err(imap_error(
+                        ImapErrorKind::Connection,
+                        "STARTTLS attempted on TLS transport",
+                    ));
+                }
+            };
+            session.read_buffer.clear();
+        }
+
+        session.capabilities = session.fetch_capabilities()?;
+        if !matches!(greeting, GreetingKind::Preauth) {
+            session.login(config)?;
+        }
+
+        Ok(session)
+    }
+
+    fn read_greeting(&mut self) -> Result<GreetingKind> {
+        let line = self.read_line_string()?;
+        let upper = line.to_ascii_uppercase();
+        if upper.starts_with("* PREAUTH") {
+            Ok(GreetingKind::Preauth)
+        } else if upper.starts_with("* OK") {
+            Ok(GreetingKind::Ok)
+        } else if upper.starts_with("* BYE") {
+            Err(imap_error(
+                ImapErrorKind::Connection,
+                format!("server closed connection during greeting: {line}"),
+            ))
+        } else {
+            Err(imap_error(
+                ImapErrorKind::Connection,
+                format!("unexpected IMAP greeting: {line}"),
+            ))
+        }
+    }
+
+    fn login(&mut self, config: &ImapConfig) -> Result<()> {
+        let user = config.login_user().ok_or_else(|| {
+            imap_error(
+                ImapErrorKind::Authentication,
+                "missing imap.user in runtime config",
+            )
+        })?;
+        let pass = config.pass.as_deref().ok_or_else(|| {
+            imap_error(
+                ImapErrorKind::Authentication,
+                "missing imap.pass in runtime config",
+            )
+        })?;
+
+        if config.encryption == Some(ImapEncryption::None)
+            && self.capabilities.contains("LOGINDISABLED")
+        {
+            return Err(imap_error(
+                ImapErrorKind::Authentication,
+                "server disallows LOGIN over plaintext connections",
+            ));
+        }
+
+        self.command_ok(
+            &format!(
+                "LOGIN {} {}",
+                quote_imap_string(user),
+                quote_imap_string(pass)
+            ),
+            ImapErrorKind::Authentication,
+        )
+    }
+
+    fn fetch_capabilities(&mut self) -> Result<HashSet<String>> {
+        let lines = self.command_ok_lines("CAPABILITY", ImapErrorKind::Protocol)?;
+        let mut capabilities = HashSet::new();
+
+        for line in lines {
+            let upper = line.to_ascii_uppercase();
+            if !upper.starts_with("* CAPABILITY ") {
+                continue;
+            }
+
+            for token in line.split_whitespace().skip(2) {
+                capabilities.insert(token.trim().to_ascii_uppercase());
+            }
+        }
+
+        Ok(capabilities)
+    }
+
+    fn select_mailbox(&mut self, mailbox: &str) -> Result<MailboxSnapshot> {
+        let lines = self.command_ok_lines(
+            &format!("SELECT {}", quote_imap_string(mailbox)),
+            ImapErrorKind::MailboxSelection,
+        )?;
+
+        let mut uidvalidity = None;
+        let mut uidnext = None;
+        let mut highest_modseq = None;
+
+        for line in lines {
+            if let Some(value) = parse_status_code_u64(&line, "UIDVALIDITY") {
+                uidvalidity = Some(value);
+            }
+            if let Some(value) = parse_status_code_u64(&line, "UIDNEXT") {
+                uidnext = Some(value as u32);
+            }
+            if let Some(value) = parse_status_code_u64(&line, "HIGHESTMODSEQ") {
+                highest_modseq = Some(value);
+            }
+        }
+
+        Ok(MailboxSnapshot {
+            uidvalidity: uidvalidity.unwrap_or(1),
+            highest_uid: uidnext.unwrap_or(1).saturating_sub(1),
+            highest_modseq,
+        })
+    }
+
+    fn search_uid_range(&mut self, first_uid: u32) -> Result<Vec<u32>> {
+        self.search_uids(&format!("UID SEARCH UID {first_uid}:*"))
+    }
+
+    fn search_modseq(&mut self, modseq: u64) -> Result<Vec<u32>> {
+        self.search_uids(&format!("UID SEARCH MODSEQ {modseq}"))
+    }
+
+    fn search_uids(&mut self, command: &str) -> Result<Vec<u32>> {
+        let lines = self.command_ok_lines(command, ImapErrorKind::Protocol)?;
+        let mut uids = BTreeSet::new();
+
+        for line in lines {
+            let upper = line.to_ascii_uppercase();
+            if !upper.starts_with("* SEARCH") {
+                continue;
+            }
+            for token in line.split_whitespace().skip(2) {
+                if let Ok(uid) = token.parse::<u32>() {
+                    uids.insert(uid);
+                }
+            }
+        }
+
+        Ok(uids.into_iter().collect())
+    }
+
+    fn fetch_uids(&mut self, uids: &[u32], body_peek: &str) -> Result<Vec<RemoteMail>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut fetched = Vec::new();
+        for chunk in uids.chunks(IMAP_FETCH_BATCH_SIZE) {
+            fetched.extend(self.fetch_uid_chunk(chunk, body_peek)?);
+        }
+        fetched.sort_by_key(|mail| mail.uid);
+        Ok(fetched)
+    }
+
+    fn fetch_uid_chunk(&mut self, uids: &[u32], body_peek: &str) -> Result<Vec<RemoteMail>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tag = self.next_tag();
+        let uid_set = format_uid_sequence_set(uids);
+        self.write_command(
+            &tag,
+            &format!("UID FETCH {uid_set} (UID FLAGS MODSEQ {body_peek})"),
+        )?;
+
+        let mut fetched = Vec::new();
+        loop {
+            let line = self.read_line_string()?;
+            if line.starts_with('*') {
+                if !line.to_ascii_uppercase().contains(" FETCH (") {
+                    continue;
+                }
+
+                let fetched_uid = parse_fetch_uid(&line).ok_or_else(|| {
+                    imap_error(
+                        ImapErrorKind::Protocol,
+                        format!("missing UID in FETCH response: {line}"),
+                    )
+                })?;
+                let flags = parse_fetch_flags(&line);
+                let modseq = parse_fetch_modseq(&line);
+                let literal_len = parse_literal_len(&line).ok_or_else(|| {
+                    imap_error(
+                        ImapErrorKind::Protocol,
+                        format!("missing literal size in FETCH response: {line}"),
+                    )
+                })?;
+                let raw = self.read_exact_bytes(literal_len)?;
+                self.consume_fetch_trailer()?;
+                fetched.push(RemoteMail {
+                    uid: fetched_uid,
+                    modseq,
+                    flags,
+                    raw,
+                });
+                continue;
+            }
+
+            if line.starts_with(&tag) {
+                ensure_tagged_ok(&line, ImapErrorKind::Protocol)?;
+                return Ok(fetched);
+            }
+        }
+    }
+
+    fn consume_fetch_trailer(&mut self) -> Result<()> {
+        loop {
+            let line = self.read_line_string()?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.trim_end().ends_with(')') {
+                return Ok(());
+            }
+            if line.starts_with('A') {
+                return Err(imap_error(
+                    ImapErrorKind::Protocol,
+                    format!("truncated FETCH trailer before tagged completion: {line}"),
+                ));
+            }
+        }
+    }
+
+    fn command_ok(&mut self, command: &str, kind: ImapErrorKind) -> Result<()> {
+        self.command_ok_lines(command, kind).map(|_| ())
+    }
+
+    fn command_ok_lines(&mut self, command: &str, kind: ImapErrorKind) -> Result<Vec<String>> {
+        let tag = self.next_tag();
+        self.write_command(&tag, command)?;
+
+        let mut lines = Vec::new();
+        loop {
+            let line = self.read_line_string()?;
+            if line.starts_with(&tag) {
+                ensure_tagged_ok(&line, kind)?;
+                return Ok(lines);
+            }
+            lines.push(line);
+        }
+    }
+
+    fn next_tag(&mut self) -> String {
+        let tag = format!("A{:04}", self.next_tag);
+        self.next_tag = self.next_tag.saturating_add(1);
+        tag
+    }
+
+    fn write_command(&mut self, tag: &str, command: &str) -> Result<()> {
+        let payload = format!("{tag} {command}\r\n");
+        self.transport
+            .write_all(payload.as_bytes())
+            .map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Imap,
+                    format!("failed to write IMAP command '{command}'"),
+                    error,
+                )
+            })?;
+        self.transport.flush().map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Imap,
+                format!("failed to flush IMAP command '{command}'"),
+                error,
+            )
+        })
+    }
+
+    fn read_line_string(&mut self) -> Result<String> {
+        let bytes = self.read_line_bytes()?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn read_line_bytes(&mut self) -> Result<Vec<u8>> {
+        loop {
+            if let Some(position) = self.read_buffer.iter().position(|byte| *byte == b'\n') {
+                let mut line: Vec<u8> = self.read_buffer.drain(..=position).collect();
+                if line.last() == Some(&b'\n') {
+                    line.pop();
+                }
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(line);
+            }
+
+            let mut chunk = [0u8; 4096];
+            let read = self.transport.read(&mut chunk).map_err(|error| {
+                CourierError::with_source(ErrorCode::Imap, "failed to read from IMAP socket", error)
+            })?;
+            if read == 0 {
+                return Err(imap_error(
+                    ImapErrorKind::Connection,
+                    "unexpected EOF while reading IMAP response",
+                ));
+            }
+            self.read_buffer.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    fn read_exact_bytes(&mut self, len: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len);
+        let drain = len.min(self.read_buffer.len());
+        out.extend(self.read_buffer.drain(..drain));
+
+        while out.len() < len {
+            let remaining = len - out.len();
+            let mut chunk = vec![0u8; remaining.min(4096)];
+            let read = self.transport.read(&mut chunk).map_err(|error| {
+                CourierError::with_source(ErrorCode::Imap, "failed to read IMAP literal", error)
+            })?;
+            if read == 0 {
+                return Err(imap_error(
+                    ImapErrorKind::Connection,
+                    "unexpected EOF while reading IMAP literal",
+                ));
+            }
+            out.extend_from_slice(&chunk[..read]);
+        }
+
+        Ok(out)
+    }
+}
+
+fn format_uid_sequence_set(uids: &[u32]) -> String {
+    if uids.is_empty() {
+        return String::new();
+    }
+
+    let mut ordered: Vec<u32> = uids.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+
+    let mut parts = Vec::new();
+    let mut start = ordered[0];
+    let mut end = ordered[0];
+
+    for uid in ordered.into_iter().skip(1) {
+        if uid == end.saturating_add(1) {
+            end = uid;
+            continue;
+        }
+        parts.push(render_uid_range(start, end));
+        start = uid;
+        end = uid;
+    }
+    parts.push(render_uid_range(start, end));
+
+    parts.join(",")
+}
+
+fn render_uid_range(start: u32, end: u32) -> String {
+    if start == end {
+        start.to_string()
+    } else {
+        format!("{start}:{end}")
+    }
+}
+
+fn parse_imap_proxy(proxy_url: &str) -> Result<ImapProxy> {
+    let parsed = reqwest::Url::parse(proxy_url).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::ConfigParse,
+            format!("invalid IMAP proxy URL '{proxy_url}'"),
+            error,
+        )
+    })?;
+
+    let scheme = match parsed.scheme() {
+        "http" => ImapProxyScheme::Http,
+        "socks5" | "socks5h" => ImapProxyScheme::Socks5,
+        unsupported => {
+            return Err(CourierError::new(
+                ErrorCode::ConfigParse,
+                format!(
+                    "unsupported IMAP proxy scheme '{unsupported}'; use http://, socks5://, or socks5h://"
+                ),
+            ));
+        }
+    };
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(CourierError::new(
+            ErrorCode::ConfigParse,
+            "IMAP proxy authentication is not supported yet; use an unauthenticated local proxy",
+        ));
+    }
+
+    if parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !(parsed.path().is_empty() || parsed.path() == "/")
+    {
+        return Err(CourierError::new(
+            ErrorCode::ConfigParse,
+            format!("invalid IMAP proxy URL '{proxy_url}': remove path, query, and fragment"),
+        ));
+    }
+
+    let host = parsed.host_str().ok_or_else(|| {
+        CourierError::new(
+            ErrorCode::ConfigParse,
+            format!("invalid IMAP proxy URL '{proxy_url}': missing host"),
+        )
+    })?;
+    let port = parsed.port().unwrap_or(match scheme {
+        ImapProxyScheme::Http => 80,
+        ImapProxyScheme::Socks5 => 1080,
+    });
+
+    Ok(ImapProxy {
+        scheme,
+        host: host.to_string(),
+        port,
+    })
+}
+
+fn configure_tcp_timeouts(stream: &TcpStream, label: &str) -> Result<()> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(REMOTE_IMAP_TIMEOUT_SECS)))
+        .map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Imap,
+                format!("failed to configure IMAP read timeout for {label}"),
+                error,
+            )
+        })?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(REMOTE_IMAP_TIMEOUT_SECS)))
+        .map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Imap,
+                format!("failed to configure IMAP write timeout for {label}"),
+                error,
+            )
+        })?;
+
+    Ok(())
+}
+
+fn connect_direct_tcp(server: &str, port: u16) -> Result<TcpStream> {
+    let stream = TcpStream::connect((server, port)).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!("failed to connect to IMAP server {server}:{port}"),
+            error,
+        )
+    })?;
+    configure_tcp_timeouts(&stream, &format!("IMAP server {server}:{port}"))?;
+
+    Ok(stream)
+}
+
+fn read_http_proxy_response<S: Read>(
+    stream: &mut S,
+    proxy: &ImapProxy,
+    target: &str,
+) -> Result<String> {
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while !response.ends_with(b"\r\n\r\n") {
+        let read = stream.read(&mut byte).map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Imap,
+                format!(
+                    "failed while reading IMAP proxy {} response for {target}",
+                    proxy.redacted_url()
+                ),
+                error,
+            )
+        })?;
+        if read == 0 {
+            return Err(CourierError::new(
+                ErrorCode::Imap,
+                format!(
+                    "IMAP proxy {} closed the connection before CONNECT to {target} completed",
+                    proxy.redacted_url()
+                ),
+            ));
+        }
+        response.push(byte[0]);
+        if response.len() > HTTP_PROXY_RESPONSE_MAX_BYTES {
+            return Err(CourierError::new(
+                ErrorCode::Imap,
+                format!(
+                    "IMAP proxy {} sent too much HTTP response data while tunneling {target}",
+                    proxy.redacted_url()
+                ),
+            ));
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+fn establish_http_connect_tunnel<S: Read + Write>(
+    stream: &mut S,
+    proxy: &ImapProxy,
+    server: &str,
+    port: u16,
+) -> Result<()> {
+    let target = format!("{server}:{port}");
+    let request = format!(
+        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to send IMAP CONNECT request through proxy {} for {target}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+    stream.flush().map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to flush IMAP CONNECT request through proxy {} for {target}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+
+    let response = read_http_proxy_response(stream, proxy, &target)?;
+    let status_line = response
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('\r')
+        .to_string();
+    let mut parts = status_line.split_whitespace();
+    let protocol = parts.next().unwrap_or_default();
+    let status_code = parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or_default();
+    if !protocol.starts_with("HTTP/") || !(200..300).contains(&status_code) {
+        return Err(CourierError::new(
+            ErrorCode::Imap,
+            format!(
+                "IMAP proxy {} rejected CONNECT to {target}: {status_line}",
+                proxy.redacted_url()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn read_socks5_reply_address<S: Read>(stream: &mut S, proxy: &ImapProxy) -> Result<()> {
+    let mut atyp = [0u8; 1];
+    stream.read_exact(&mut atyp).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to read SOCKS5 reply type from IMAP proxy {}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+    let address_len = match atyp[0] {
+        0x01 => 4usize,
+        0x03 => {
+            let mut length = [0u8; 1];
+            stream.read_exact(&mut length).map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Imap,
+                    format!(
+                        "failed to read SOCKS5 domain length from IMAP proxy {}",
+                        proxy.redacted_url()
+                    ),
+                    error,
+                )
+            })?;
+            length[0] as usize
+        }
+        0x04 => 16usize,
+        value => {
+            return Err(CourierError::new(
+                ErrorCode::Imap,
+                format!(
+                    "IMAP proxy {} returned unsupported SOCKS5 address type 0x{value:02x}",
+                    proxy.redacted_url()
+                ),
+            ));
+        }
+    };
+
+    let mut discard = vec![0u8; address_len + 2];
+    stream.read_exact(&mut discard).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to read SOCKS5 bind address from IMAP proxy {}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+    Ok(())
+}
+
+fn socks5_reply_text(code: u8) -> &'static str {
+    match code {
+        0x01 => "general SOCKS server failure",
+        0x02 => "connection not allowed by ruleset",
+        0x03 => "network unreachable",
+        0x04 => "host unreachable",
+        0x05 => "connection refused",
+        0x06 => "TTL expired",
+        0x07 => "command not supported",
+        0x08 => "address type not supported",
+        _ => "unknown SOCKS5 error",
+    }
+}
+
+fn establish_socks5_tunnel<S: Read + Write>(
+    stream: &mut S,
+    proxy: &ImapProxy,
+    server: &str,
+    port: u16,
+) -> Result<()> {
+    stream.write_all(&[0x05, 0x01, 0x00]).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to send SOCKS5 greeting to IMAP proxy {}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+
+    let mut greeting_reply = [0u8; 2];
+    stream.read_exact(&mut greeting_reply).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to read SOCKS5 greeting reply from IMAP proxy {}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+    if greeting_reply[0] != 0x05 {
+        return Err(CourierError::new(
+            ErrorCode::Imap,
+            format!(
+                "IMAP proxy {} returned invalid SOCKS5 version 0x{:02x}",
+                proxy.redacted_url(),
+                greeting_reply[0]
+            ),
+        ));
+    }
+    if greeting_reply[1] != 0x00 {
+        return Err(CourierError::new(
+            ErrorCode::Imap,
+            format!(
+                "IMAP proxy {} does not allow unauthenticated SOCKS5 connections",
+                proxy.redacted_url()
+            ),
+        ));
+    }
+
+    let host = server.as_bytes();
+    if host.len() > u8::MAX as usize {
+        return Err(CourierError::new(
+            ErrorCode::Imap,
+            format!("IMAP server name '{server}' is too long for SOCKS5 proxying"),
+        ));
+    }
+
+    let mut request = Vec::with_capacity(4 + 1 + host.len() + 2);
+    request.extend_from_slice(&[0x05, 0x01, 0x00, 0x03, host.len() as u8]);
+    request.extend_from_slice(host);
+    request.extend_from_slice(&port.to_be_bytes());
+    stream.write_all(&request).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to send SOCKS5 CONNECT request through IMAP proxy {}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+
+    let mut reply = [0u8; 3];
+    stream.read_exact(&mut reply).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to read SOCKS5 CONNECT status from IMAP proxy {}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+    if reply[0] != 0x05 {
+        return Err(CourierError::new(
+            ErrorCode::Imap,
+            format!(
+                "IMAP proxy {} returned invalid SOCKS5 version 0x{:02x}",
+                proxy.redacted_url(),
+                reply[0]
+            ),
+        ));
+    }
+    if reply[1] != 0x00 {
+        return Err(CourierError::new(
+            ErrorCode::Imap,
+            format!(
+                "IMAP proxy {} failed to connect to {server}:{port}: {}",
+                proxy.redacted_url(),
+                socks5_reply_text(reply[1])
+            ),
+        ));
+    }
+    read_socks5_reply_address(stream, proxy)?;
+
+    Ok(())
+}
+
+fn connect_tcp_via_proxy(proxy: &ImapProxy, server: &str, port: u16) -> Result<TcpStream> {
+    let target = format!("{server}:{port}");
+    let stream = TcpStream::connect((proxy.host.as_str(), proxy.port)).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!(
+                "failed to connect to IMAP proxy {} for {target}",
+                proxy.redacted_url()
+            ),
+            error,
+        )
+    })?;
+    configure_tcp_timeouts(&stream, &format!("IMAP proxy {}", proxy.redacted_url()))?;
+
+    let mut stream = stream;
+    match proxy.scheme {
+        ImapProxyScheme::Http => establish_http_connect_tunnel(&mut stream, proxy, server, port)?,
+        ImapProxyScheme::Socks5 => establish_socks5_tunnel(&mut stream, proxy, server, port)?,
+    }
+
+    Ok(stream)
+}
+
+fn connect_tcp(config: &ImapConfig, server: &str, port: u16) -> Result<TcpStream> {
+    if let Some(proxy_url) = config.proxy.as_deref() {
+        let proxy = parse_imap_proxy(proxy_url)?;
+        tracing::info!(
+            op = "imap_connect",
+            mode = "proxy",
+            proxy = %proxy.redacted_url(),
+            target = %format!("{server}:{port}")
+        );
+        connect_tcp_via_proxy(&proxy, server, port)
+    } else {
+        connect_direct_tcp(server, port)
+    }
+}
+
+fn connect_tls(
+    server: &str,
+    stream: TcpStream,
+) -> Result<StreamOwned<ClientConnection, TcpStream>> {
+    let root_store = RootCertStore::from_iter(TLS_SERVER_ROOTS.iter().cloned());
+    let client_config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Imap,
+                    "failed to configure TLS protocol versions for IMAP client",
+                    error,
+                )
+            })?
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+    let server_name = ServerName::try_from(server.to_string()).map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Imap,
+            format!("invalid IMAP server name '{server}' for TLS"),
+            error,
+        )
+    })?;
+    let connection =
+        ClientConnection::new(Arc::new(client_config), server_name).map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Imap,
+                format!("failed to initialize TLS session for IMAP server '{server}'"),
+                error,
+            )
+        })?;
+
+    Ok(StreamOwned::new(connection, stream))
+}
+
+fn quote_imap_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn ensure_tagged_ok(line: &str, kind: ImapErrorKind) -> Result<()> {
+    let mut parts = line.split_whitespace();
+    let _tag = parts.next();
+    match parts
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "OK" => Ok(()),
+        _ => Err(imap_error(kind, line.to_string())),
+    }
+}
+
+fn parse_status_code_u64(line: &str, key: &str) -> Option<u64> {
+    let needle = format!("[{key} ");
+    let start = line.find(&needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest.find(']')?;
+    rest[..end].trim().parse::<u64>().ok()
+}
+
+fn parse_fetch_uid(line: &str) -> Option<u32> {
+    parse_numeric_token(line, "UID ").and_then(|value| value.parse::<u32>().ok())
+}
+
+fn parse_fetch_modseq(line: &str) -> Option<u64> {
+    parse_numeric_token(line, "MODSEQ (").and_then(|value| value.parse::<u64>().ok())
+}
+
+fn parse_numeric_token<'a>(line: &'a str, needle: &str) -> Option<&'a str> {
+    let start = line.find(needle)? + needle.len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    if end == 0 { None } else { Some(&rest[..end]) }
+}
+
+fn parse_fetch_flags(line: &str) -> Vec<String> {
+    let Some(start) = line.find("FLAGS (") else {
+        return Vec::new();
+    };
+    let rest = &line[start + "FLAGS (".len()..];
+    let Some(end) = rest.find(')') else {
+        return Vec::new();
+    };
+    split_flags(&rest[..end])
+}
+
+fn parse_literal_len(line: &str) -> Option<usize> {
+    let trimmed = line.trim_end();
+    let suffix = trimmed.strip_suffix('}')?;
+    let start = suffix.rfind('{')?;
+    suffix[start + 1..].parse::<usize>().ok()
+}
+
 #[derive(Debug, Clone)]
 struct FixtureEntry {
     path: PathBuf,
@@ -716,13 +1822,19 @@ fn classify(kind: ImapErrorKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Read, Write};
     use std::path::PathBuf;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use crate::infra::config::{ImapConfig, ImapEncryption};
+
     use super::{
-        FixtureImapClient, ImapClient, lore_raw_url_candidates, parse_atom_timestamp,
-        parse_lore_atom_entries,
+        FixtureImapClient, ImapClient, ImapErrorKind, RemoteImapClient, ensure_tagged_ok,
+        establish_http_connect_tunnel, establish_socks5_tunnel, format_uid_sequence_set,
+        lore_raw_url_candidates, parse_atom_timestamp, parse_fetch_flags, parse_fetch_modseq,
+        parse_fetch_uid, parse_imap_proxy, parse_literal_len, parse_lore_atom_entries,
+        parse_status_code_u64,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -733,6 +1845,47 @@ mod tests {
         let path = std::env::temp_dir().join(format!("courier-imap-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[derive(Default)]
+    struct MockStream {
+        reads: Vec<u8>,
+        read_offset: usize,
+        writes: Vec<u8>,
+    }
+
+    impl MockStream {
+        fn with_reads(reads: &[u8]) -> Self {
+            Self {
+                reads: reads.to_vec(),
+                read_offset: 0,
+                writes: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for MockStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.read_offset >= self.reads.len() {
+                return Ok(0);
+            }
+            let available = self.reads.len() - self.read_offset;
+            let count = available.min(buf.len());
+            buf[..count].copy_from_slice(&self.reads[self.read_offset..self.read_offset + count]);
+            self.read_offset += count;
+            Ok(count)
+        }
+    }
+
+    impl Write for MockStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -786,6 +1939,133 @@ mod tests {
         assert_eq!(snapshot.uidvalidity, 9001);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_client_accepts_complete_config() {
+        let client = RemoteImapClient::new(ImapConfig {
+            email: Some("me@example.com".to_string()),
+            user: Some("imap-user".to_string()),
+            pass: Some("imap-pass".to_string()),
+            server: Some("imap.example.com".to_string()),
+            server_port: Some(993),
+            encryption: Some(ImapEncryption::Tls),
+            proxy: None,
+        });
+
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn remote_client_rejects_incomplete_config() {
+        let error = RemoteImapClient::new(ImapConfig {
+            email: None,
+            user: Some("imap-user".to_string()),
+            pass: None,
+            server: Some("imap.example.com".to_string()),
+            server_port: Some(993),
+            encryption: Some(ImapEncryption::Tls),
+            proxy: None,
+        })
+        .err()
+        .expect("incomplete config should fail");
+
+        assert!(error.to_string().contains("imap.pass"));
+    }
+
+    #[test]
+    fn parses_imap_fetch_metadata() {
+        let line = "* 2 FETCH (UID 2 FLAGS (\\Seen \\Answered) MODSEQ (20) BODY[] {123}";
+        assert_eq!(parse_fetch_uid(line), Some(2));
+        assert_eq!(parse_fetch_modseq(line), Some(20));
+        assert_eq!(parse_literal_len(line), Some(123));
+        assert_eq!(
+            parse_fetch_flags(line),
+            vec!["\\Seen".to_string(), "\\Answered".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_select_status_codes() {
+        assert_eq!(
+            parse_status_code_u64("* OK [UIDVALIDITY 77] UIDs valid", "UIDVALIDITY"),
+            Some(77)
+        );
+        assert_eq!(
+            parse_status_code_u64("* OK [UIDNEXT 42] Predicted next UID", "UIDNEXT"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_status_code_u64("* OK [HIGHESTMODSEQ 9001] Highest", "HIGHESTMODSEQ"),
+            Some(9001)
+        );
+    }
+
+    #[test]
+    fn tagged_errors_keep_imap_error_classification() {
+        let error = ensure_tagged_ok(
+            "A0002 NO [AUTHENTICATIONFAILED] invalid credentials",
+            ImapErrorKind::Authentication,
+        )
+        .expect_err("tagged failure should surface");
+
+        assert!(error.to_string().contains("authentication"));
+    }
+
+    #[test]
+    fn tls_client_config_uses_explicit_crypto_provider() {
+        let root_store =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let _config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("configure protocol versions")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    }
+
+    #[test]
+    fn uid_sequence_set_compacts_contiguous_ranges() {
+        assert_eq!(format_uid_sequence_set(&[1, 2, 3, 5, 8, 9]), "1:3,5,8:9");
+        assert_eq!(format_uid_sequence_set(&[5]), "5");
+        assert_eq!(format_uid_sequence_set(&[9, 7, 8, 8]), "7:9");
+    }
+
+    #[test]
+    fn http_proxy_connect_tunnels_imap_socket() {
+        let proxy = parse_imap_proxy("http://127.0.0.1:7890").expect("parse proxy");
+        let mut stream = MockStream::with_reads(b"HTTP/1.1 200 Connection established\r\n\r\n");
+
+        establish_http_connect_tunnel(&mut stream, &proxy, "imap.gmail.com", 993)
+            .expect("proxy tunnel should connect");
+
+        let request_text = String::from_utf8(stream.writes).expect("request utf8");
+        assert!(request_text.starts_with("CONNECT imap.gmail.com:993 HTTP/1.1\r\n"));
+        assert!(request_text.contains("\r\nHost: imap.gmail.com:993\r\n"));
+    }
+
+    #[test]
+    fn socks5_proxy_connect_tunnels_imap_socket() {
+        let proxy = parse_imap_proxy("socks5://127.0.0.1:7890").expect("parse proxy");
+        let mut stream = MockStream::with_reads(&[
+            0x05, 0x00, // greeting reply
+            0x05, 0x00, 0x00, // connect reply status
+            0x03, 0x0e, b'i', b'm', b'a', b'p', b'.', b'g', b'm', b'a', b'i', b'l', b'.', b'c',
+            b'o', b'm', 0x03, 0xe1, // bound address + port
+        ]);
+
+        establish_socks5_tunnel(&mut stream, &proxy, "imap.gmail.com", 993)
+            .expect("proxy tunnel should connect");
+
+        assert_eq!(
+            stream.writes,
+            [
+                0x05, 0x01, 0x00, // greeting
+                0x05, 0x01, 0x00, 0x03, 14, b'i', b'm', b'a', b'p', b'.', b'g', b'm', b'a', b'i',
+                b'l', b'.', b'c', b'o', b'm', 0x03, 0xe1
+            ]
+        );
     }
 
     #[test]
