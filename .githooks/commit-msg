@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+message_file=${1:?missing commit message file}
+
+comment_char="$(git config --get core.commentChar || true)"
+if [[ -z "${comment_char}" || "${comment_char}" == "auto" ]]; then
+    comment_char="#"
+fi
+
+subject="$(
+    awk -v comment_char="${comment_char}" '
+        {
+            trimmed = $0
+            sub(/^[[:space:]]+/, "", trimmed)
+            if (trimmed == "") {
+                next
+            }
+            if (substr(trimmed, 1, length(comment_char)) == comment_char) {
+                next
+            }
+            print trimmed
+            exit
+        }
+    ' "${message_file}"
+)"
+
+if [[ -z "${subject}" ]]; then
+    printf '%s\n' "commit message subject is empty" >&2
+    exit 1
+fi
+
+if [[ "${subject}" =~ ^(Merge|Revert)\  ]]; then
+    exit 0
+fi
+
+if [[ "${subject}" =~ ^(fixup\!\ |squash\!\ ) ]]; then
+    subject=${subject#*! }
+fi
+
+conventional_subject_pattern='^(feat|fix|docs|refactor|test|chore)(\([^)[:space:]]+\))?: .+'
+
+if [[ ! "${subject}" =~ ${conventional_subject_pattern} ]]; then
+    cat >&2 <<'EOF'
+commit message subject must use one of:
+  feat: summary
+  feat(scope): summary
+  fix: summary
+  docs: summary
+  refactor: summary
+  test: summary
+  chore: summary
+
+Rules from docs/code-guildline-cn.md:
+- keep one logical change per commit
+- use an imperative subject after the prefix
+- keep the subject line within 72 characters when possible
+EOF
+    exit 1
+fi
+
+subject_length=${#subject}
+if (( subject_length > 72 )); then
+    printf '%s\n' \
+        "warning: commit subject is ${subject_length} characters; keep it within 72 when possible" \
+        >&2
+fi

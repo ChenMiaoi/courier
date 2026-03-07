@@ -81,6 +81,7 @@
 
 提交信息策略（兼容本项目规范与参考的 Asterinas 规则）：
 - 保留本项目 Conventional Commit 前缀：`feat:`、`fix:`、`docs:`、`refactor:`、`test:`、`chore:`。
+- 可选使用 scope，格式如：`feat(ci): ...`、`fix(sync): ...`。
 - 前缀后的主题句使用祈使语气，描述清晰。
 - 主题行尽量不超过 72 字符。
 

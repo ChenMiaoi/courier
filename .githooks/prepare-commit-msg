@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+message_file=${1:?missing commit message file}
+commit_source=${2-}
+
+if [[ -n "${commit_source}" ]]; then
+    exit 0
+fi
+
+comment_char="$(git config --get core.commentChar || true)"
+if [[ -z "${comment_char}" || "${comment_char}" == "auto" ]]; then
+    comment_char="#"
+fi
+
+marker="${comment_char} Courier commit message guide"
+
+if grep -Fq "${marker}" "${message_file}"; then
+    exit 0
+fi
+
+if grep -Eq "^[[:space:]]*[^${comment_char}[:space:]]" "${message_file}"; then
+    exit 0
+fi
+
+cat <<EOF >> "${message_file}"
+${comment_char} Courier commit message guide
+${comment_char}
+${comment_char} Allowed forms:
+${comment_char}   feat: imperative summary
+${comment_char}   feat(scope): imperative summary
+${comment_char}   fix: imperative summary
+${comment_char}   docs: imperative summary
+${comment_char}   refactor: imperative summary
+${comment_char}   test: imperative summary
+${comment_char}   chore: imperative summary
+${comment_char}
+${comment_char} Rules from docs/code-guildline-cn.md:
+${comment_char} - one commit for one logical change
+${comment_char} - use an imperative subject after the prefix
+${comment_char} - keep the subject line within 72 characters when possible
+EOF

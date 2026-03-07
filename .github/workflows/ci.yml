@@ -15,12 +15,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Check commit messages
+        env:
+          CI_COMMIT_BEFORE: ${{ github.event.before }}
+          CI_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/check-commit-messages.sh
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

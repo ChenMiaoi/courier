@@ -1,165 +1,202 @@
 # Courier
 
-Courier 是一个基于 Rust 的终端内核 patch 邮件工作流工具，面向 Linux kernel 邮件列表协作场景。
+Courier is a Rust TUI for Linux kernel patch mail workflows.
 
-当前实现（M8）支持：
-- CLI: `tui` / `sync` / `doctor` / `version`
-- SQLite 初始化与迁移
-- 从 `lore.kernel.org` 同步邮件并构建线程
-- 空库首次同步仅拉取最近 20 个 threads
-- 后续按 checkpoint 做增量更新
-- 真实 IMAP `INBOX` 同步，支持 `ssl`/`tls`、`starttls`、`none`
-- IMAP 代理支持：`http://`、`socks5://`、`socks5h://`
-- `My Inbox` 内置订阅：IMAP 配置完整时首次默认启用，并参与启动自动同步
-- `My Inbox` 在 TUI 打开期间会按可配置周期做后台增量同步（默认 30 秒）
-- `My Inbox` 首次同步优化：先抓 header，再只下载最新 20 个 patch 相关 threads 的完整 raw
-- `INBOX` 只保留 patch 相关邮件，历史非 patch 邮件会在后续同步时 prune
-- TUI 订阅启用状态与分组展开状态持久化
-- 启动 TUI 后后台自动同步已启用订阅（不阻塞首屏），并显示同步进度与完成摘要
-- 启动自动同步支持配置项 `ui.startup_sync`（默认开启）
-- 同步失败与 panic 会被隔离为状态栏/日志错误，不再直接打断 TUI
-- patch series 识别（`[PATCH vN M/N]`）、完整性校验（缺片/重复/乱序）
-- TUI `a`（apply）/`d`（download）/`u`（undo 上次 apply）封装调用 b4 + git
-- patch 执行状态与日志回写（`new/reviewing/applied/failed/conflict`）
-- 代码浏览页（Kernel Tree + Source Preview）
-- Code Preview VM1 内联 Vim-like 编辑（`Browse/Normal/Insert/Command`）
-- VM1 最小命令集：`s`、`:w`、`:q`、`:q!`、`:wq`（含 dirty 规则）
-- Code Preview VM2 外部 Vim 编辑（`E`/`:vim`），支持 `VISUAL -> EDITOR -> vim` 选择顺序
-- 外部 Vim 退出后自动恢复终端状态并刷新预览内容
-- 命令栏 `config` 已升级为可视化配置面板，并保留 `config get/set` 文本入口
-- 预览区会对非纯文本 / MIME / HTML / 编码邮件显示显眼警告
-- 关键用户操作日志统一为 `op/status` 结构（apply/undo/sync/config/vim/local command 等）
-- 命令栏支持本地命令（`!<shell command>`）与路径补全
-- Mail Preview 回信面板（`e` / `r`）：自动填充 `From/To/Cc/Subject/In-Reply-To/References`
-- 回信草稿自动生成 kernel 风格引用正文，并在 `To/Cc` 构造与预览阶段去重、移除自己地址
-- 回信编辑沿用最小 Vim-like 状态机（`NORMAL / INSERT / COMMAND`）
-- `Send Preview -> Confirm -> Send` 已打通，底层通过 `git send-email` 发送真实回信
-- 回信发送结果会持久化记录 `Message-ID`、状态、退出码、stderr 摘要与确认时间
-- `doctor` 会检查 `git send-email` 可用性和默认回信身份（git email）
+It is built for developers who work on mailing-list-driven review, especially in Linux kernel style flows, and want a terminal-first tool that keeps subscription, sync, review, patch application, and reply in one local workflow.
 
-详细设计与里程碑见：
-- [docs/design.md](docs/design.md)
-- [docs/mvp-milestones.md](docs/mvp-milestones.md)
-- [docs/reply-format-spec.md](docs/reply-format-spec.md)
-- [docs/reply-mvp-milestones.md](docs/reply-mvp-milestones.md)
+Chinese usage guide: [README-zh.md](README-zh.md)
 
-## 快速开始
+## Status
 
-### 依赖
-- Rust (stable)
-- Python 3（用于构建阶段处理 `vendor/b4`，无则会降级为 warning）
+Courier is under active development. The current `develop` branch already covers the core workflow:
 
-### 安装
+- sync mail from `lore.kernel.org`
+- sync a real IMAP `INBOX` through the built-in `My Inbox` subscription
+- browse threads and detect patch series
+- apply or export patches through `b4`
+- compose and send replies from the TUI through `git send-email`
 
-从源码仓库安装（clone 后在仓库根目录执行）：
+## Features
+
+- Rust CLI with `courier tui`, `courier sync`, `courier doctor`, and `courier version`
+- local SQLite storage with automatic runtime bootstrap
+- incremental lore sync with checkpoint-based updates
+- real IMAP `INBOX` sync with patch-oriented filtering
+- background startup sync for enabled subscriptions
+- periodic auto-sync for `My Inbox`
+- patch series detection for subjects like `[PATCH vN M/N]`
+- patch apply/export workflow powered by `b4`
+- undo for the most recent successful apply in the current session
+- kernel tree browser with source preview
+- inline Vim-like editing and external Vim editing
+- reply panel that fills `From`, `To`, `Cc`, `Subject`, `In-Reply-To`, and `References`
+- real reply delivery through `git send-email`
+- visual config editor, command palette completion, and structured operation logs
+
+## Requirements
+
+- Rust stable
+- Git
+- Python 3
+  - needed when using the vendored `vendor/b4/b4.sh`
+- `b4`
+  - Courier resolves it in this order: `[b4].path` -> `COURIER_B4_PATH` -> `./vendor/b4/b4.sh` -> `b4` in `PATH`
+- `git send-email`
+  - only required if you want to send replies
+
+`courier doctor` checks `b4`, `git send-email`, git mail identity, and IMAP connectivity.
+
+## Installation
+
+Source installation is the recommended path.
+
+### Install from a clone
+
+If you want to use the vendored `b4`, clone the repository with submodules:
 
 ```bash
+git clone --recurse-submodules https://github.com/ChenMiaoi/courier.git
+cd courier
 cargo install --path . --locked
 ```
 
-如果需要覆盖已安装版本：
+If you already cloned the repository without submodules:
 
 ```bash
-cargo install --path . --locked --force
+git submodule update --init --recursive
 ```
 
-不 clone 直接从 GitHub 安装：
+### Install directly from GitHub
 
 ```bash
 cargo install --git https://github.com/ChenMiaoi/courier.git --locked courier
 ```
 
-### 构建与自检
+In this mode, you should provide `b4` through `b4.path`, `COURIER_B4_PATH`, or your system `PATH`.
+
+### Run from source
 
 ```bash
-cargo build
 cargo run -- doctor
-```
-
-## 配置
-
-默认配置文件路径为 `~/.courier/courier-config.toml`，默认数据目录为 `~/.courier/`。
-
-最小配置示例见 [docs/config.example.toml](docs/config.example.toml)。
-
-可选项：
-- `[ui].startup_sync = true|false`（默认 `true`）
-- `[ui].inbox_auto_sync_interval_secs = <seconds>`（默认 `30`，必须大于 `0`）
-
-IMAP 说明：
-- `imap.email` 用于识别“自己”的邮件；当 `imap.user` 省略时，也会默认作为 IMAP 登录账号。
-- Gmail 一般应使用完整邮箱地址作为 `imap.user`。
-- `imap.proxy` 支持 `http://`、`socks5://`、`socks5h://`。
-
-回信身份说明：
-- `From` 优先读取 `git config sendemail.from`；若未设置，则回退到 `git config user.name` / `user.email`。
-- `imap.email` 会参与“自己地址”识别，用于从回信预览中的 `To/Cc` 自动移除自己。
-- `courier doctor` 会同时检查 `git send-email` 和默认回信身份是否可用。
-
-## 同步与 TUI
-
-### 1. 手动同步（在线）
-
-```bash
-cargo run -- sync --mailbox io-uring
-```
-
-### 2. 启动 TUI
-
-```bash
 cargo run -- tui
 ```
 
-说明：
-- 打开 TUI 后会在后台自动同步“已启用订阅”，状态栏显示正在同步的 mailbox 与完成汇总。
-- IMAP 配置完整时，左栏会出现默认启用的 `My Inbox`；它走真实 IMAP `INBOX`，其余子系统订阅继续走 lore。
-- `My Inbox` 在 TUI 保持打开且订阅启用时，会按 `ui.inbox_auto_sync_interval_secs` 做后台增量同步；默认 30 秒。手动 `sync INBOX` 或首次启动同步会顺延下一次定时触发。
-- `My Inbox` 同步失败时只会显示错误，不会把整个 TUI 带退出；状态栏和命令栏中的错误也会被压平成单行显示，避免界面紊乱。
-- 命令栏（`:`）可用命令：`help`、`sync`、`sync <mailbox>`、`config`、`vim`、`restart`、`quit`、`exit`、`!<shell command>`。
-- 命令栏支持 `Tab` 补全命令与参数；同一位置再按一次 `Tab` 会在下方列出可选参数；`!` 本地命令同样支持路径补全。
-- `config` 默认打开可视化配置面板；仍支持 `config get <key>` / `config set <key> <value>`。
-- `help` 会显示命令与常用键位（`j/l`、`i/k`、`y/n`、`a/d/u`）。
-- 在线程列表选中 patch series 后：
-  - 按 `a`：执行 apply（封装 `b4 am`）
-  - 按 `d`：执行 download（封装 `b4 am -o` 导出到 `patch_dir`）
-  - 按 `u`：撤销本次会话中最近一次成功 apply（reset 到 apply 前 HEAD）
-- 在 Mail Preview 上：
-  - 按 `e`：从 Preview 焦点进入回信面板
-  - 按 `r`：直接打开当前线程的回信面板
-  - 回信面板会自动填充 `From/To/Cc/Subject/In-Reply-To/References`，并生成引用正文模板
-  - 回信面板键位：`Esc` 返回 normal/关闭，`i` 进入插入，`h/j/k/l` 移动，`x` 删除，`Enter/o` 在正文打开下方新行并进入插入
-  - 回信命令：`p` 或 `:preview` 打开发送预览，`Enter/c` 确认预览，`S` 或 `:send` 尝试发送，`:q` / `:q!` 关闭草稿
-  - 发送成功后会关闭 Reply Panel；发送失败或超时会保留草稿，允许直接重试
-- `Tab` 可以在 Mail 页和 Code Browser 页之间切换。
-- 在 Code Browser 页，焦点位于 Source 且选中文件时：
-  - 按 `e` 进入 VM1 编辑态
-  - 按 `E` 进入 VM2 外部 Vim 编辑
-  - `h/j/k/l` 移动，`i` 进入插入，`x` 删除当前字符，`s` 保存
-  - `:w` 保存，`:q` 退出（dirty 时拒绝），`:q!` 强制丢弃退出，`:wq` 保存并退出，`:vim` 打开外部 Vim
+## Quick Start
 
-## 本地 fixture 测试（可选）
-
-如果你要用本地 `.eml` 测试同步逻辑：
+### 1. Check your environment
 
 ```bash
-cargo run -- sync --mailbox inbox --fixture-dir ./fixtures
+courier doctor
 ```
 
-## 开发命令
+### 2. Prepare configuration
+
+The default config file is `~/.courier/courier-config.toml`, and the default runtime directory is `~/.courier/`. Courier creates a minimal config file automatically on first run.
+
+See [docs/config.example.toml](docs/config.example.toml) for a complete example.
+
+Typical configuration:
+
+```toml
+[source]
+mailbox = "io-uring"
+
+[imap]
+email = "you@example.com"
+user = "you@example.com"
+pass = "app-password"
+server = "imap.example.com"
+serverport = 993
+encryption = "ssl"
+
+[kernel]
+tree = "/path/to/linux"
+```
+
+Notes:
+
+- relative paths are resolved from the config file directory
+- `[imap]` is optional if you only use lore sync
+- when IMAP config is complete, `My Inbox` is enabled by default on first use
+- `imap.proxy` supports `http://`, `socks5://`, and `socks5h://`
+- reply identity prefers `git config sendemail.from`, then falls back to `git config user.name` and `git config user.email`
+- `ui.startup_sync` defaults to `true`
+- `ui.inbox_auto_sync_interval_secs` defaults to `30`
+
+### 3. Sync mail
+
+Sync a lore mailbox:
 
 ```bash
-cargo fmt
+courier sync --mailbox io-uring
+```
+
+Sync a real IMAP inbox:
+
+```bash
+courier sync --mailbox INBOX
+```
+
+Use local `.eml` fixtures for debugging:
+
+```bash
+courier sync --mailbox test --fixture-dir ./fixtures
+```
+
+### 4. Start the TUI
+
+```bash
+courier tui
+```
+
+Inside the TUI:
+
+- `:` opens the command palette
+- `y` / `n` enable or disable the selected subscription
+- `Enter` opens the selected mailbox or thread
+- `a` applies the current patch series
+- `d` exports the current patch series
+- `u` undoes the most recent successful apply from the current session
+- `r` or `e` opens the reply panel
+- `Tab` switches between the mail page and the code browser
+
+When IMAP is configured, `My Inbox` joins startup sync and continues periodic background sync while the TUI remains open.
+
+## Documentation
+
+- [README-zh.md](README-zh.md): Chinese usage guide
+- [docs/config.example.toml](docs/config.example.toml): configuration example
+- [docs/design.md](docs/design.md): design notes
+- [docs/reply-format-spec.md](docs/reply-format-spec.md): reply panel and sending format
+- [docs/mvp-milestones.md](docs/mvp-milestones.md): historical milestone record
+- [docs/reply-mvp-milestones.md](docs/reply-mvp-milestones.md): reply workflow evolution
+
+## Development
+
+Common development commands:
+
+```bash
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo test --all-targets --all-features
 ```
 
-## CI
+The repository includes GitHub Actions CI for `push` and `pull_request` with the same formatting, lint, and test checks.
 
-GitHub Actions 工作流位于 `.github/workflows/ci.yml`，会在 push / pull_request 时执行：
-- `cargo fmt --all -- --check`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-targets --all-features`
+## Contributing
+
+Issues and pull requests are welcome.
+
+Before sending changes, run:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
+
+If you change user-visible behavior, commands, config keys, or workflows, update the relevant documentation in the same change.
 
 ## License
 
-[GPL-2.0](LICENSE)
+Courier is licensed under [LGPL-2.1](LICENSE). Vendored third-party components keep their upstream licenses.
