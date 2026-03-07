@@ -46,3 +46,58 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --all-features
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Prepare release assets
+        env:
+          GIT_TAG: ${{ github.ref_name }}
+        run: ./scripts/package-release-assets.sh "${GIT_TAG}" dist/release
+
+      - name: Generate release notes
+        env:
+          GIT_TAG: ${{ github.ref_name }}
+        run: ./scripts/generate-release-notes.sh "${GIT_TAG}" dist/release/release-notes.md
+
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_TAG: ${{ github.ref_name }}
+        run: |
+          release_title="Courier ${GIT_TAG}"
+          notes_file="dist/release/release-notes.md"
+          tar_asset="dist/release/courier-${GIT_TAG}-src.tar.gz"
+          zip_asset="dist/release/courier-${GIT_TAG}-src.zip"
+
+          if gh release view "${GIT_TAG}" >/dev/null 2>&1; then
+            gh release upload "${GIT_TAG}" \
+              "${tar_asset}" \
+              "${zip_asset}" \
+              --clobber
+            gh release edit "${GIT_TAG}" \
+              --title "${release_title}" \
+              --notes-file "${notes_file}"
+          else
+            gh release create "${GIT_TAG}" \
+              "${tar_asset}" \
+              "${zip_asset}" \
+              --title "${release_title}" \
+              --notes-file "${notes_file}"
+          fi
