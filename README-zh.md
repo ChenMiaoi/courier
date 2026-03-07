@@ -2,6 +2,8 @@
 
 Courier 是一个面向 Linux kernel patch 邮件工作流的 Rust TUI 工具，用来把“订阅 -> 同步 -> 阅读 -> 应用 patch -> 回复邮件”放进同一条终端内、本地优先的工作流中。
 
+![Courier TUI demo](docs/media/courier-tui-demo.gif)
+
 English README: [README.md](README.md)
 
 ## 当前能力

@@ -4,6 +4,8 @@ Courier is a Rust TUI for Linux kernel patch mail workflows.
 
 It is built for developers who work on mailing-list-driven review, especially in Linux kernel style flows, and want a terminal-first tool that keeps subscription, sync, review, patch application, and reply in one local workflow.
 
+![Courier TUI demo](docs/media/courier-tui-demo.gif)
+
 Chinese usage guide: [README-zh.md](README-zh.md)
 
 ## Status
