@@ -16,7 +16,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 
 use crate::domain::subscriptions::SubscriptionCategory;
 use crate::infra::bootstrap::BootstrapState;
-use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
+use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig, UiKeymap};
 use crate::infra::db;
 use crate::infra::db::DatabaseState;
 use crate::infra::mail_parser;
@@ -115,6 +115,7 @@ fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
         imap: crate::infra::config::ImapConfig::default(),
         lore_base_url: "https://lore.kernel.org".to_string(),
         startup_sync: true,
+        ui_keymap: UiKeymap::Default,
         inbox_auto_sync_interval_secs: crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
         kernel_trees: Vec::new(),
     }
@@ -686,6 +687,23 @@ fn command_palette_help_includes_keyboard_shortcuts() {
 }
 
 #[test]
+fn command_palette_help_uses_vim_keymap_labels() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let mut state = AppState::new(vec![], runtime);
+    state.palette.open = true;
+    state.palette.input = "help".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(state.status.contains("h/l focus"));
+    assert!(state.status.contains("j/k move"));
+}
+
+#[test]
 fn config_palette_get_and_set_roundtrip() {
     let root = temp_dir("palette-config");
     let config_path = root.join("criew-config.toml");
@@ -730,6 +748,65 @@ mailbox = "inbox"
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     );
     assert!(state.status.contains("io-uring"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_palette_set_keymap_updates_navigation_immediately() {
+    let root = temp_dir("palette-keymap");
+    let config_path = root.join("criew-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+keymap = "default"
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    let stale_runtime = runtime.clone();
+    let mut state = AppState::new(
+        vec![
+            sample_thread("t0", "a@example.com", 0),
+            sample_thread("t1", "b@example.com", 1),
+        ],
+        runtime,
+    );
+
+    state.palette.open = true;
+    state.palette.input = "config set ui.keymap vim".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert_eq!(state.runtime.ui_keymap, UiKeymap::Vim);
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(persisted.contains("keymap = \"vim\""));
+    state.palette.open = false;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Threads));
+    assert_eq!(state.thread_index, 1);
+
+    let bootstrap = test_bootstrap(&stale_runtime);
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &stale_runtime, &bootstrap))
+        .expect("draw updated keymap footer");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("h/l focus | j/k move"));
+    assert!(!rendered.contains("j/l focus | i/k move"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2509,6 +2586,48 @@ fn jl_focus_and_ik_move_selection() {
         KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
     );
     assert!(matches!(action_j, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Subscriptions));
+}
+
+#[test]
+fn vim_keymap_uses_hl_focus_and_jk_move_selection() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let mut state = AppState::new(
+        vec![
+            sample_thread("t0", "a@example.com", 0),
+            sample_thread("t1", "b@example.com", 1),
+        ],
+        runtime,
+    );
+    state.subscription_index = 1;
+
+    let action_l = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_l, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let action_j = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_j, LoopAction::Continue));
+    assert_eq!(state.thread_index, 1);
+
+    let action_k = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_k, LoopAction::Continue));
+    assert_eq!(state.thread_index, 0);
+
+    let action_h = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_h, LoopAction::Continue));
     assert!(matches!(state.focus, Pane::Subscriptions));
 }
 

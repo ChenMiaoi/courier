@@ -21,7 +21,7 @@ use crate::domain::subscriptions::{
     DEFAULT_SUBSCRIPTIONS, SubscriptionCategory, category_for_mailbox,
 };
 use crate::infra::bootstrap::BootstrapState;
-use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
+use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig, UiKeymap};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::mail_store::{self, ThreadRow};
 use crate::infra::reply_store::{self, ReplySendRecordRequest, ReplySendStatus};
@@ -186,6 +186,7 @@ const CONFIG_GET_KEYS: &[&str] = &[
     "imap.proxy",
     "source.lore_base_url",
     "ui.startup_sync",
+    "ui.keymap",
     "ui.inbox_auto_sync_interval_secs",
     "kernel.tree",
     "kernel.trees",
@@ -209,6 +210,7 @@ const CONFIG_SET_KEYS: &[&str] = &[
     "imap.proxy",
     "source.lore_base_url",
     "ui.startup_sync",
+    "ui.keymap",
     "ui.inbox_auto_sync_interval_secs",
     "kernel.tree",
     "kernel.trees",
@@ -225,6 +227,10 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
     ConfigEditorField {
         key: "ui.startup_sync",
         description: "Whether enabled subscriptions start syncing automatically after TUI launch.",
+    },
+    ConfigEditorField {
+        key: "ui.keymap",
+        description: "Main-page navigation scheme. default=j/l focus+i/k move, vim=h/l focus+j/k move.",
     },
     ConfigEditorField {
         key: "ui.inbox_auto_sync_interval_secs",
@@ -297,6 +303,28 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
 ];
 const CODE_EDIT_ENTRY_HINT: &str = "select a source file in Source pane, then press e";
 const EXTERNAL_EDITOR_ENTRY_HINT: &str = "select a source file in Source pane, then press E";
+
+fn main_page_focus_shortcuts(keymap: UiKeymap) -> &'static str {
+    match keymap {
+        UiKeymap::Default => "j/l",
+        UiKeymap::Vim => "h/l",
+    }
+}
+
+fn main_page_move_shortcuts(keymap: UiKeymap) -> &'static str {
+    match keymap {
+        UiKeymap::Default => "i/k",
+        UiKeymap::Vim => "j/k",
+    }
+}
+
+fn main_page_navigation_shortcuts(keymap: UiKeymap) -> String {
+    format!(
+        "{} focus | {} move",
+        main_page_focus_shortcuts(keymap),
+        main_page_move_shortcuts(keymap)
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExternalEditorProcessResult {

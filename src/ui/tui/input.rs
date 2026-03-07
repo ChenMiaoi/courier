@@ -19,6 +19,49 @@ pub(super) enum LoopAction {
     Restart,
 }
 
+fn handle_main_page_navigation_key(state: &mut AppState, key: KeyEvent) -> bool {
+    match state.runtime.ui_keymap {
+        UiKeymap::Default => match key.code {
+            KeyCode::Char('j') => {
+                state.move_focus_previous();
+                true
+            }
+            KeyCode::Char('l') => {
+                state.move_focus_next();
+                true
+            }
+            KeyCode::Char('i') => {
+                state.move_up();
+                true
+            }
+            KeyCode::Char('k') => {
+                state.move_down();
+                true
+            }
+            _ => false,
+        },
+        UiKeymap::Vim => match key.code {
+            KeyCode::Char('h') => {
+                state.move_focus_previous();
+                true
+            }
+            KeyCode::Char('l') => {
+                state.move_focus_next();
+                true
+            }
+            KeyCode::Char('k') => {
+                state.move_up();
+                true
+            }
+            KeyCode::Char('j') => {
+                state.move_down();
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
 pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
     tracing::debug!(
         key = ?key,
@@ -63,6 +106,10 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         return LoopAction::Continue;
     }
 
+    if handle_main_page_navigation_key(state, key) {
+        return LoopAction::Continue;
+    }
+
     match key.code {
         KeyCode::Char('/') => {
             if matches!(state.ui_page, UiPage::Mail) {
@@ -102,10 +149,6 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
             state.open_external_editor();
         }
         KeyCode::Tab => state.toggle_ui_page(),
-        KeyCode::Char('j') => state.move_focus_previous(),
-        KeyCode::Char('l') => state.move_focus_next(),
-        KeyCode::Char('i') => state.move_up(),
-        KeyCode::Char('k') => state.move_down(),
         KeyCode::Char(character)
             if matches!(state.ui_page, UiPage::Mail)
                 && matches!(state.focus, Pane::Threads)
@@ -544,7 +587,11 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "quit" | "exit" => return LoopAction::Exit,
                 "restart" => return LoopAction::Restart,
                 "help" => {
-                    state.status = "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: j/l focus, i/k move, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim".to_string();
+                    state.status = format!(
+                        "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: {} focus, {} move, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
+                        main_page_focus_shortcuts(state.runtime.ui_keymap),
+                        main_page_move_shortcuts(state.runtime.ui_keymap)
+                    );
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
                     run_palette_sync(state, value);
