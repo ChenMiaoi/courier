@@ -38,7 +38,11 @@ if [[ "${tag_version}" != "${package_version}" ]]; then
     exit 1
 fi
 
-release_root="${output_dir%/}"
+if [[ "${output_dir}" = /* ]]; then
+    release_root="${output_dir%/}"
+else
+    release_root="${repo_root}/${output_dir%/}"
+fi
 asset_prefix="${package_name}-${tag_name}"
 source_root="${release_root}/source-root/${asset_prefix}"
 tar_asset="${release_root}/${asset_prefix}-src.tar.gz"
