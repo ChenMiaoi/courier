@@ -1,3 +1,9 @@
+//! Ratatui-based interface for Courier's interactive workflow.
+//!
+//! Rendering details are split into submodules, but the top-level state
+//! machine stays here so key handling, background work, and side effects remain
+//! readable in one place.
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -3274,6 +3280,8 @@ fn spawn_startup_sync_worker(
     thread::spawn(move || {
         let total = mailboxes.len();
         for (index, mailbox) in mailboxes.into_iter().enumerate() {
+            // Emit progress before the work starts so the UI can show which
+            // mailbox is currently blocking startup, even if the sync hangs.
             if sender
                 .send(StartupSyncEvent::MailboxStarted {
                     mailbox: mailbox.clone(),
@@ -3337,6 +3345,9 @@ fn catch_sync_panic<T, F>(mailbox: &str, operation: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
+    // Background sync must not tear down the entire TUI process. Convert panics
+    // into structured errors so the user can keep interacting and inspect the
+    // failing mailbox name from the status line or logs.
     match panic::catch_unwind(AssertUnwindSafe(operation)) {
         Ok(result) => result,
         Err(payload) => {
@@ -3439,6 +3450,8 @@ where
     let enter_result = enter_alternate_screen();
     let enable_result = enable_raw();
 
+    // Prefer returning a terminal-restore failure over silently leaving the
+    // user in a broken terminal, even if the editor command itself succeeded.
     let mut restore_errors = Vec::new();
     if let Err(error) = enter_result {
         restore_errors.push(format!("failed to re-enter alternate screen: {error}"));
@@ -3589,6 +3602,8 @@ pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiActi
             .as_ref()
             .map(|state| state.imap_defaults_initialized)
             .unwrap_or(false);
+    // Resume the last active mailbox when possible, but always fall back to a
+    // live runtime default so a stale persisted value cannot block startup.
     let initial_mailbox = persisted_ui_state
         .as_ref()
         .and_then(|state| state.active_mailbox.as_ref())
@@ -3606,6 +3621,8 @@ pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiActi
         AppState::new(threads, config.clone())
     };
     if should_persist_imap_defaults {
+        // Persist once after IMAP becomes available so future launches can tell
+        // whether inbox defaults were already seeded for this user.
         state.persist_ui_state();
     }
     if state.filtered_thread_indices.is_empty()
@@ -3664,6 +3681,8 @@ fn tui_loop(
     bootstrap: &BootstrapState,
 ) -> Result<TuiAction> {
     loop {
+        // Pump worker events before drawing so each frame reflects the newest
+        // background sync state and can request a full refresh when needed.
         state.pump_startup_sync_events();
         state.pump_inbox_auto_sync_events();
         state.maybe_start_inbox_auto_sync();
@@ -3719,6 +3738,8 @@ fn build_kernel_tree_rows(
 ) -> Vec<KernelTreeRow> {
     let mut rows = Vec::new();
     for root in root_paths {
+        // Cap row generation defensively so an unexpectedly large tree cannot
+        // turn one render pass into an unbounded filesystem walk.
         if rows.len() >= KERNEL_TREE_MAX_ROWS {
             break;
         }
@@ -3857,6 +3878,8 @@ fn child_entries(path: &Path) -> Vec<PathBuf> {
                     .map(|name| name.to_string_lossy().to_string()),
             )
     });
+    // Show directories before files so expanding the tree behaves like a
+    // navigator, not like a flat alphabetical dump of mixed entries.
     dirs.extend(files);
     dirs
 }
@@ -3891,6 +3914,8 @@ fn default_subscriptions(
         .collect();
 
     if runtime.imap.is_complete() {
+        // `My Inbox` is special: expose it only when the account is usable, but
+        // default it on so IMAP users do not have to discover it manually.
         let enable_my_inbox = enabled_mailboxes.contains(IMAP_INBOX_MAILBOX)
             || (allow_default_my_inbox && !enabled_mailboxes.contains(IMAP_INBOX_MAILBOX));
         items.insert(
@@ -3907,6 +3932,8 @@ fn default_subscriptions(
         .iter()
         .all(|item| item.mailbox != runtime.source_mailbox)
     {
+        // Always keep the configured source mailbox visible even if the static
+        // catalog changes, because it is the user's declared sync target.
         items.insert(
             0,
             SubscriptionItem {
@@ -3936,6 +3963,9 @@ fn default_subscriptions(
         && !mailbox.is_empty()
         && items.iter().all(|item| item.mailbox != mailbox)
     {
+        // Preserve access to the last active mailbox even if it no longer
+        // appears in defaults, otherwise persisted UI state could point at an
+        // invisible selection.
         items.push(SubscriptionItem {
             mailbox: mailbox.to_string(),
             label: if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {

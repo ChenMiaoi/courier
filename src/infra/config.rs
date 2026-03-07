@@ -1,3 +1,9 @@
+//! Runtime config loading and normalization.
+//!
+//! This module accepts sparse user config and expands it into a fully resolved
+//! runtime shape. Paths, legacy aliases, and defaults are normalized here so
+//! the rest of the program can operate on one consistent configuration model.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -251,6 +257,9 @@ fn load_with_home(config_override: Option<&Path>, home_dir: &Path) -> Result<Run
     let config_path = if let Some(path) = config_override {
         path.to_path_buf()
     } else {
+        // Missing config is not an error on first run: auto-select or
+        // initialize the default path so the rest of startup can operate on one
+        // concrete file location.
         select_or_initialize_default_config_path(&default_root)?
     };
 
@@ -268,6 +277,8 @@ fn build_runtime_config(
     file_config: FileConfig,
     default_root: &Path,
 ) -> Result<RuntimeConfig> {
+    // Resolve user-provided relative paths against the config file location
+    // instead of the process cwd so `courier --config <file>` stays portable.
     let config_base_dir = config_path
         .parent()
         .map(Path::to_path_buf)
@@ -318,6 +329,8 @@ fn build_runtime_config(
             .clone()
             .or(file_config.imap.mailbox.clone()),
     )
+    // Keep honoring the historical `[imap].mailbox` alias while routing new
+    // config toward the source-oriented name used by the current runtime model.
     .unwrap_or_else(|| DEFAULT_SOURCE_MAILBOX.to_string());
 
     let imap = build_imap_config(&file_config.imap, &config_path)?;
@@ -342,6 +355,8 @@ fn build_runtime_config(
     }
     for tree in file_config.kernel.trees {
         let resolved = resolve_path(&config_base_dir, tree);
+        // Preserve declaration order while suppressing duplicates so the first
+        // configured tree keeps its priority in the UI and palette.
         if !kernel_trees.iter().any(|existing| existing == &resolved) {
             kernel_trees.push(resolved);
         }
@@ -371,11 +386,15 @@ fn select_or_initialize_default_config_path(default_root: &Path) -> Result<PathB
         return Ok(preferred_path);
     }
 
+    // Keep honoring the legacy filename so upgrades do not strand existing
+    // installations on a fresh empty config.
     let legacy_path = default_root.join(LEGACY_CONFIG_FILE_NAME);
     if legacy_path.exists() {
         return Ok(legacy_path);
     }
 
+    // Auto-initialize only after both expected locations are absent. That keeps
+    // first-run setup zero-touch without overwriting user-managed files.
     write_default_config_file(&preferred_path)?;
     Ok(preferred_path)
 }
@@ -447,6 +466,9 @@ where
         server_port: file_config.serverport,
         encryption: file_config.encryption,
         proxy: normalize_optional_string(file_config.proxy.clone()).or_else(|| {
+            // Check Courier-specific proxy configuration first, then honor the
+            // common shell proxy variables so existing environments work
+            // without duplicating config in two places.
             [
                 "COURIER_IMAP_PROXY",
                 "ALL_PROXY",
@@ -502,6 +524,8 @@ fn resolve_self_email_with<F>(config: &RuntimeConfig, git_lookup: F) -> SelfEmai
 where
     F: FnOnce() -> std::result::Result<Option<String>, String>,
 {
+    // Prefer Courier config over git config so reply identity follows the mail
+    // account actually used for sync when both are present.
     if let Some(email) = config.imap.email.as_ref() {
         return SelfEmailResolution {
             email: Some(email.clone()),

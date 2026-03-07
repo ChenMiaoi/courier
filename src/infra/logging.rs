@@ -1,3 +1,8 @@
+//! Tracing subscriber initialization.
+//!
+//! Logging is process-global state, so this module owns the once-only setup and
+//! keeps the background writer guard alive for the lifetime of the process.
+
 use std::path::Path;
 use std::sync::{Once, OnceLock};
 
@@ -30,6 +35,8 @@ pub fn init(default_filter: &str, log_dir: &Path) -> Result<()> {
 
         let appender = tracing_appender::rolling::daily(log_dir, "courier.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        // Dropping the guard early can lose buffered log lines during shutdown,
+        // so store it in a process-wide cell once initialization succeeds.
         let _ = LOG_GUARD.set(guard);
         let error_appender = tracing_appender::rolling::never(log_dir, "error.log");
 

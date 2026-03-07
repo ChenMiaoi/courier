@@ -1,3 +1,9 @@
+//! Command-line surface for Courier.
+//!
+//! The CLI stays intentionally compact: clap defines the public verbs here,
+//! while validation and side-effecting policy remain in the application layer
+//! so tests can exercise the same behavior without going through argv parsing.
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};

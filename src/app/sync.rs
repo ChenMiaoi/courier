@@ -1,3 +1,9 @@
+//! Sync worker orchestration.
+//!
+//! Fixture, lore, and real IMAP sources all flow through the same batch shape
+//! before touching storage. Keeping that normalization here lets the thread and
+//! checkpoint code enforce one set of invariants regardless of the source.
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -116,6 +122,9 @@ fn resolve_sync_source(config: &RuntimeConfig, request: &SyncRequest) -> Result<
     }
 
     if request.mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+        // `INBOX` is the only mailbox that depends on private account state, so
+        // treat it as an explicit IMAP-only path and fail fast when credentials
+        // are incomplete instead of silently falling back to lore.
         if config.imap.is_complete() {
             return Ok(SyncSource::Imap);
         }
@@ -142,6 +151,9 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         .map(|state| state.last_seen_uid)
         .unwrap_or(0);
     let mailbox_message_count = mail_store::mailbox_message_count(&config.database_path, mailbox)?;
+    // An empty mailbox gets a different startup path because paying the cost of
+    // a bounded initial window is better than downloading an entire busy inbox
+    // before the first TUI frame appears.
     let initial_window_sync = mailbox_message_count == 0;
 
     let mut client: Box<dyn ImapClient> = match source {
@@ -175,6 +187,9 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         checkpoint.as_ref().and_then(|state| state.highest_modseq)
     };
 
+    // `My Inbox` can contain a large amount of unrelated mail. On the very
+    // first sync we inspect headers first so we can bound startup latency and
+    // only fetch full raws for the latest patch-related threads.
     let initial_inbox_selection = if initial_window_sync
         && mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
     {
@@ -229,6 +244,9 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
     for envelope in envelopes {
         let mut remote = envelope.remote;
         if remote.uid == 0 {
+            // Fixture and lore sources do not always provide stable IMAP UIDs.
+            // Synthesize monotonic values so raw mail filenames and checkpoint
+            // math still follow the same assumptions as the real IMAP path.
             synthetic_uid = synthetic_uid.saturating_add(1);
             remote.uid = synthetic_uid;
         }
@@ -257,6 +275,8 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         .max(fetched_highest_uid)
         .max(checkpoint_last_seen_uid);
 
+    // Keep checkpoint progress monotonic even when the selected fetch window is
+    // intentionally partial, such as the initial inbox optimization.
     let batch_highest_modseq = max_option(snapshot.highest_modseq, fetched_highest_modseq);
 
     let write_result = mail_store::apply_sync_batch(
@@ -270,6 +290,9 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
         },
     )?;
     if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+        // The initial header scan is only an optimization. Pruning after the
+        // write keeps later incremental syncs from slowly reintroducing
+        // unrelated mail into the patch-focused inbox view.
         let pruned =
             mail_store::prune_mailbox_subjects(&config.database_path, mailbox, |subject| {
                 patch_worker::subject_is_patch_related(subject)
@@ -308,6 +331,9 @@ fn parse_remote_messages(
         .into_iter()
         .enumerate()
         .map(|(index, remote)| {
+            // Some sources do not provide stable Message-Ids. Generate a
+            // mailbox-scoped fallback so the rest of the pipeline can still
+            // reason about threading and de-duplication deterministically.
             let fallback_message_id = if remote.uid == 0 {
                 format!("synthetic-{mailbox}-{index}@local")
             } else {
@@ -330,6 +356,8 @@ fn select_initial_inbox_messages(
     let patch_related = envelopes.len();
     let selected = retain_latest_threads(envelopes, thread_limit);
     let mut index_by_message_id = HashMap::new();
+    // Root detection walks parent chains, so build the lookup map once before
+    // counting distinct threads in the selected working set.
     for (index, message) in selected.iter().enumerate() {
         index_by_message_id.insert(message.parsed.message_id.clone(), index);
     }
@@ -382,6 +410,8 @@ fn retain_latest_threads(
     }
 
     let mut threads: Vec<(String, u64)> = latest_rank_by_thread.into_iter().collect();
+    // Rank threads by their newest activity, then keep ordering deterministic
+    // for equal timestamps so tests and the first-sync window stay stable.
     threads.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
 
     let selected_roots: HashSet<String> = threads
@@ -425,6 +455,10 @@ fn thread_root_key(
         }
 
         let Some(parent) = parent_index(current, messages, index_by_message_id) else {
+            // If the root mail is missing locally, the first `References`
+            // entry is usually the most stable stand-in for the thread root.
+            // That keeps siblings grouped together during the initial window
+            // selection instead of treating each reply as its own thread.
             if let Some(root_hint) = messages[current].parsed.references.first()
                 && !root_hint.is_empty()
             {
@@ -443,6 +477,8 @@ fn parent_index(
 ) -> Option<usize> {
     let current_message_id = messages[index].parsed.message_id.as_str();
 
+    // Prefer `References` because it usually preserves the full ancestry chain;
+    // `In-Reply-To` is the fallback when only the direct parent survives.
     if let Some(parent) = messages[index]
         .parsed
         .references
@@ -480,6 +516,8 @@ fn persist_raw_mail(
         )
     })?;
 
+    // Zero-padding keeps lexicographic order aligned with UID order, which
+    // makes fixture inspection and manual debugging much easier.
     let path = mailbox_dir.join(format!("{:010}.eml", uid));
     fs::write(&path, raw).map_err(|error| {
         CourierError::with_source(

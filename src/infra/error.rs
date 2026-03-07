@@ -1,3 +1,9 @@
+//! Shared error types and stable error codes.
+//!
+//! Courier reports failures to humans through stderr, logs, and status lines.
+//! Centralizing the envelope here keeps those surfaces aligned on one error
+//! taxonomy instead of each layer inventing its own wording and exit mapping.
+
 use std::error::Error as StdError;
 use std::fmt;
 

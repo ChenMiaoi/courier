@@ -1,3 +1,8 @@
+//! Persistence for reply-send history.
+//!
+//! Send attempts are stored separately from the live reply composer state so
+//! Courier can retain an audit trail even after the TUI session exits.
+
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -85,6 +90,8 @@ pub fn insert_reply_send(path: &Path, request: &ReplySendRecordRequest) -> Resul
         .as_ref()
         .map(|path| path.display().to_string());
 
+    // Persist the draft path and transport outcome together so a failed send
+    // still leaves behind enough context for manual recovery.
     connection
         .execute(
             "
@@ -146,6 +153,8 @@ WHERE mail_id = ?1
 ORDER BY id DESC
 LIMIT 1
 ",
+            // Use insertion order as recency because send attempts are append-
+            // only and ids remain monotonic within one database.
             params![mail_id],
             |row| {
                 Ok(ReplySendRecord {

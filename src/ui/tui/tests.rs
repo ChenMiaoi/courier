@@ -1,3 +1,9 @@
+//! Focused TUI regression tests.
+//!
+//! These tests exercise the visible behavior of the interactive layer without
+//! depending on a real terminal or network so refactors can change internals
+//! while keeping key bindings, rendering, and workflow guarantees stable.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;

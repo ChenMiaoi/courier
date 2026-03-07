@@ -1,3 +1,9 @@
+//! SQLite schema initialization and migrations.
+//!
+//! Schema setup stays isolated from higher-level storage code so the rest of
+//! the program can assume a ready database and focus on data invariants rather
+//! than migration bookkeeping.
+
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, params};
@@ -83,6 +89,8 @@ pub fn initialize(path: &Path) -> Result<DatabaseState> {
         .iter()
         .filter(|migration| migration.version > current)
     {
+        // Apply each migration atomically so a partial upgrade cannot leave the
+        // schema_version table claiming success for SQL that never committed.
         let tx = connection.transaction().map_err(|error| {
             CourierError::with_source(
                 ErrorCode::Database,

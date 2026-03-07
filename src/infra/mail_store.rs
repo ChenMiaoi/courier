@@ -1,3 +1,9 @@
+//! SQLite persistence for mails, checkpoints, and materialized threads.
+//!
+//! The sync layer feeds raw mail batches into this module, which owns the
+//! invariants around idempotent upserts, checkpoint monotonicity, and the
+//! scope of thread rebuilds.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -218,6 +224,8 @@ where
         )
     })?;
 
+    // Delete raw files only after the database commit succeeds so a filesystem
+    // cleanup failure cannot leave persisted rows pointing at missing files.
     for (_, raw_path) in &pruned_mail_ids {
         let Some(raw_path) = raw_path.as_ref() else {
             continue;
@@ -255,6 +263,9 @@ pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult
         .is_some_and(|state| state.uidvalidity != batch.uidvalidity);
 
     if mailbox_rebuilt {
+        // Once UIDVALIDITY changes, every stored UID for this mailbox is stale.
+        // Clearing mailbox rows is cheaper and safer than trying to salvage
+        // incremental state across two unrelated UID namespaces.
         tx.execute(
             "DELETE FROM mail WHERE imap_mailbox = ?1",
             params![batch.mailbox],
@@ -282,6 +293,8 @@ pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult
         }
 
         touched_mail_ids.insert(mail_id);
+        // Track message ids separately because descendants can refer to a mail
+        // by Message-Id even when their own rows were untouched in this batch.
         touched_message_ids.insert(mail.parsed.message_id.clone());
     }
 
@@ -291,6 +304,9 @@ pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult
     } else if touched_mail_ids.is_empty() {
         0
     } else {
+        // In steady state, only rebuild roots touched by new mail or by
+        // references that can change parentage. Recomputing every thread on
+        // each incremental sync would be correct but scales poorly.
         let affected_mail_ids =
             expand_affected_mail_ids_tx(&tx, &touched_mail_ids, &touched_message_ids)?;
         let stale_roots = load_stale_roots_tx(&tx, &affected_mail_ids)?;
@@ -460,6 +476,9 @@ fn persist_mailbox_state_tx(
     let previous_last_seen = previous_state.map(|state| state.last_seen_uid).unwrap_or(0);
     let previous_modseq = previous_state.and_then(|state| state.highest_modseq);
 
+    // Checkpoints only move forward. A single batch can be sparse, so preserve
+    // the highest seen UID/MODSEQ rather than assuming the current fetch is a
+    // complete view of mailbox progress.
     let next_last_seen_uid = previous_last_seen.max(batch.highest_uid);
     let next_highest_modseq = max_option(previous_modseq, batch.highest_modseq);
 
@@ -791,6 +810,8 @@ WHERE is_expunged = 0
     }
 
     let mut refs_map: HashMap<i64, Vec<String>> = HashMap::new();
+    // Load references separately so the first pass can build the mail node set
+    // without repeating row data for every reference edge.
     let mut ref_statement = tx
         .prepare("SELECT mail_id, ref_message_id FROM mail_ref ORDER BY mail_id, ord ASC")
         .map_err(|error| {
@@ -830,6 +851,8 @@ WHERE is_expunged = 0
 
     let mut parent_map: HashMap<i64, Option<i64>> = HashMap::new();
     for node in build.nodes.values() {
+        // Prefer the most recent resolvable `References` entry because it keeps
+        // threading stable for mails that include the full ancestry chain.
         let parent = node
             .refs
             .iter()
@@ -878,6 +901,8 @@ WHERE is_expunged = 0
     }
 
     for mail_ids in build.groups.values_mut() {
+        // Keep a stable order inside each thread so incremental rebuilds do not
+        // reshuffle visible rows when the ancestry itself has not changed.
         mail_ids.sort_by(|left, right| {
             let left_assignment =
                 build
@@ -928,6 +953,8 @@ fn resolve_thread_assignment(
     }
 
     if !stack.insert(mail_id) {
+        // Broken or cyclic reference chains should degrade to a self-rooted
+        // node rather than recursing forever or cross-linking unrelated mail.
         memo.insert(mail_id, (mail_id, 0));
         return (mail_id, 0);
     }
@@ -998,6 +1025,8 @@ fn rebuild_thread_roots_tx(
             .unwrap_or_default();
         let subject_norm = normalize_subject(&root_subject);
 
+        // Thread activity is derived from the newest member mail so list
+        // ordering reflects conversation freshness, not only root age.
         let last_activity_at = group_mail_ids
             .iter()
             .filter_map(|mail_id| build.nodes.get(mail_id).map(|node| node.created_at.clone()))

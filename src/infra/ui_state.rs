@@ -1,3 +1,9 @@
+//! Persistence for lightweight TUI preferences.
+//!
+//! The UI stores only coarse-grained user intent here, such as enabled
+//! mailboxes and the last active mailbox. Derived state stays out of this file
+//! so upgrades can rebuild richer view models from stable preferences.
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -38,6 +44,8 @@ impl Default for UiState {
 
 impl UiState {
     pub fn normalized_enabled_mailboxes(&self) -> Vec<String> {
+        // Normalize once at the boundary so read/modify/write cycles do not
+        // churn the file with duplicates or whitespace-only entries.
         let mut seen = HashSet::new();
         let mut mailboxes = Vec::new();
         for mailbox in &self.enabled_mailboxes {

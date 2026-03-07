@@ -1,3 +1,8 @@
+//! Application-layer entrypoints and orchestration.
+//!
+//! This module keeps command routing and high-level policy in one place so the
+//! lower layers can stay focused on storage, network, and UI primitives.
+
 pub mod cli;
 pub mod patch;
 pub mod sync;

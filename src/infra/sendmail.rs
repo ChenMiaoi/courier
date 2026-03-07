@@ -1,3 +1,9 @@
+//! Reply delivery through `git send-email`.
+//!
+//! This module owns command discovery, draft generation, and timeout handling
+//! so the rest of the application can treat mail sending as a structured
+//! operation with recorded outcome metadata.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -101,6 +107,9 @@ fn check_with_command_path(command_path: Option<&Path>) -> GitSendEmailCheck {
     let mut last_failure: Option<(PathBuf, String)> = None;
 
     for candidate in git_candidates(command_path) {
+        // Stop at the first usable candidate, but remember the last broken one
+        // so diagnostics can explain why discovery failed instead of only
+        // saying "missing".
         match probe_send_email(&candidate) {
             Probe::Available { path, version, .. } => {
                 return GitSendEmailCheck {
@@ -130,6 +139,8 @@ fn resolve_reply_identity_with_command_path(
 ) -> std::result::Result<ReplyIdentity, String> {
     let resolved = resolve_git_binary(command_path)?;
 
+    // `sendemail.from` is the closest match to what `git send-email` will use,
+    // so prefer it over the more general user.name/user.email pair.
     if let Some(value) = git_config_value(&resolved.command, GIT_SENDEMAIL_FROM_ARGS)? {
         let identity = parse_identity(&value).ok_or_else(|| {
             "git config sendemail.from is set but does not contain a valid email address"
@@ -235,6 +246,8 @@ fn send_with_command_path(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Never let git prompt interactively inside the TUI path; failures must
+        // surface as structured outcomes the UI can record and display.
         .env("GIT_TERMINAL_PROMPT", "0");
 
     let mut child = match command.spawn() {
@@ -313,6 +326,8 @@ fn send_with_command_path(
     }
 
     if output.status.success() {
+        // Remove the draft only after a confirmed send so failures leave behind
+        // an inspectable artifact the user can reuse or resend manually.
         let _ = fs::remove_file(&draft_path);
         return SendOutcome {
             transport: "git-send-email".to_string(),
@@ -454,6 +469,8 @@ where
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!("{stdout}\n{stderr}");
 
+            // `git send-email -h` is a lightweight capability probe that works
+            // both for real binaries and wrapper scripts without sending mail.
             if looks_like_send_email_help(&combined) {
                 let version = probe_git_version(command)
                     .unwrap_or_else(|| "git send-email (version unavailable)".to_string());
@@ -623,6 +640,8 @@ fn normalize_message_id(value: &str) -> String {
 }
 
 fn render_message_file(request: &SendRequest, message_id: &str) -> String {
+    // Emit a complete RFC822-style draft so `git send-email` handles transport
+    // and SMTP concerns while Courier keeps ownership of message content.
     let mut lines = vec![
         format!("From: {}", request.from),
         format!("To: {}", request.to.join(", ")),
@@ -681,6 +700,8 @@ fn build_send_email_args(request: &SendRequest, draft_path: &Path) -> Vec<String
 }
 
 fn generate_message_id(from: &str) -> String {
+    // Reuse the sender domain when possible so generated ids look like normal
+    // outbound mail and are easier to correlate in archives and mail clients.
     let domain = extract_email_address(from)
         .and_then(|email| email.split('@').nth(1).map(ToOwned::to_owned))
         .unwrap_or_else(|| "localhost".to_string());
@@ -692,6 +713,8 @@ fn generate_message_id(from: &str) -> String {
 }
 
 fn resolve_working_dir(runtime: &RuntimeConfig) -> PathBuf {
+    // Prefer the kernel tree so git config, hooks, and relative includes match
+    // the repository context where the user is reviewing patches.
     runtime
         .kernel_trees
         .iter()
@@ -732,6 +755,8 @@ fn normalize_output(bytes: &[u8]) -> Option<String> {
 }
 
 fn summarize_failure(exit_code: Option<i32>, stdout: &str, stderr: &str) -> Option<String> {
+    // Prefer stderr because it usually carries the actionable SMTP or auth
+    // error, then fall back to stdout for older scripts that log there.
     normalize_output(stderr.as_bytes())
         .or_else(|| normalize_output(stdout.as_bytes()))
         .or_else(|| exit_code.map(|code| format!("git send-email exited with {code}")))

@@ -1,3 +1,9 @@
+//! Reply composition helpers for the TUI.
+//!
+//! Reply generation keeps header normalization, recipient filtering, and quoted
+//! body construction together so preview and send flows share one consistent
+//! interpretation of what the outbound message should look like.
+
 use std::collections::HashSet;
 use std::process::Command as ProcessCommand;
 
@@ -168,6 +174,8 @@ pub(super) fn prepare_reply_message(
         errors.push("From is missing a valid email address".to_string());
     }
 
+    // Treat the sender and any configured self aliases as one dedup set so the
+    // preview can warn about genuinely empty recipient lists after self-removal.
     let mut self_set = request
         .self_addresses
         .iter()
@@ -211,6 +219,8 @@ pub(super) fn prepare_reply_message(
             .iter()
             .any(|value| value == &in_reply_to)
     {
+        // Ensure the direct parent is always present even if the original
+        // message had a truncated or malformed References chain.
         normalized_references.push(in_reply_to.clone());
     }
 
@@ -290,6 +300,8 @@ fn build_reply_body(raw: &[u8], sent_at: &str, author: &str) -> Vec<String> {
         return lines;
     }
 
+    // Quote line-by-line instead of prefixing the whole block so editing stays
+    // predictable when the user deletes or reflows only part of the quoted mail.
     lines.extend(
         body_text
             .lines()

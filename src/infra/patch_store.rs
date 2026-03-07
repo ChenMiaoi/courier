@@ -1,3 +1,9 @@
+//! Persistence for patch-series metadata and execution history.
+//!
+//! Patch analysis is recomputable from mail, but keeping normalized series and
+//! run records in SQLite makes the TUI fast and preserves workflow status
+//! across restarts.
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -163,6 +169,9 @@ ON CONFLICT(mailbox, thread_id, version) DO UPDATE SET
         )
     })?;
 
+    // Replace the item set wholesale so the stored series shape always mirrors
+    // the latest thread analysis, including reorder, duplicate, or missing
+    // patch changes discovered on a later sync.
     for item in &request.items {
         tx.execute(
             "
@@ -271,6 +280,8 @@ WHERE id = ?1
 
 pub fn insert_series_run(path: &Path, run: &SeriesRunRequest) -> Result<()> {
     let connection = open_connection(path)?;
+    // Keep an append-only run history separate from the latest status so users
+    // can inspect prior attempts even after a newer retry succeeds.
     connection
         .execute(
             "
@@ -318,6 +329,8 @@ pub fn load_series_statuses(
     let mut seen = HashSet::new();
 
     for thread_id in thread_ids {
+        // The caller may hand us repeated thread ids from a larger UI list; de-
+        // duplicate here so status hydration stays predictable and cheap.
         if !seen.insert(*thread_id) {
             continue;
         }

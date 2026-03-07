@@ -1,3 +1,9 @@
+//! Key-event routing for the TUI state machine.
+//!
+//! Modal surfaces such as the palette, reply editor, and config editor all
+//! share the same event stream. Centralizing dispatch order here prevents
+//! conflicting shortcuts from being interpreted by multiple layers at once.
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::config::run_palette_config;
@@ -26,6 +32,8 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         "user key event"
     );
 
+    // Modal UI surfaces take precedence over the base page shortcuts so keys
+    // keep local meaning while a dialog, editor, or search interaction is open.
     if state.config_editor.open {
         return handle_config_editor_key_event(state, key);
     }

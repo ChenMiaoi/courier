@@ -1,3 +1,9 @@
+//! Mail preview extraction for the preview pane.
+//!
+//! The preview pane should remain useful even when raw mail is missing or only
+//! partially parsed, so this module is intentionally biased toward graceful
+//! fallback text instead of strict MIME fidelity.
+
 use std::fs;
 
 use crate::infra::mail_store::ThreadRow;
@@ -16,6 +22,8 @@ pub(super) fn load_mail_preview(thread: &ThreadRow) -> MailPreview {
     let fallback_sent = thread.date.as_deref().and_then(non_empty_normalized_header);
 
     let Some(path) = thread.raw_path.as_ref() else {
+        // Thread rows can outlive raw-file cleanup or fixture gaps. Rendering a
+        // synthetic preview keeps navigation usable instead of failing closed.
         return MailPreview {
             warning: None,
             content: format_preview_with_headers(
@@ -71,6 +79,9 @@ fn build_mail_preview(
     fallback_from: &str,
     fallback_sent: Option<&str>,
 ) -> MailPreview {
+    // Re-parse a narrow header view here instead of sharing richer sync data so
+    // preview rendering can tolerate incomplete stored metadata and still use
+    // whatever survives in the raw message.
     let headers = parse_preview_header_block(raw);
 
     let from = preview_header_value(&headers, "from")

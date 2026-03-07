@@ -1,3 +1,9 @@
+//! Runtime bootstrap for filesystem and database prerequisites.
+//!
+//! Startup code goes through this module before touching higher-level features
+//! so later layers can assume the basic runtime directories and schema already
+//! exist.
+
 use std::fs;
 
 use crate::infra::config::RuntimeConfig;
@@ -10,6 +16,9 @@ pub struct BootstrapState {
 }
 
 pub fn prepare(config: &RuntimeConfig) -> Result<BootstrapState> {
+    // Make filesystem state explicit up front so later failures point at the
+    // actual feature operation, not at some missing directory deep in the call
+    // stack.
     ensure_runtime_dirs(config)?;
     let db_state = db::initialize(&config.database_path)?;
 

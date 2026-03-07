@@ -1,3 +1,9 @@
+//! Command-palette execution and completions.
+//!
+//! The palette is the escape hatch for actions that do not fit well into a
+//! single-key workflow. Keeping command parsing here avoids leaking shell-like
+//! concerns into the rest of the TUI state machine.
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::config::config_completion_suggestions;
@@ -128,6 +134,8 @@ pub(super) fn short_commit_id(value: &str) -> String {
 pub(super) fn resolve_palette_local_workdir(
     state: &AppState,
 ) -> std::result::Result<PathBuf, String> {
+    // Prefer the configured kernel tree so local commands run in the same repo
+    // the code browser and patch actions are already talking about.
     if let Some(path) = state.runtime.kernel_trees.first() {
         if !path.exists() {
             return Err(format!("[kernel].tree does not exist: {}", path.display()));

@@ -1,3 +1,9 @@
+//! Frame rendering for the ratatui interface.
+//!
+//! This module turns coarse-grained app state into widgets. Keeping rendering
+//! separate from input/state mutation preserves the top-down readability of the
+//! main TUI loop.
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
@@ -21,6 +27,8 @@ pub(super) fn draw(
     config: &RuntimeConfig,
     bootstrap: &BootstrapState,
 ) {
+    // Keep header, body, and footer in fixed bands so transient overlays do
+    // not cause the main navigation chrome to jump between frames.
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

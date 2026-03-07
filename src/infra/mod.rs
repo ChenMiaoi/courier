@@ -1,3 +1,9 @@
+//! Infrastructure adapters for side-effecting concerns.
+//!
+//! Filesystem access, SQLite, IMAP/lore sync, external commands, and persisted
+//! UI state all live here so the rest of the program can depend on narrower
+//! interfaces.
+
 pub mod b4;
 pub mod bootstrap;
 pub mod config;

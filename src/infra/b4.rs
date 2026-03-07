@@ -1,3 +1,9 @@
+//! Discovery and execution helpers for the external `b4` tool.
+//!
+//! Higher layers care about patch download/apply outcomes, not about PATH
+//! probing or timeout loops, so this module isolates those process-management
+//! details behind a small result type.
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -106,6 +112,8 @@ pub fn run(
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
+                // Poll with an explicit timeout so a wedged `b4` process cannot
+                // freeze the TUI or patch workflow indefinitely.
                 if started_at.elapsed() >= timeout {
                     timed_out = true;
                     let _ = child.kill();
@@ -143,6 +151,8 @@ pub fn run(
 fn candidates(configured_path: Option<&Path>) -> Vec<Candidate> {
     let mut values = Vec::new();
 
+    // Discovery order is from most explicit to most implicit so user config
+    // wins over environment hints and PATH-based fallback.
     if let Some(path) = configured_path {
         values.push(Candidate::Path(path.to_path_buf()));
     }
@@ -243,6 +253,8 @@ fn resolve_command(configured_path: Option<&Path>) -> Result<ResolvedCommand> {
     }
 
     if let Some((path, reason)) = last_failure {
+        // Report the last broken candidate explicitly because "not found" would
+        // hide a misconfigured path that the user can actually fix.
         return Err(CourierError::new(
             ErrorCode::B4,
             format!("b4 executable '{}' is broken: {}", path.display(), reason),

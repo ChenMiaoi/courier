@@ -1,3 +1,9 @@
+//! Minimal mail-header parsing used by sync and reply flows.
+//!
+//! Courier only needs a narrow subset of RFC mail parsing for threading and
+//! reply generation, so this module deliberately extracts just the fields that
+//! affect visible behavior instead of pulling a heavier MIME model everywhere.
+
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
@@ -28,6 +34,9 @@ pub fn parse_headers(raw: &[u8], fallback_message_id: String) -> ParsedMailHeade
     if references.is_empty()
         && let Some(reply_to) = in_reply_to.as_ref()
     {
+        // Some mails only provide `In-Reply-To`. Reusing it as a one-element
+        // reference chain keeps threading and reply reconstruction consistent
+        // with the more complete cases.
         references.push(reply_to.clone());
     }
 

@@ -1,3 +1,9 @@
+//! Config-editor interactions rendered inside the TUI.
+//!
+//! Editing config in-process lets Courier validate and apply changes against
+//! the same runtime normalization rules used at startup, instead of teaching
+//! the UI a second config model.
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -337,6 +343,8 @@ fn update_config_key_in_file(
         .map(render_toml_value)
         .unwrap_or_else(|| "<unknown>".to_string());
     let content = render_config_table(&table)?;
+    // Validate against the real runtime loader before touching disk so the TUI
+    // never writes a config it cannot immediately reload.
     let runtime = validate_updated_config(config_path, &content)?;
     write_config_content(config_path, &content)?;
 
@@ -443,6 +451,8 @@ fn set_config_key(
     };
     let mut current = table;
     for segment in key_parts {
+        // Materialize missing intermediate tables on demand so editing one leaf
+        // does not require the user to hand-create every parent section first.
         let node = current
             .entry(segment.to_string())
             .or_insert_with(|| TomlValue::Table(TomlTable::new()));
@@ -486,6 +496,8 @@ fn remove_config_key_segments(table: &mut TomlTable, segments: &[&str]) -> bool 
     };
 
     if prune_child {
+        // Prune now-empty parent tables so repeated edits do not leave behind
+        // confusing hollow sections in the generated config file.
         table.remove(key);
     }
 
@@ -498,6 +510,8 @@ fn parse_toml_value_literal(value_literal: &str) -> TomlValue {
         return TomlValue::String(String::new());
     }
 
+    // Parse through a synthetic TOML snippet first so numbers, booleans, and
+    // arrays preserve their real types instead of being forced into strings.
     let snippet = format!("value = {literal}");
     if let Ok(parsed) = toml::from_str::<TomlTable>(&snippet)
         && let Some(value) = parsed.get("value")
@@ -523,6 +537,8 @@ fn apply_runtime_update(state: &mut AppState, runtime: RuntimeConfig) {
     let selected_path_hint = state.selected_kernel_tree_path();
     let enabled_mailboxes: HashSet<String> = state.enabled_mailboxes().into_iter().collect();
     let active_mailbox = state.active_thread_mailbox.clone();
+    // Preserve current UI intent across config reloads so editing one setting
+    // does not unexpectedly wipe mailbox enablement or the active tree focus.
     state.runtime = runtime;
     state.ui_state_path = ui_state::path_for_data_dir(&state.runtime.data_dir);
     state.subscriptions = default_subscriptions(
@@ -645,6 +661,9 @@ pub(super) fn config_completion_suggestions(
         ],
         2 => {
             let owned_editor_keys: Vec<&str>;
+            // Suggest only keys relevant to the chosen action so palette
+            // completion nudges users toward supported edits instead of every
+            // config field the runtime happens to know about.
             let keys = if action == "set" {
                 CONFIG_SET_KEYS
             } else if action == "edit" {
@@ -912,6 +931,9 @@ pub(super) fn draw_config_editor(frame: &mut Frame<'_>, state: &AppState) {
         String::new(),
         format!("File value: {}", file_value),
         format!("Effective: {}", effective_value),
+        // Show both the literal file value and the effective runtime value so
+        // users can see when defaults or derived behavior are masking an unset
+        // field in the config file itself.
         format!(
             "Source: {}",
             if file_value == "<unset>" {

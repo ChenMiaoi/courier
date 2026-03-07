@@ -1,3 +1,8 @@
+//! Static subscription templates for the mailbox picker.
+//!
+//! Keeping this list in code makes startup deterministic and offline-friendly;
+//! runtime persistence only stores user choices, not a second mutable catalog.
+
 #[derive(Debug, Clone, Copy)]
 pub struct SubscriptionTemplate {
     pub mailbox: &'static str,
@@ -5,7 +10,8 @@ pub struct SubscriptionTemplate {
     pub description: &'static str,
 }
 
-// Snapshot from https://subspace.kernel.org/vger.kernel.org.html (M2 baseline).
+// Keep a curated snapshot in-tree so default subscriptions do not depend on a
+// network fetch or on the source site remaining stable at startup time.
 pub const VGER_SUBSCRIPTIONS: &[SubscriptionTemplate] = &[
     SubscriptionTemplate {
         mailbox: "arm-scmi",

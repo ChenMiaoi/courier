@@ -1,3 +1,9 @@
+//! Mail source adapters behind a common sync trait.
+//!
+//! Fixture data, lore.kernel.org, and real IMAP all implement the same
+//! high-level contract so sync orchestration can share checkpoint logic and
+//! storage invariants regardless of where mail bytes came from.
+
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::{Read, Write};

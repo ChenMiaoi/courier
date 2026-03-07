@@ -1,3 +1,10 @@
+//! Patch-series analysis and `b4` orchestration.
+//!
+//! Thread inspection, integrity checks, and external command execution live in
+//! one module so the TUI can ask higher-level questions such as "is this
+//! series ready to apply?" without knowing how `b4` or patch metadata storage
+//! work underneath.
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -152,6 +159,8 @@ struct CandidatePatch<'a> {
 pub fn build_series_index(mailbox: &str, threads: &[ThreadRow]) -> HashMap<i64, SeriesSummary> {
     let mut rows_by_thread: HashMap<i64, Vec<(usize, &ThreadRow)>> = HashMap::new();
     for (index, row) in threads.iter().enumerate() {
+        // Patch readiness is a thread-level property, so group rows first and
+        // only analyze ordering/integrity within that conversation boundary.
         rows_by_thread
             .entry(row.thread_id)
             .or_default()
@@ -172,6 +181,9 @@ pub fn hydrate_series_statuses(
     mailbox: &str,
     summaries: &mut HashMap<i64, SeriesSummary>,
 ) -> Result<()> {
+    // Recompute structure from mail every time, then overlay persisted workflow
+    // state so stale database status cannot invent patch series that no longer
+    // exist in the visible thread set.
     let thread_ids: Vec<i64> = summaries.keys().copied().collect();
     let statuses = patch_store::load_series_statuses(path, mailbox, &thread_ids)?;
     for (thread_id, status) in statuses {
@@ -235,6 +247,8 @@ pub fn run_action(
         },
     )?;
 
+    // Mark the series as actively being worked on before spawning `b4` so the
+    // UI reflects in-flight intent even if the external process later fails.
     patch_store::update_series_result(
         &runtime.database_path,
         record.id,
@@ -263,6 +277,8 @@ pub fn run_action(
     };
     let mut output_path: Option<PathBuf> = None;
     let apply_artifacts_before = if matches!(action, PatchAction::Apply) {
+        // Snapshot existing artifacts so we only relocate files created by this
+        // apply run, not unrelated leftovers already present in the tree.
         working_dir
             .as_deref()
             .map(snapshot_apply_artifacts)
@@ -338,6 +354,8 @@ pub fn run_action(
         && status == PatchSeriesStatus::Applied
         && let (Some(path), Some(before_head)) = (working_dir.as_deref(), baseline_head.as_deref())
     {
+        // A zero exit code is not enough for apply: verify that git history
+        // actually moved so "no-op success" does not look like a real apply.
         match resolve_git_head(path) {
             Ok(after_head) => {
                 if after_head == *before_head {
@@ -428,6 +446,8 @@ pub fn undo_last_apply(
         )
     })?;
     let current_head = resolve_git_head(&working_dir)?;
+    // Refuse to undo if HEAD no longer matches the previously applied commit,
+    // otherwise we could silently discard unrelated user work.
     if current_head != expected_current_head {
         return Err(CourierError::new(
             ErrorCode::Command,
@@ -504,6 +524,8 @@ fn analyze_thread_series(
         return None;
     }
 
+    // When multiple rerolls exist in one thread, surface only the newest
+    // version; mixing v1/v2 patches would produce misleading integrity results.
     let selected_version = parsed_candidates
         .iter()
         .map(|candidate| candidate.parsed.version)
@@ -582,6 +604,8 @@ fn analyze_thread_series(
                 .min_by_key(|candidate| candidate.sort_ord)
         })
         .or_else(|| selected.iter().min_by_key(|candidate| candidate.sort_ord))?;
+    // Prefer the cover letter as the anchor when present because it usually has
+    // the best series title; otherwise fall back to the first real patch/mail.
 
     let subject = if anchor.parsed.title.is_empty() {
         anchor.row.subject.trim().to_string()
@@ -792,6 +816,8 @@ fn prepare_download_dir(root: &Path, summary: &SeriesSummary) -> Result<PathBuf>
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
+    // Include a time component so repeated downloads of the same series do not
+    // clobber earlier exports the user may still want to inspect.
     let name = download_series_name(summary);
     let dir = root.join(format!("{name}-{nonce}"));
     fs::create_dir_all(&dir).map_err(|error| {
@@ -873,6 +899,8 @@ fn relocate_new_apply_artifacts(
     }
     created.sort();
 
+    // Move apply artifacts under Courier-managed storage so later cleanups and
+    // previews do not depend on temporary files remaining in the kernel tree.
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -1009,6 +1037,8 @@ fn map_b4_result(
                 "series applied by b4 shazam".to_string(),
             );
         }
+        // Download keeps the series in a reviewable state because fetching
+        // patches does not imply they were applied anywhere yet.
         if let Some(path) = output_path {
             return (
                 PatchSeriesStatus::Reviewing,
@@ -1061,6 +1091,8 @@ fn truncate_output(value: &str) -> String {
     if value.len() <= MAX_LOG_BYTES {
         return value.to_string();
     }
+    // Persist a bounded amount of tool output so the DB stays readable and one
+    // noisy command cannot bloat the patch history tables indefinitely.
     let mut truncated = value[..MAX_LOG_BYTES].to_string();
     truncated.push_str("\n<truncated>");
     truncated
