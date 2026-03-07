@@ -37,27 +37,28 @@
 
 - VM1 + `git send-email` + git email 身份检查均可演示。
 
-## RM1：Patch Preview 一步回信（MVP，必须）
+## RM1：Patch Preview 一步回信（MVP，必须，已完成）
 
 ### 阶段目标
 
 用户在 `Patch Preview` 进入 Vim 模式后，系统自动弹出回信面板，完成“填充 -> 编辑 -> 发送”最短闭环。
 
-### 任务拆分
+### 已完成项
 
 1. 回信入口与状态机
    - 在 `Patch Preview + Vim` 激活时自动打开 `Reply Panel`。
    - 面板关闭/发送/取消后，稳定回到预览上下文。
    - 发送动作固定为 `Send Preview -> Confirm Send -> Send`。
 2. 头部自动填充
+   - `From/To/Cc/Subject` 打开面板时会自动填充默认值，但都允许用户修改。
    - `Subject` 自动规范为单一 `Re: ...`。
-   - `To/Cc` 继承原邮件并去重。
+   - `To/Cc` 默认继承原邮件并去重。
    - 若出现自己地址，自动从 `To/Cc` 移除。
-   - `From` 自动读取 git email 身份。
+   - `From` 默认读取 git email 身份。
    - 自动构造 `In-Reply-To` 与 `References`。
 3. 正文模板与引用输入
    - 自动生成 `On ..., ... wrote:` + `>` 引用模板。
-   - 在 Vim `INSERT` 中按 `Enter` 自动续写 `> `。
+   - 在 Vim `INSERT` 中保留普通换行；用户回复写在不带 `>` 的空白行中。
    - 保持纯文本与内核常用 inline reply 格式。
 4. 发送执行（MVP）
    - 实现 `SendService`（或等价抽象），由 Reply Panel 调用统一接口。
@@ -84,12 +85,13 @@
 
 1. 在 patch 预览进入 Vim 后自动看到回信面板。
 2. 标题自动为规范 `Re: ...`，且不重复前缀。
-3. `To/Cc` 与原邮件一致并自动去自己。
-4. `From` 自动取自 git email 身份。
-5. `Enter` 可在引用区持续自动补 `> `。
-6. 用户必须先通过 `Send Preview` 确认，才允许发送。
-7. 发送路径对用户仅暴露 `Send`，底层实现细节不外露。
-8. MVP 底层 `git send-email` 可完成发送，失败可追踪并可重试。
+3. `From/To/Cc/Subject` 进入面板时自动填充，但用户可直接修改。
+4. `To/Cc` 在预览时仍会自动去自己并去重。
+5. `From` 默认取自 git email 身份，修改后仍需保持有效邮箱地址。
+6. 用户回复默认写在不带 `>` 的空白行中，历史引用层级以保留的 `>` / `>>` 表示。
+7. 用户必须先通过 `Send Preview` 确认，才允许发送。
+8. 发送路径对用户仅暴露 `Send`，底层实现细节不外露。
+9. MVP 底层 `git send-email` 可完成发送，失败可追踪并可重试。
 
 ### 退出条件
 

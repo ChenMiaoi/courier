@@ -4,6 +4,7 @@ use crate::infra::mail_store::ThreadRow;
 
 use super::{PREVIEW_RECIPIENT_PREVIEW_LIMIT, PREVIEW_TAB_SPACES};
 
+#[derive(Debug, Clone)]
 pub(super) struct MailPreview {
     pub warning: Option<String>,
     pub content: String,
@@ -294,7 +295,7 @@ fn build_preview_warning(headers: &[(String, String)]) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-pub(super) fn extract_mail_body_preview(raw: &[u8]) -> String {
+pub(super) fn extract_mail_body_text(raw: &[u8]) -> String {
     let body_start = find_subslice(raw, b"\r\n\r\n")
         .map(|index| index + 4)
         .or_else(|| find_subslice(raw, b"\n\n").map(|index| index + 2))
@@ -306,12 +307,17 @@ pub(super) fn extract_mail_body_preview(raw: &[u8]) -> String {
 
     let sanitized = sanitize_preview_text(&stripped);
 
-    let lines: Vec<&str> = sanitized
+    sanitized
         .lines()
         .map(str::trim_end)
         .skip_while(|line| line.trim().is_empty())
-        .take(80)
-        .collect();
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+pub(super) fn extract_mail_body_preview(raw: &[u8]) -> String {
+    let body_text = extract_mail_body_text(raw);
+    let lines: Vec<&str> = body_text.lines().take(80).collect();
 
     let snippet = lines.join("\n");
     if snippet.trim().is_empty() {

@@ -221,6 +221,21 @@ pub fn load(config_override: Option<&Path>) -> Result<RuntimeConfig> {
     load_with_home(config_override, &home_dir)
 }
 
+pub(crate) fn load_from_document(config_path: &Path, content: &str) -> Result<RuntimeConfig> {
+    let home_dir = UserDirs::new()
+        .map(|dirs| dirs.home_dir().to_path_buf())
+        .ok_or_else(|| {
+            CourierError::new(
+                ErrorCode::ConfigRead,
+                "failed to determine HOME directory for courier runtime",
+            )
+        })?;
+    let default_root = home_dir.join(DEFAULT_RUNTIME_DIR_NAME);
+    let file_config = parse_config_document(content, config_path)?;
+
+    build_runtime_config(config_path.to_path_buf(), file_config, &default_root)
+}
+
 fn load_with_home(config_override: Option<&Path>, home_dir: &Path) -> Result<RuntimeConfig> {
     let default_root = home_dir.join(DEFAULT_RUNTIME_DIR_NAME);
 
@@ -236,16 +251,24 @@ fn load_with_home(config_override: Option<&Path>, home_dir: &Path) -> Result<Run
         FileConfig::default()
     };
 
+    build_runtime_config(config_path, file_config, &default_root)
+}
+
+fn build_runtime_config(
+    config_path: PathBuf,
+    file_config: FileConfig,
+    default_root: &Path,
+) -> Result<RuntimeConfig> {
     let config_base_dir = config_path
         .parent()
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_root.clone());
+        .unwrap_or_else(|| default_root.to_path_buf());
 
     let data_dir = file_config
         .storage
         .data_dir
         .map(|path| resolve_path(&config_base_dir, path))
-        .unwrap_or_else(|| default_root.clone());
+        .unwrap_or_else(|| default_root.to_path_buf());
 
     let database_path = file_config
         .storage
@@ -366,7 +389,15 @@ fn parse_config_file(path: &Path) -> Result<FileConfig> {
         )
     })?;
 
-    toml::from_str::<FileConfig>(&content).map_err(|error| {
+    parse_config_document(&content, path)
+}
+
+fn parse_config_document(content: &str, path: &Path) -> Result<FileConfig> {
+    if content.trim().is_empty() {
+        return Ok(FileConfig::default());
+    }
+
+    toml::from_str::<FileConfig>(content).map_err(|error| {
         CourierError::with_source(
             ErrorCode::ConfigParse,
             format!("failed to parse TOML config {}", path.display()),

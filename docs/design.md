@@ -407,6 +407,28 @@ MVP 范围与阶段目标已迁移至独立文档：
 - 默认启用 `My Inbox` 会改变“首次启动默认全禁用”的旧行为；迁移策略应固定为：
   对已有 `ui-state.toml` 用户保持原状态，仅对首次引入 IMAP 配置或新用户自动开启。
 
+## 18. M7（已完成）：回信编辑与预览
+
+### 18.1 已决策项
+
+- Reply MVP 首版接入 mail page 的 `Preview` 面板：`e` 在 `Preview` 上进入回信
+  Vim 编辑态，`r` 作为直接回信别名入口，统一打开 `Reply Panel` 悬浮层。
+- `Reply Panel` 在打开时自动填充 `From`、`To`、`Cc`、`Subject`、
+  `In-Reply-To`、`References` 与 kernel 风格引用正文；`Subject` 固定规范为单一
+  `Re: ...`，其中 `From/To/Cc/Subject` 只是可编辑的默认值，只有
+  `In-Reply-To/References` 保持只读；`To/Cc` 在构造与预览阶段都会去重并移除自己地址。
+- 回信编辑沿用 VM1 的最小 Vim-like 交互（`NORMAL / INSERT / COMMAND`），但作用域改为
+  Reply draft：头部字段保持单行编辑，正文支持 `>` 引用续写。
+- `Send Preview -> Confirm` 在 M7 固化为强门控：任何 draft 变更都会清除确认状态，
+  M8 只允许在该确认状态上接入真实发送器，不再绕过前置预览。
+
+### 18.2 风险与后续动作
+
+- 当前 reply draft 仅保存在内存中，关闭面板或退出 TUI 后不会恢复；若 M8 引入发送重试/
+  草稿保留，需要补充持久化策略。
+- 正文仍以纯文本单缓冲区编辑为主，尚未加入 72 列辅助换行、地址补全或 alias 管理；
+  这些增强应在不破坏当前头部构造规则的前提下后续追加。
+
 ---
 
 该文档作为实现基线，后续应同步更新设计决策、风险项与约束变化。

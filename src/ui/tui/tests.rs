@@ -1,0 +1,2767 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+
+use crate::infra::bootstrap::BootstrapState;
+use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
+use crate::infra::db;
+use crate::infra::db::DatabaseState;
+use crate::infra::mail_parser;
+use crate::infra::mail_store::{self, IncomingMail, SyncBatch, ThreadRow};
+use crate::infra::ui_state::UiState;
+
+use super::preview::preview_warning_message;
+use super::reply::ReplyIdentity;
+use super::{
+    AppState, CodeEditMode, CodePaneFocus, ExternalEditorProcessResult, LoopAction, MY_INBOX_LABEL,
+    Pane, ReplyEditMode, ReplySection, StartupSyncEvent, StartupSyncMailboxStatus,
+    StartupSyncState, SubscriptionItem, UiPage, catch_sync_panic, code_edit_cursor_position, draw,
+    extract_mail_body_preview, extract_mail_preview, handle_key_event, is_palette_open_shortcut,
+    is_palette_toggle, load_source_file_preview, mail_page_panes, matching_commands,
+    pick_external_editor, resolve_palette_local_workdir, run_external_editor_session_with,
+    sanitize_inline_ui_text, subscription_line, thread_line,
+};
+
+fn temp_dir(label: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("courier-ui-{label}-{nonce}"));
+    fs::create_dir_all(&path).expect("create temp dir");
+    path
+}
+
+fn sample_thread(subject: &str, message_id: &str, depth: u16) -> ThreadRow {
+    ThreadRow {
+        thread_id: 1,
+        mail_id: 1,
+        depth,
+        subject: subject.to_string(),
+        from_addr: "alice@example.com".to_string(),
+        message_id: message_id.to_string(),
+        in_reply_to: None,
+        date: None,
+        raw_path: None,
+    }
+}
+
+fn sample_thread_with_raw(
+    subject: &str,
+    message_id: &str,
+    depth: u16,
+    raw_path: PathBuf,
+) -> ThreadRow {
+    ThreadRow {
+        thread_id: 1,
+        mail_id: 1,
+        depth,
+        subject: subject.to_string(),
+        from_addr: "alice@example.com".to_string(),
+        message_id: message_id.to_string(),
+        in_reply_to: None,
+        date: None,
+        raw_path: Some(raw_path),
+    }
+}
+
+fn sample_thread_in_thread(
+    thread_id: i64,
+    mail_id: i64,
+    subject: &str,
+    message_id: &str,
+    depth: u16,
+) -> ThreadRow {
+    ThreadRow {
+        thread_id,
+        mail_id,
+        depth,
+        subject: subject.to_string(),
+        from_addr: "alice@example.com".to_string(),
+        message_id: message_id.to_string(),
+        in_reply_to: None,
+        date: None,
+        raw_path: None,
+    }
+}
+
+fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
+    RuntimeConfig {
+        config_path: root.join("config.toml"),
+        data_dir: root.join("data"),
+        database_path: root.join("data/courier.db"),
+        raw_mail_dir: root.join("data/raw"),
+        patch_dir: root.join("data/patches"),
+        log_dir: root.join("data/logs"),
+        b4_path: None,
+        log_filter: "info".to_string(),
+        source_mailbox: "inbox".to_string(),
+        imap: crate::infra::config::ImapConfig::default(),
+        lore_base_url: "https://lore.kernel.org".to_string(),
+        startup_sync: true,
+        kernel_trees: Vec::new(),
+    }
+}
+
+fn test_runtime() -> RuntimeConfig {
+    test_runtime_in(PathBuf::from("/tmp/courier-ui-test"))
+}
+
+fn test_runtime_with_kernel_tree(tree: PathBuf) -> RuntimeConfig {
+    let mut runtime = test_runtime();
+    runtime.kernel_trees = vec![tree];
+    runtime
+}
+
+fn test_runtime_with_imap_in(root: PathBuf) -> RuntimeConfig {
+    let mut runtime = test_runtime_in(root);
+    runtime.imap = crate::infra::config::ImapConfig {
+        email: Some("me@example.com".to_string()),
+        user: Some("imap-user".to_string()),
+        pass: Some("imap-pass".to_string()),
+        server: Some("imap.example.com".to_string()),
+        server_port: Some(993),
+        encryption: Some(crate::infra::config::ImapEncryption::Tls),
+        proxy: None,
+    };
+    runtime
+}
+
+fn test_runtime_with_imap() -> RuntimeConfig {
+    test_runtime_with_imap_in(PathBuf::from("/tmp/courier-ui-test"))
+}
+
+fn seed_mailbox_thread(db_path: &Path, mailbox: &str, uid: u32, message_id: &str, subject: &str) {
+    fs::create_dir_all(db_path.parent().expect("db parent")).expect("create db parent");
+    db::initialize(db_path).expect("initialize db");
+    let batch = SyncBatch {
+            mailbox: mailbox.to_string(),
+            uidvalidity: 1,
+            highest_uid: uid,
+            highest_modseq: Some(uid as u64),
+            mails: vec![IncomingMail {
+                mailbox: mailbox.to_string(),
+                uid,
+                modseq: Some(uid as u64),
+                flags: vec!["Seen".to_string()],
+                raw_path: PathBuf::from(format!("/tmp/{mailbox}-{uid}.eml")),
+                parsed: mail_parser::parse_headers(
+                    format!(
+                        "Message-ID: <{message_id}>\nSubject: {subject}\nFrom: Alice <alice@example.com>\n\nbody\n"
+                    )
+                    .as_bytes(),
+                    format!("synthetic-{mailbox}-{uid}@local"),
+                ),
+            }],
+        };
+
+    mail_store::apply_sync_batch(db_path, batch).expect("apply mailbox sync batch");
+}
+
+fn startup_sync_state(mailboxes: &[(&str, StartupSyncMailboxStatus)]) -> StartupSyncState {
+    let (_sender, receiver) = mpsc::channel();
+    StartupSyncState {
+        receiver,
+        mailbox_order: mailboxes
+            .iter()
+            .map(|(mailbox, _)| (*mailbox).to_string())
+            .collect(),
+        mailboxes: mailboxes
+            .iter()
+            .map(|(mailbox, status)| ((*mailbox).to_string(), *status))
+            .collect(),
+        total: mailboxes.len(),
+        completed: mailboxes
+            .iter()
+            .filter(|(_, status)| {
+                matches!(
+                    status,
+                    StartupSyncMailboxStatus::Finished | StartupSyncMailboxStatus::Failed
+                )
+            })
+            .count(),
+        succeeded: mailboxes
+            .iter()
+            .filter(|(_, status)| matches!(status, StartupSyncMailboxStatus::Finished))
+            .count(),
+        failed: mailboxes
+            .iter()
+            .filter(|(_, status)| matches!(status, StartupSyncMailboxStatus::Failed))
+            .count(),
+    }
+}
+
+fn test_bootstrap(runtime: &RuntimeConfig) -> BootstrapState {
+    BootstrapState {
+        db: DatabaseState {
+            path: runtime.database_path.clone(),
+            schema_version: 1,
+            created: false,
+            applied_migrations: vec![],
+        },
+    }
+}
+
+#[test]
+fn startup_sync_is_not_started_when_disabled_in_config() {
+    let mut runtime = test_runtime();
+    runtime.startup_sync = false;
+    let mut state = AppState::new(vec![], runtime);
+
+    state.start_startup_sync_if_enabled();
+
+    assert!(state.startup_sync.is_none());
+}
+
+#[test]
+fn startup_sync_progress_summary_renders_counts_and_running_mailbox() {
+    let sync_state = startup_sync_state(&[
+        ("INBOX", StartupSyncMailboxStatus::InFlight),
+        ("io-uring", StartupSyncMailboxStatus::Pending),
+        ("kvm", StartupSyncMailboxStatus::Finished),
+    ]);
+
+    assert_eq!(
+        sync_state.progress_summary(),
+        "1/3 ok=1 fail=0 queued=1 running=INBOX"
+    );
+    assert_eq!(
+        sync_state.mailbox_states_display(),
+        "INBOX:syncing io-uring:queued kvm:done"
+    );
+}
+
+fn external_editor_mock_success(
+    _editor: &str,
+    file_path: &Path,
+) -> std::result::Result<ExternalEditorProcessResult, String> {
+    fs::write(file_path, "externally edited\n")
+        .map_err(|error| format!("failed to write fixture: {error}"))?;
+    Ok(ExternalEditorProcessResult {
+        success: true,
+        exit_code: Some(0),
+    })
+}
+
+fn external_editor_mock_failure(
+    _editor: &str,
+    _file_path: &Path,
+) -> std::result::Result<ExternalEditorProcessResult, String> {
+    Err("mock launch failure".to_string())
+}
+
+fn reply_identity_mock() -> std::result::Result<ReplyIdentity, String> {
+    Ok(ReplyIdentity {
+        display: "Courier Test <courier@example.com>".to_string(),
+        email: "courier@example.com".to_string(),
+    })
+}
+
+#[test]
+fn empty_query_returns_all_palette_commands() {
+    let all = matching_commands("");
+    assert_eq!(all.len(), 7);
+    assert_eq!(all[0].name, "config");
+    assert_eq!(all[1].name, "exit");
+    assert_eq!(all[2].name, "help");
+    assert_eq!(all[3].name, "quit");
+    assert_eq!(all[4].name, "restart");
+    assert_eq!(all[5].name, "sync");
+    assert_eq!(all[6].name, "vim");
+}
+
+#[test]
+fn prefix_matches_rank_before_fuzzy_matches() {
+    let commands = matching_commands("ex");
+    assert_eq!(commands[0].name, "exit");
+}
+
+#[test]
+fn bang_mode_is_not_matched_as_builtin_command() {
+    let commands = matching_commands("!pwd");
+    assert!(commands.is_empty());
+}
+
+#[test]
+fn external_editor_selection_prefers_visual_then_editor_then_vim() {
+    assert_eq!(
+        pick_external_editor(Some("nvim"), Some("vim")),
+        "nvim".to_string()
+    );
+    assert_eq!(
+        pick_external_editor(Some("  "), Some("hx")),
+        "hx".to_string()
+    );
+    assert_eq!(pick_external_editor(None, Some("nano")), "nano".to_string());
+    assert_eq!(pick_external_editor(None, None), "vim".to_string());
+}
+
+#[test]
+fn external_editor_session_restores_terminal_after_editor_exit() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let steps: Rc<RefCell<Vec<&'static str>>> = Rc::new(RefCell::new(Vec::new()));
+    let result = run_external_editor_session_with(
+        "vim",
+        Path::new("/tmp/demo.rs"),
+        {
+            let steps = steps.clone();
+            move || {
+                steps.borrow_mut().push("disable_raw");
+                Ok(())
+            }
+        },
+        {
+            let steps = steps.clone();
+            move || {
+                steps.borrow_mut().push("leave_alt");
+                Ok(())
+            }
+        },
+        {
+            let steps = steps.clone();
+            move |_, _| {
+                steps.borrow_mut().push("launch");
+                Ok(ExternalEditorProcessResult {
+                    success: true,
+                    exit_code: Some(0),
+                })
+            }
+        },
+        {
+            let steps = steps.clone();
+            move || {
+                steps.borrow_mut().push("enter_alt");
+                Ok(())
+            }
+        },
+        {
+            let steps = steps.clone();
+            move || {
+                steps.borrow_mut().push("enable_raw");
+                Ok(())
+            }
+        },
+    )
+    .expect("external editor session should succeed");
+
+    assert!(result.success);
+    assert_eq!(
+        *steps.borrow(),
+        vec![
+            "disable_raw",
+            "leave_alt",
+            "launch",
+            "enter_alt",
+            "enable_raw"
+        ]
+    );
+}
+
+#[test]
+fn mail_page_layout_keeps_preview_at_fixed_80_columns() {
+    let panes = mail_page_panes(Rect::new(0, 0, 180, 20));
+
+    assert_eq!(panes[2].width, 80);
+    assert_eq!(panes[2].x, 100);
+    assert_eq!(panes[0].width, 25);
+    assert_eq!(panes[1].width, 75);
+    assert_eq!(panes[0].width + panes[1].width + panes[2].width, 180);
+}
+
+#[test]
+fn mail_page_layout_falls_back_to_available_width_when_terminal_is_narrow() {
+    let panes = mail_page_panes(Rect::new(0, 0, 60, 20));
+
+    assert_eq!(panes[2].width, 60);
+    assert_eq!(panes[0].width, 0);
+    assert_eq!(panes[1].width, 0);
+}
+
+#[test]
+fn subscription_line_shows_marker_and_mailbox_name_only() {
+    let enabled = SubscriptionItem {
+        mailbox: "io-uring".to_string(),
+        label: "io-uring".to_string(),
+        enabled: true,
+    };
+    let disabled = SubscriptionItem {
+        mailbox: "linux-mm".to_string(),
+        label: "linux-mm".to_string(),
+        enabled: false,
+    };
+
+    assert_eq!(subscription_line(&enabled, None), "[y] io-uring");
+    assert_eq!(subscription_line(&disabled, None), "[n] linux-mm");
+}
+
+#[test]
+fn subscription_line_shows_sync_suffix_when_progress_is_active() {
+    let enabled = SubscriptionItem {
+        mailbox: "INBOX".to_string(),
+        label: "My Inbox".to_string(),
+        enabled: true,
+    };
+
+    assert_eq!(
+        subscription_line(&enabled, Some(StartupSyncMailboxStatus::Pending)),
+        "[y] My Inbox [queued]"
+    );
+    assert_eq!(
+        subscription_line(&enabled, Some(StartupSyncMailboxStatus::InFlight)),
+        "[y] My Inbox [sync]"
+    );
+}
+
+#[test]
+fn thread_line_hides_sender() {
+    let row = sample_thread("thread subject", "x@example.com", 0);
+    let line = thread_line(&row, 120);
+
+    assert_eq!(line, "thread subject");
+    assert!(!line.contains("alice@example.com"));
+}
+
+#[test]
+fn thread_line_truncates_by_max_chars_and_available_width() {
+    let long_subject = "x".repeat(240);
+    let row = sample_thread(&long_subject, "x@example.com", 0);
+
+    let line_capped_at_120 = thread_line(&row, 200);
+    assert_eq!(
+        line_capped_at_120.chars().count(),
+        super::THREAD_LINE_MAX_CHARS
+    );
+    assert!(line_capped_at_120.ends_with("..."));
+
+    let line_capped_by_width = thread_line(&row, 30);
+    assert_eq!(line_capped_by_width.chars().count(), 30);
+    assert!(line_capped_by_width.ends_with("..."));
+}
+
+#[test]
+fn command_palette_quit_exits_application() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "quit".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(action, LoopAction::Exit));
+}
+
+#[test]
+fn command_palette_restart_requests_tui_restart() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "restart".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(action, LoopAction::Restart));
+}
+
+#[test]
+fn command_palette_help_includes_keyboard_shortcuts() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "help".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(state.status.contains("keys:"));
+    assert!(state.status.contains("j/l focus"));
+    assert!(state.status.contains("i/k move"));
+    assert!(state.status.contains("y/n enable"));
+    assert!(state.status.contains("a apply"));
+    assert!(state.status.contains("d download"));
+    assert!(state.status.contains("u undo apply"));
+}
+
+#[test]
+fn config_palette_get_and_set_roundtrip() {
+    let root = temp_dir("palette-config");
+    let config_path = root.join("courier-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[source]
+mailbox = "inbox"
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(vec![], runtime);
+
+    state.palette.open = true;
+    state.palette.input = "config get source.mailbox".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.status.contains("source.mailbox"));
+    assert!(state.status.contains("inbox"));
+
+    state.palette.open = true;
+    state.palette.input = "config set source.mailbox io-uring".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.status.contains("config updated"));
+    assert_eq!(state.runtime.source_mailbox, "io-uring");
+
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(persisted.contains("mailbox = \"io-uring\""));
+
+    state.palette.open = true;
+    state.palette.input = "config get source.mailbox".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.status.contains("io-uring"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_command_opens_visual_editor() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "config".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(state.config_editor.open);
+    assert!(!state.palette.open);
+    assert_eq!(state.selected_config_editor_field().key, "source.mailbox");
+}
+
+#[test]
+fn config_editor_saves_selected_value() {
+    let root = temp_dir("config-editor-save");
+    let config_path = root.join("courier-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[source]
+mailbox = "inbox"
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(vec![], runtime);
+
+    state.open_config_editor(Some("source.mailbox"));
+    state.start_config_editor_edit();
+    state.config_editor.input = "io-uring".to_string();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert_eq!(state.runtime.source_mailbox, "io-uring");
+    assert!(!state.config_editor.open || state.config_editor.input.is_empty());
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(persisted.contains("mailbox = \"io-uring\""));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_editor_tab_cycles_boolean_presets() {
+    let root = temp_dir("config-editor-toggle");
+    let config_path = root.join("courier-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+startup_sync = true
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(vec![], runtime);
+
+    state.open_config_editor(Some("ui.startup_sync"));
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    assert!(!state.runtime.startup_sync);
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(persisted.contains("startup_sync = false"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_editor_can_unset_optional_key() {
+    let root = temp_dir("config-editor-unset");
+    let config_path = root.join("courier-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[b4]
+path = "/usr/bin/b4"
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(vec![], runtime);
+
+    state.open_config_editor(Some("b4.path"));
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+
+    assert!(state.runtime.b4_path.is_none());
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(!persisted.contains("path = "));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_editor_rejects_invalid_runtime_value_without_writing_file() {
+    let root = temp_dir("config-editor-invalid");
+    let config_path = root.join("courier-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+startup_sync = true
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(vec![], runtime);
+
+    state.open_config_editor(Some("ui.startup_sync"));
+    state.start_config_editor_edit();
+    state.config_editor.input = "maybe".to_string();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(
+        state
+            .status
+            .contains("failed to set config key ui.startup_sync")
+    );
+    assert!(state.runtime.startup_sync);
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(persisted.contains("startup_sync = true"));
+    assert!(!persisted.contains("maybe"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_palette_set_does_not_overwrite_scalar_parent_keys() {
+    let root = temp_dir("config-palette-scalar-parent");
+    let config_path = root.join("courier-config.toml");
+    fs::write(&config_path, "source = \"broken\"\n").expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(vec![], runtime);
+
+    state.palette.open = true;
+    state.palette.input = "config set source.mailbox io-uring".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(state.status.contains("cannot set source.mailbox"));
+    assert_eq!(state.runtime.source_mailbox, "inbox");
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert_eq!(persisted, "source = \"broken\"\n");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_editor_overlay_is_rendered() {
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.open_config_editor(Some("source.mailbox"));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw config editor");
+    let rendered = format!("{}", terminal.backend());
+
+    assert!(rendered.contains("Runtime Config"));
+    assert!(rendered.contains("source.mailbox"));
+    assert!(rendered.contains("Selected Field"));
+}
+
+#[test]
+fn ctrl_backtick_toggles_command_palette() {
+    let key = KeyEvent::new(KeyCode::Char('`'), KeyModifiers::CONTROL);
+    assert!(is_palette_toggle(key));
+}
+
+#[test]
+fn colon_opens_command_palette() {
+    let mut state = AppState::new(vec![], test_runtime());
+
+    let key = KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT);
+    assert!(is_palette_open_shortcut(key));
+
+    let action = handle_key_event(&mut state, key);
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(state.palette.open);
+}
+
+#[test]
+fn palette_tab_completes_top_level_command() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "co".to_string();
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    assert_eq!(state.palette.input, "config ");
+}
+
+#[test]
+fn palette_tab_completes_config_subcommand_and_key() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "config g".to_string();
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.palette.input, "config get ");
+
+    state.palette.input = "config get source.m".to_string();
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.palette.input, "config get source.mailbox ");
+}
+
+#[test]
+fn palette_tab_completes_sync_mailbox() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "sync bp".to_string();
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    assert_eq!(state.palette.input, "sync bpf ");
+}
+
+#[test]
+fn palette_double_tab_lists_config_arguments() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "config".to_string();
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.palette.input, "config ");
+    assert!(!state.palette.show_suggestions);
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(state.palette.show_suggestions);
+    let values: Vec<String> = state
+        .palette
+        .suggestions
+        .iter()
+        .map(|item| item.value.clone())
+        .collect();
+    assert!(values.contains(&"show".to_string()));
+    assert!(values.contains(&"get".to_string()));
+    assert!(values.contains(&"set".to_string()));
+    assert!(values.contains(&"help".to_string()));
+}
+
+#[test]
+fn palette_tab_completes_local_command_path() {
+    let tree_root = temp_dir("palette-bang-complete");
+    fs::write(tree_root.join("echo-local"), "#!/bin/sh\n").expect("write executable");
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    state.palette.open = true;
+    state.palette.input = "!./ec".to_string();
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+    assert_eq!(state.palette.input, "!./echo-local ");
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn local_command_mode_uses_kernel_tree_as_workdir() {
+    let tree_root = temp_dir("palette-bang-kernel-tree");
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let state = AppState::new(vec![], runtime);
+
+    let workdir = resolve_palette_local_workdir(&state).expect("resolve local workdir");
+    assert_eq!(workdir, tree_root);
+
+    let _ = fs::remove_dir_all(workdir);
+}
+
+#[test]
+fn local_command_mode_falls_back_to_home_workdir() {
+    let state = AppState::new(vec![], test_runtime());
+    let resolved = resolve_palette_local_workdir(&state);
+    match std::env::var("HOME") {
+        Ok(home) => assert_eq!(resolved.expect("resolve home"), PathBuf::from(home)),
+        Err(_) => assert!(resolved.is_err()),
+    }
+}
+
+#[test]
+fn palette_bang_executes_local_command() {
+    let tree_root = temp_dir("palette-bang-exec");
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    state.palette.open = true;
+    state.palette.input = "!pwd".to_string();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(state.status.contains("local command ok"));
+    assert!(state.status.contains(&tree_root.display().to_string()));
+    let local_result = state
+        .palette
+        .last_local_result
+        .as_ref()
+        .expect("local result should exist");
+    assert_eq!(local_result.command, "pwd");
+    assert!(
+        local_result
+            .output
+            .contains(&tree_root.display().to_string())
+    );
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn command_palette_renders_local_command_result() {
+    let tree_root = temp_dir("palette-bang-render");
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.palette.open = true;
+    state.palette.input = "!pwd".to_string();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw frame");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Local Result"));
+    assert!(rendered.contains("!pwd"));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn tab_toggles_between_mail_page_and_code_browser_page() {
+    let tree_root = temp_dir("kernel-tree-tab");
+    fs::create_dir_all(tree_root.join("io_uring")).expect("create kernel dir");
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+
+    assert!(matches!(state.ui_page, UiPage::Mail));
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(state.ui_page, UiPage::Mail));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn kernel_tree_enter_expands_and_collapses_selected_directory() {
+    let tree_root = temp_dir("kernel-tree-expand");
+    let dir_a = tree_root.join("a");
+    let dir_b = dir_a.join("b");
+    let dir_c = tree_root.join("c");
+    fs::create_dir_all(&dir_b).expect("create nested directory");
+    fs::create_dir_all(&dir_c).expect("create sibling directory");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+    let index_a = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == dir_a)
+        .expect("directory a row exists");
+    state.kernel_tree_row_index = index_a;
+    assert!(state.kernel_tree_rows[index_a].expandable);
+    assert!(!state.kernel_tree_rows.iter().any(|row| row.path == dir_b));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.kernel_tree_rows.iter().any(|row| row.path == dir_b));
+
+    let index_a_after_expand = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == dir_a)
+        .expect("directory a row exists after expand");
+    state.kernel_tree_row_index = index_a_after_expand;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(!state.kernel_tree_rows.iter().any(|row| row.path == dir_b));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn kernel_tree_lists_files_and_source_preview_preserves_indentation() {
+    let tree_root = temp_dir("kernel-tree-files");
+    let dir_a = tree_root.join("a");
+    let file_path = dir_a.join("demo.c");
+    fs::create_dir_all(&dir_a).expect("create directory");
+    fs::write(
+        &file_path,
+        "fn demo() {\n\tif true {\n        return;\n\t}\n}\n",
+    )
+    .expect("write source file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+    let index_a = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == dir_a)
+        .expect("directory a row exists");
+    state.kernel_tree_row_index = index_a;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("file row exists");
+    state.kernel_tree_row_index = file_index;
+
+    let preview = load_source_file_preview(&file_path);
+    assert!(preview.contains("    if true {"));
+    assert!(preview.contains("        return;"));
+    assert!(!preview.contains('\t'));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_edit_mode_enters_only_on_source_file_focus() {
+    let tree_root = temp_dir("code-edit-enter");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "fn demo() {}\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+    state.code_focus = CodePaneFocus::Tree;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+    assert!(state.status.contains("select a source file"));
+
+    state.code_focus = CodePaneFocus::Source;
+    state.kernel_tree_row_index = 0;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+    assert!(state.status.contains("select a source file"));
+
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+    assert_eq!(state.code_edit_target.as_ref(), Some(&file_path));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_edit_insert_save_and_escape_exit_updates_file() {
+    let tree_root = temp_dir("code-edit-save-esc");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "alpha\nbeta\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimInsert));
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+    );
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    );
+    let saved = fs::read_to_string(&file_path).expect("read saved file");
+    assert!(saved.starts_with("!alpha"));
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+    let preview = load_source_file_preview(&file_path);
+    assert!(preview.contains("!alpha"));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_edit_command_mode_handles_dirty_q_w_and_wq() {
+    let tree_root = temp_dir("code-edit-command");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "hello\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+    assert!(state.code_edit_dirty);
+    assert!(state.status.contains("unsaved changes"));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(!state.code_edit_dirty);
+    let saved_once = fs::read_to_string(&file_path).expect("read saved file");
+    assert!(saved_once.starts_with("xhello"));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(state.code_edit_dirty);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+    let saved_twice = fs::read_to_string(&file_path).expect("read saved file");
+    assert!(saved_twice.starts_with("xyhello"));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_edit_command_mode_rejects_unsupported_command() {
+    let tree_root = temp_dir("code-edit-unsupported-command");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "hello\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+    assert!(state.status.contains("unsupported command"));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_edit_command_mode_supports_force_quit_without_saving() {
+    let tree_root = temp_dir("code-edit-force-quit");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "hello\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(state.code_edit_dirty);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+    assert!(state.status.contains("discarded unsaved changes"));
+    let disk = fs::read_to_string(&file_path).expect("read file");
+    assert_eq!(disk, "hello\n");
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_browser_external_vim_key_updates_selected_file_preview() {
+    let tree_root = temp_dir("external-vim-key");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "before\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    state.external_editor_runner = external_editor_mock_success;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+    );
+
+    assert!(state.status.contains("external vim exited successfully"));
+    let preview = load_source_file_preview(&file_path);
+    assert!(preview.contains("externally edited"));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_edit_external_vim_rejects_dirty_buffer() {
+    let tree_root = temp_dir("external-vim-dirty");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "hello\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    state.external_editor_runner = external_editor_mock_success;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(state.code_edit_dirty);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+    );
+
+    assert!(
+        state
+            .status
+            .contains("unsaved changes, run :w before external vim")
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+    assert!(state.code_edit_dirty);
+    let disk = fs::read_to_string(&file_path).expect("read file");
+    assert_eq!(disk, "hello\n");
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_edit_command_mode_vim_reloads_buffer_after_external_edit() {
+    let tree_root = temp_dir("external-vim-command");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "hello\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    state.external_editor_runner = external_editor_mock_success;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+    assert!(!state.code_edit_dirty);
+    assert_eq!(
+        state.code_edit_buffer.first().map(String::as_str),
+        Some("externally edited")
+    );
+    assert!(state.status.contains("external vim exited successfully"));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn command_palette_vim_runs_external_editor() {
+    let tree_root = temp_dir("external-vim-palette");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "before\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    state.external_editor_runner = external_editor_mock_success;
+    state.palette.open = true;
+    state.palette.input = "vim".to_string();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(state.status.contains("external vim exited successfully"));
+    let preview = load_source_file_preview(&file_path);
+    assert!(preview.contains("externally edited"));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn external_vim_launch_failure_keeps_tui_interactive() {
+    let tree_root = temp_dir("external-vim-failure");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "before\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    state.external_editor_runner = external_editor_mock_failure;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+    );
+    assert!(state.status.contains("external vim failed"));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_focus, CodePaneFocus::Tree));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn external_vim_marks_terminal_refresh_needed_after_return() {
+    let tree_root = temp_dir("external-vim-refresh");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "before\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    state.external_editor_runner = external_editor_mock_success;
+
+    assert!(!state.needs_terminal_refresh);
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT),
+    );
+    assert!(state.needs_terminal_refresh);
+    assert!(state.take_terminal_refresh_needed());
+    assert!(!state.needs_terminal_refresh);
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_edit_draw_sets_terminal_cursor_position() {
+    let tree_root = temp_dir("code-edit-cursor");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "hello\nworld\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    state.code_focus = CodePaneFocus::Source;
+    let file_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("find source file");
+    state.kernel_tree_row_index = file_index;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    let mut expected_cursor: Option<(u16, u16)> = None;
+    terminal
+        .draw(|frame| {
+            let areas = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(10),
+                    Constraint::Length(1),
+                ])
+                .split(frame.area());
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(areas[1]);
+            let inner_area = Rect::new(
+                panes[1].x + 1,
+                panes[1].y + 1,
+                panes[1].width.saturating_sub(2),
+                panes[1].height.saturating_sub(2),
+            );
+            expected_cursor = code_edit_cursor_position(&state, inner_area);
+            draw(frame, &state, &runtime, &bootstrap);
+        })
+        .expect("draw frame");
+
+    let expected = expected_cursor.expect("cursor position should be visible");
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(expected.0, expected.1));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn code_browser_navigation_keys_unchanged_when_not_editing() {
+    let tree_root = temp_dir("code-edit-regression");
+    let file_path = tree_root.join("demo.rs");
+    fs::write(&file_path, "line1\nline2\n").expect("write demo file");
+
+    let runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    let mut state = AppState::new(vec![], runtime);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+    assert!(matches!(state.code_focus, CodePaneFocus::Tree));
+
+    state.code_focus = CodePaneFocus::Source;
+    state.code_preview_scroll = 2;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert_eq!(state.code_preview_scroll, 1);
+    assert!(matches!(state.code_edit_mode, CodeEditMode::Browse));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    assert_eq!(state.code_preview_scroll, 2);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_focus, CodePaneFocus::Tree));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.code_focus, CodePaneFocus::Source));
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn enter_on_subscription_opens_threads_without_toggling_enabled_state() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.focus = Pane::Subscriptions;
+    let initial = state.subscriptions[0].enabled;
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert_eq!(state.subscriptions[0].enabled, initial);
+}
+
+#[test]
+fn enter_on_group_header_toggles_expand_and_collapse() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.focus = Pane::Subscriptions;
+    state.subscription_row_index = 0;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(!state.enabled_group_expanded);
+    let rows_after_collapse = state.subscription_rows();
+    assert!(rows_after_collapse[0].text.starts_with('▶'));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.enabled_group_expanded);
+    let rows_after_expand = state.subscription_rows();
+    assert!(rows_after_expand[0].text.starts_with('▼'));
+}
+
+#[test]
+fn first_open_starts_with_all_subscriptions_disabled() {
+    let state = AppState::new(vec![], test_runtime());
+    assert!(state.subscriptions.iter().all(|item| !item.enabled));
+}
+
+#[test]
+fn first_open_with_complete_imap_enables_my_inbox() {
+    let state = AppState::new(vec![], test_runtime_with_imap());
+    let my_inbox = state
+        .subscriptions
+        .iter()
+        .find(|item| item.mailbox == IMAP_INBOX_MAILBOX)
+        .expect("my inbox subscription exists");
+
+    assert!(my_inbox.enabled);
+    assert_eq!(my_inbox.label, MY_INBOX_LABEL);
+    assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+}
+
+#[test]
+fn legacy_ui_state_with_complete_imap_enables_my_inbox_once() {
+    let state = AppState::new_with_ui_state(
+        vec![],
+        test_runtime_with_imap(),
+        Some(UiState {
+            enabled_mailboxes: vec!["io-uring".to_string()],
+            enabled_group_expanded: true,
+            disabled_group_expanded: true,
+            imap_defaults_initialized: false,
+            active_mailbox: Some("io-uring".to_string()),
+        }),
+    );
+
+    let my_inbox = state
+        .subscriptions
+        .iter()
+        .find(|item| item.mailbox == IMAP_INBOX_MAILBOX)
+        .expect("my inbox subscription exists");
+
+    assert!(my_inbox.enabled);
+    assert!(state.imap_defaults_initialized);
+}
+
+#[test]
+fn initialized_ui_state_keeps_my_inbox_disabled_when_user_opted_out() {
+    let state = AppState::new_with_ui_state(
+        vec![],
+        test_runtime_with_imap(),
+        Some(UiState {
+            enabled_mailboxes: vec!["io-uring".to_string()],
+            enabled_group_expanded: true,
+            disabled_group_expanded: true,
+            imap_defaults_initialized: true,
+            active_mailbox: Some("io-uring".to_string()),
+        }),
+    );
+
+    let my_inbox = state
+        .subscriptions
+        .iter()
+        .find(|item| item.mailbox == IMAP_INBOX_MAILBOX)
+        .expect("my inbox subscription exists");
+
+    assert!(!my_inbox.enabled);
+    assert!(state.imap_defaults_initialized);
+}
+
+#[test]
+fn catch_sync_panic_converts_panics_into_errors() {
+    let error = catch_sync_panic("INBOX", || -> crate::infra::error::Result<()> {
+        panic!("boom");
+    })
+    .expect_err("panic should become courier error");
+
+    assert!(error.to_string().contains("sync panicked for INBOX: boom"));
+}
+
+#[test]
+fn empty_active_inbox_recovers_to_cached_enabled_mailbox() {
+    let root = temp_dir("imap-fallback-cache");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    seed_mailbox_thread(
+        &runtime.database_path,
+        "kvm",
+        1,
+        "kvm@example.com",
+        "kvm thread",
+    );
+
+    let mut state = AppState::new_with_ui_state(
+        vec![],
+        runtime,
+        Some(UiState {
+            enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "kvm".to_string()],
+            enabled_group_expanded: true,
+            disabled_group_expanded: true,
+            imap_defaults_initialized: true,
+            active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+        }),
+    );
+
+    assert!(state.recover_from_empty_active_mailbox("inbox unavailable"));
+    assert_eq!(state.active_thread_mailbox, "kvm");
+    assert_eq!(state.threads.len(), 1);
+    assert!(state.status.contains("showing threads for kvm"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn startup_sync_failure_for_empty_inbox_falls_back_to_cached_mailbox() {
+    let root = temp_dir("imap-fallback-startup");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    seed_mailbox_thread(
+        &runtime.database_path,
+        "io-uring",
+        1,
+        "io-uring@example.com",
+        "io_uring thread",
+    );
+
+    let mut state = AppState::new_with_ui_state(
+        vec![],
+        runtime,
+        Some(UiState {
+            enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "io-uring".to_string()],
+            enabled_group_expanded: true,
+            disabled_group_expanded: true,
+            imap_defaults_initialized: true,
+            active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+        }),
+    );
+
+    state.apply_startup_sync_event(StartupSyncEvent::MailboxFailed {
+        mailbox: IMAP_INBOX_MAILBOX.to_string(),
+        error: "imap unavailable".to_string(),
+    });
+
+    assert_eq!(state.active_thread_mailbox, "io-uring");
+    assert_eq!(state.threads.len(), 1);
+    assert!(state.status.contains("showing threads for io-uring"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enter_on_mailbox_pending_startup_sync_stays_non_blocking() {
+    let root = temp_dir("imap-pending-enter");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    fs::create_dir_all(runtime.database_path.parent().expect("db parent"))
+        .expect("create db parent");
+    db::initialize(&runtime.database_path).expect("initialize db");
+
+    let mut state = AppState::new_with_ui_state(
+        vec![],
+        runtime,
+        Some(UiState {
+            enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string()],
+            enabled_group_expanded: true,
+            disabled_group_expanded: true,
+            imap_defaults_initialized: true,
+            active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+        }),
+    );
+    state.focus = Pane::Subscriptions;
+    state.startup_sync = Some(startup_sync_state(&[(
+        IMAP_INBOX_MAILBOX,
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+
+    state.open_threads_for_selected_subscription();
+
+    assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    assert!(state.threads.is_empty());
+    assert!(state.status.contains("syncing in background"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn background_success_does_not_steal_focus_from_pending_inbox() {
+    let root = temp_dir("imap-pending-focus");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    seed_mailbox_thread(
+        &runtime.database_path,
+        "kvm",
+        1,
+        "kvm@example.com",
+        "kvm thread",
+    );
+
+    let mut state = AppState::new_with_ui_state(
+        vec![],
+        runtime,
+        Some(UiState {
+            enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "kvm".to_string()],
+            enabled_group_expanded: true,
+            disabled_group_expanded: true,
+            imap_defaults_initialized: true,
+            active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+        }),
+    );
+    state.startup_sync = Some(startup_sync_state(&[
+        (IMAP_INBOX_MAILBOX, StartupSyncMailboxStatus::InFlight),
+        ("kvm", StartupSyncMailboxStatus::Pending),
+    ]));
+
+    state.apply_startup_sync_event(StartupSyncEvent::MailboxFinished {
+        mailbox: "kvm".to_string(),
+        fetched: 1,
+        inserted: 1,
+        updated: 0,
+    });
+
+    assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    assert!(state.threads.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn y_and_n_toggle_subscription_and_keep_grouped_sort_order() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.focus = Pane::Subscriptions;
+
+    let target_index = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "bpf")
+        .expect("bpf subscription exists");
+    state.subscription_index = target_index;
+    state.sync_subscription_row_to_selected_item();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    );
+
+    let bpf_after_enable = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "bpf")
+        .expect("bpf exists after enable");
+    assert!(state.subscriptions[bpf_after_enable].enabled);
+
+    let first_disabled = state
+        .subscriptions
+        .iter()
+        .position(|item| !item.enabled)
+        .expect("has disabled subscriptions");
+    assert!(bpf_after_enable < first_disabled);
+
+    let enabled_group = &state.subscriptions[..first_disabled];
+    assert!(
+        enabled_group
+            .windows(2)
+            .all(|pair| pair[0].mailbox <= pair[1].mailbox)
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+
+    let bpf_after_disable = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "bpf")
+        .expect("bpf exists after disable");
+    assert!(!state.subscriptions[bpf_after_disable].enabled);
+
+    let last_enabled = state.subscriptions.iter().rposition(|item| item.enabled);
+    if let Some(last_enabled) = last_enabled {
+        assert!(bpf_after_disable > last_enabled);
+
+        let disabled_group = &state.subscriptions[last_enabled + 1..];
+        assert!(
+            disabled_group
+                .windows(2)
+                .all(|pair| pair[0].mailbox <= pair[1].mailbox)
+        );
+    } else {
+        assert!(state.subscriptions.iter().all(|item| !item.enabled));
+        assert!(
+            state
+                .subscriptions
+                .windows(2)
+                .all(|pair| pair[0].mailbox <= pair[1].mailbox)
+        );
+    }
+}
+
+#[test]
+fn slash_opens_search_and_filters_threads() {
+    let mut state = AppState::new(
+        vec![
+            sample_thread("[PATCH] mm cleanup", "a@example.com", 0),
+            sample_thread("[PATCH] net fix", "b@example.com", 0),
+        ],
+        test_runtime(),
+    );
+
+    let action_search = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_search, LoopAction::Continue));
+    assert!(state.search.active);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(!state.search.active);
+    assert_eq!(state.filtered_thread_indices.len(), 1);
+    let selected = state.selected_thread().expect("selected thread");
+    assert_eq!(selected.message_id, "b@example.com");
+}
+
+#[test]
+fn jl_focus_and_ik_move_selection() {
+    let mut state = AppState::new(
+        vec![
+            sample_thread("t0", "a@example.com", 0),
+            sample_thread("t1", "b@example.com", 1),
+        ],
+        test_runtime(),
+    );
+    state.subscription_index = 1;
+
+    let action_l = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_l, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let action_i = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_i, LoopAction::Continue));
+    assert_eq!(state.thread_index, 0);
+
+    let action_k = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_k, LoopAction::Continue));
+    assert_eq!(state.thread_index, 1);
+
+    let action_j = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_j, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Subscriptions));
+}
+
+#[test]
+fn a_d_and_u_require_patch_series_or_apply_snapshot_on_thread_focus() {
+    let mut state = AppState::new(
+        vec![sample_thread("normal mail", "plain@example.com", 0)],
+        test_runtime(),
+    );
+    state.focus = Pane::Threads;
+
+    let action_apply = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_apply, LoopAction::Continue));
+    assert!(state.status.contains("not a patch series"));
+
+    let action_download = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_download, LoopAction::Continue));
+    assert!(state.status.contains("not a patch series"));
+
+    let action_undo = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_undo, LoopAction::Continue));
+    assert!(state.status.contains("no apply action to undo"));
+}
+
+#[test]
+fn inline_ui_text_collapses_multiline_errors() {
+    let sanitized = sanitize_inline_ui_text(
+        "sync failed:\nCould not automatically determine provider\r\n\tline2",
+    );
+
+    assert_eq!(
+        sanitized,
+        "sync failed: Could not automatically determine provider line2"
+    );
+}
+
+#[test]
+fn preview_hides_rfc_headers_and_keeps_body() {
+    let raw = b"Message-ID: <a@example.com>\r\nSubject: test\r\nFrom: a@example.com\r\n\r\nhello\nworld\n";
+    let preview = extract_mail_body_preview(raw);
+    assert!(!preview.contains("Message-ID:"));
+    assert!(!preview.contains("Subject: test"));
+    assert!(preview.contains("hello"));
+    assert!(preview.contains("world"));
+}
+
+#[test]
+fn preview_skips_first_mime_part_headers() {
+    let raw = b"Content-Type: multipart/alternative; boundary=\"abc\"\r\n\r\n--abc\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nplain body line\r\n--abc--\r\n";
+    let preview = extract_mail_body_preview(raw);
+    assert!(!preview.contains("Content-Transfer-Encoding"));
+    assert!(preview.contains("plain body line"));
+}
+
+#[test]
+fn preview_strips_control_characters() {
+    let raw =
+        b"Message-ID: <a@example.com>\r\nSubject: test\r\n\r\nline1\x1b[31m\x07\nline2\tok\r\n";
+    let preview = extract_mail_body_preview(raw);
+    assert!(!preview.contains('\u{001b}'));
+    assert!(!preview.contains('\u{0007}'));
+    assert!(!preview.contains('\t'));
+    assert!(preview.contains("line1"));
+    assert!(preview.contains("line2    ok"));
+}
+
+#[test]
+fn preview_shows_from_sent_to_cc_headers() {
+    let raw = b"From: Chen Miao <chenmiao.ku@gmail.com>\r\nDate: Monday, March 2, 2026 5:29 PM\r\nTo: Daniel Baluta <daniel.baluta@nxp.com>; Simona Toaca <simona.toaca@nxp.com>\r\nCc: Team One <team1@example.com>\r\nSubject: [PATCH] demo\r\n\r\nmail body line\n";
+    let preview = extract_mail_preview(raw, "(no subject)", "<unknown sender>", None);
+
+    assert!(preview.contains("From: Chen Miao <chenmiao.ku@gmail.com>"));
+    assert!(preview.contains("Sent: Monday, March 2, 2026 5:29 PM"));
+    assert!(preview.contains(
+        "To: Daniel Baluta <daniel.baluta@nxp.com>; Simona Toaca <simona.toaca@nxp.com>"
+    ));
+    assert!(preview.contains("Cc: Team One <team1@example.com>"));
+    assert!(preview.contains("Subject: [PATCH] demo"));
+    assert!(preview.contains("mail body line"));
+}
+
+#[test]
+fn preview_truncates_to_and_cc_recipient_lists() {
+    let raw = b"From: sender@example.com\r\nDate: Tue, 3 Mar 2026 12:00:00 +0000\r\nTo: A <a@example.com>, B <b@example.com>, C <c@example.com>\r\nCc: X <x@example.com>; Y <y@example.com>; Z <z@example.com>\r\nSubject: test\r\n\r\nbody\n";
+    let preview = extract_mail_preview(raw, "(no subject)", "<unknown sender>", None);
+
+    assert!(preview.contains("To: A <a@example.com>; B <b@example.com>; ..."));
+    assert!(preview.contains("Cc: X <x@example.com>; Y <y@example.com>; ..."));
+    assert!(!preview.contains("C <c@example.com>"));
+    assert!(!preview.contains("Z <z@example.com>"));
+}
+
+#[test]
+fn preview_warns_for_multipart_mail() {
+    let raw = b"Content-Type: multipart/alternative; boundary=\"abc\"\r\n\r\n--abc\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nplain body line\r\n--abc--\r\n";
+    let warning = preview_warning_message(raw).expect("warning expected");
+
+    assert!(warning.contains("NON-PLAIN-TEXT MAIL"));
+    assert!(warning.contains("Parse artifacts/errors are normal"));
+    assert!(warning.contains("Content-Type: multipart/alternative; boundary=\"abc\""));
+}
+
+#[test]
+fn preview_warns_for_encoded_html_mail() {
+    let raw = b"Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<html><body>hello</body></html>\r\n";
+    let warning = preview_warning_message(raw).expect("warning expected");
+
+    assert!(warning.contains("NON-PLAIN-TEXT MAIL"));
+    assert!(warning.contains("Content-Type: text/html; charset=utf-8"));
+    assert!(warning.contains("Transfer-Encoding: quoted-printable"));
+}
+
+#[test]
+fn multiline_sync_error_does_not_break_footer_or_palette_render() {
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.status = "sync failed: E1007:\nCould not automatically determine provider".to_string();
+    state.palette.open = true;
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 35)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw multiline status");
+    let rendered = format!("{}", terminal.backend());
+
+    assert!(
+        rendered.contains("status: sync failed: E1007: Could not automatically determine provider")
+    );
+    assert!(rendered.contains("Command Palette"));
+}
+
+#[test]
+fn mail_preview_e_opens_reply_panel_with_autofilled_headers() {
+    let root = temp_dir("reply-open");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Courier Test <courier@example.com>, Bob <bob@example.com>\r\nCc: Alice <alice@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+
+    let panel = state.reply_panel.as_ref().expect("reply panel should open");
+    assert_eq!(panel.from, "Courier Test <courier@example.com>");
+    assert_eq!(panel.to, "Bob <bob@example.com>");
+    assert_eq!(panel.cc, "Alice <alice@example.com>");
+    assert_eq!(panel.subject, "Re: [PATCH] demo");
+    assert_eq!(panel.in_reply_to, "patch@example.com");
+    assert_eq!(panel.references, vec!["patch@example.com"]);
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw reply panel");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Reply Panel"));
+    assert!(rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(rendered.contains("Reply Body"));
+    assert!(rendered.contains("Subject: Re: [PATCH] demo"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_send_preview_requires_confirmation_before_send() {
+    let root = temp_dir("reply-send-gate");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    );
+    assert!(state.status.contains("run Send Preview and confirm first"));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.preview_open)
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.preview_confirmed)
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    );
+    assert!(state.status.contains("send is not available until M8"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_preview_validation_blocks_confirm_on_missing_recipients() {
+    let root = temp_dir("reply-preview-validation");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    if let Some(panel) = state.reply_panel.as_mut() {
+        panel.to.clear();
+        panel.cc = "courier@example.com".to_string();
+    }
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| !panel.preview_errors.is_empty())
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    );
+    assert!(state.status.contains("cannot confirm send preview"));
+    assert!(
+        !state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.preview_confirmed)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_send_preview_uses_edited_header_values() {
+    let root = temp_dir("reply-preview-edited-headers");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nCc: Carol <carol@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    if let Some(panel) = state.reply_panel.as_mut() {
+        panel.from = "Reviewer Bot <reviewer@example.com>".to_string();
+        panel.to = "Maintainer <maintainer@example.com>".to_string();
+        panel.cc = "List <list@example.com>".to_string();
+        panel.mark_dirty();
+    }
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+
+    let panel = state
+        .reply_panel
+        .as_ref()
+        .expect("reply panel should stay open");
+    assert!(panel.preview_open);
+    assert!(panel.preview_errors.is_empty());
+    assert!(
+        panel
+            .preview_rendered
+            .contains("From: Reviewer Bot <reviewer@example.com>")
+    );
+    assert!(
+        panel
+            .preview_rendered
+            .contains("To: Maintainer <maintainer@example.com>")
+    );
+    assert!(
+        panel
+            .preview_rendered
+            .contains("Cc: List <list@example.com>")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_insert_enter_on_quote_line_starts_unquoted_reply_line() {
+    let root = temp_dir("reply-quote-enter");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    if let Some(panel) = state.reply_panel.as_mut() {
+        panel.section = ReplySection::Body;
+        panel.body_row = 2;
+        panel.cursor_col = panel.body[2].chars().count();
+        panel.adjust_scroll();
+    }
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    let panel = state
+        .reply_panel
+        .as_ref()
+        .expect("reply panel should stay open");
+    assert_eq!(panel.body_row, 3);
+    assert_eq!(panel.cursor_col, 0);
+    assert_eq!(panel.body[3], "");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_normal_mode_enter_opens_unquoted_reply_line_below_current_line_and_enters_insert() {
+    let root = temp_dir("reply-normal-enter");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    if let Some(panel) = state.reply_panel.as_mut() {
+        panel.section = ReplySection::Body;
+        panel.body = vec!["> xxxx".to_string(), "> yyyy".to_string()];
+        panel.body_row = 1;
+        panel.cursor_col = 0;
+        panel.adjust_scroll();
+    }
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    let panel = state
+        .reply_panel
+        .as_ref()
+        .expect("reply panel should stay open");
+    assert_eq!(panel.body_row, 2);
+    assert_eq!(panel.cursor_col, 0);
+    assert_eq!(
+        panel.body,
+        vec!["> xxxx".to_string(), "> yyyy".to_string(), String::new(),]
+    );
+    assert!(matches!(panel.mode, ReplyEditMode::Insert));
+    assert_eq!(state.status, "reply insert mode");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_normal_mode_o_opens_unquoted_reply_line_below_current_line_and_enters_insert() {
+    let root = temp_dir("reply-normal-open-below");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    if let Some(panel) = state.reply_panel.as_mut() {
+        panel.section = ReplySection::Body;
+        panel.body = vec!["> xxxx".to_string(), "> yyyy".to_string()];
+        panel.body_row = 1;
+        panel.cursor_col = 0;
+        panel.adjust_scroll();
+    }
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE),
+    );
+
+    let panel = state
+        .reply_panel
+        .as_ref()
+        .expect("reply panel should stay open");
+    assert_eq!(panel.body_row, 2);
+    assert_eq!(panel.cursor_col, 0);
+    assert_eq!(
+        panel.body,
+        vec!["> xxxx".to_string(), "> yyyy".to_string(), String::new(),]
+    );
+    assert!(matches!(panel.mode, ReplyEditMode::Insert));
+    assert_eq!(state.status, "reply insert mode");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn preview_redraw_clears_stale_characters_after_thread_switch() {
+    let root = temp_dir("preview-clear");
+    let first_raw = root.join("first.eml");
+    let second_raw = root.join("second.eml");
+
+    fs::write(
+            &first_raw,
+            b"Message-ID: <first@example.com>\r\nSubject: first\r\nFrom: a@example.com\r\n\r\nSTALE_PREVIEW_TOKEN_123456\nlong line that should disappear\n",
+        )
+        .expect("write first raw mail");
+    fs::write(
+            &second_raw,
+            b"Message-ID: <second@example.com>\r\nSubject: second\r\nFrom: b@example.com\r\n\r\nshort\n",
+        )
+        .expect("write second raw mail");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![
+            sample_thread_with_raw("first", "first@example.com", 0, first_raw.clone()),
+            sample_thread_with_raw("second", "second@example.com", 0, second_raw.clone()),
+        ],
+        runtime.clone(),
+    );
+    state.focus = Pane::Threads;
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw first frame");
+    let first_frame = format!("{}", terminal.backend());
+    assert!(first_frame.contains("STALE_PREVIEW_TOKEN_123456"));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw second frame");
+    let second_frame = format!("{}", terminal.backend());
+    assert!(!second_frame.contains("STALE_PREVIEW_TOKEN_123456"));
+    assert!(second_frame.contains("short"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn preview_redraw_uses_cached_mail_body_after_raw_file_is_removed() {
+    let root = temp_dir("preview-cache");
+    let raw_path = root.join("cached.eml");
+    fs::write(
+        &raw_path,
+        b"Message-ID: <cached@example.com>\r\nSubject: cached\r\nFrom: cache@example.com\r\n\r\ncached body line\n",
+    )
+    .expect("write raw mail");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let state = AppState::new(
+        vec![sample_thread_with_raw(
+            "cached",
+            "cached@example.com",
+            0,
+            raw_path.clone(),
+        )],
+        runtime.clone(),
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw first frame");
+    let first_frame = format!("{}", terminal.backend());
+    assert!(first_frame.contains("cached body line"));
+
+    fs::remove_file(&raw_path).expect("remove raw mail");
+
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw second frame");
+    let second_frame = format!("{}", terminal.backend());
+    assert!(second_frame.contains("cached body line"));
+    assert!(!second_frame.contains("failed to read"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn code_source_preview_redraw_clears_stale_characters_after_file_switch() {
+    let root = temp_dir("code-preview-clear");
+    let file_a = root.join("a-long.rs");
+    let file_b = root.join("b-short.rs");
+    fs::write(
+        &file_a,
+        "fn demo() {\n    let _x = \"STALE_SOURCE_TOKEN_987654\";\n}\n",
+    )
+    .expect("write file a");
+    fs::write(&file_b, "fn demo() {}\n").expect("write file b");
+
+    let runtime = test_runtime_with_kernel_tree(root.clone());
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.ui_page = UiPage::CodeBrowser;
+    state.code_focus = CodePaneFocus::Tree;
+
+    let index_a = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_a)
+        .expect("find file a");
+    state.kernel_tree_row_index = index_a;
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw first frame");
+    let first_frame = format!("{}", terminal.backend());
+    assert!(first_frame.contains("STALE_SOURCE_TOKEN_987654"));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw second frame");
+    let second_frame = format!("{}", terminal.backend());
+    assert!(!second_frame.contains("STALE_SOURCE_TOKEN_987654"));
+    assert!(second_frame.contains("fn demo() {}"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn preview_render_preserves_code_indentation() {
+    let root = temp_dir("preview-indent");
+    let raw = root.join("indent.eml");
+
+    fs::write(
+            &raw,
+            b"Message-ID: <indent@example.com>\r\nSubject: indent\r\nFrom: a@example.com\r\n\r\nfn demo() {\n\tif true {\n        return;\n\t}\n}\n",
+        )
+        .expect("write raw mail");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let state = AppState::new(
+        vec![sample_thread_with_raw(
+            "indent",
+            "indent@example.com",
+            0,
+            raw.clone(),
+        )],
+        runtime.clone(),
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw frame");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("    if true {"));
+    assert!(rendered.contains("        return;"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn threads_panel_renders_thread_group_headers() {
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![
+            sample_thread_in_thread(100, 1, "thread a root", "a-root@example.com", 0),
+            sample_thread_in_thread(100, 2, "thread a reply", "a-reply@example.com", 1),
+            sample_thread_in_thread(200, 3, "thread b root", "b-root@example.com", 0),
+        ],
+        runtime.clone(),
+    );
+    state.focus = Pane::Threads;
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw frame");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Thread 100 (2 msgs)"));
+    assert!(rendered.contains("Thread 200 (1 msg)"));
+    assert!(rendered.contains("thread a root"));
+    assert!(rendered.contains("thread b root"));
+}
