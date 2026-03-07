@@ -1,0 +1,64 @@
+name: Feature request
+description: Suggest a new feature or workflow improvement for Courier
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an improvement to Courier.
+
+        English is preferred for public issues. Chinese is also acceptable if that is easier.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues
+          required: true
+        - label: I checked whether the current README or docs already cover this workflow
+          required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the feature request in one or two sentences.
+      placeholder: Add support for ...
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow gap
+      description: What problem are you trying to solve? What is painful today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, workflow, or interface you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Describe workarounds or other approaches you have considered.
+    validations:
+      required: false
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and impact
+      description: Mention whether this affects sync, TUI, patch handling, reply flow, docs, config, or release workflow.
+    validations:
+      required: false
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Links, mockups, examples, references, or related issues.
+    validations:
+      required: false
