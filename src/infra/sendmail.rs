@@ -920,7 +920,7 @@ mod tests {
         let fake_git = write_fake_git(
             &root,
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  printf '%s\n' \"$@\" > '{}'\n  last=''\n  for arg in \"$@\"; do\n    last=\"$arg\"\n  done\n  cp \"$last\" '{}'\n  echo 'sent'\n  exit 0\nfi\nexit 1\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  printf '%s\\n' \"$@\" > '{}'\n  last=''\n  for arg in \"$@\"; do\n    last=\"$arg\"\n  done\n  cp \"$last\" '{}'\n  echo 'sent'\n  exit 0\nfi\nexit 1\n",
                 capture_args.display(),
                 capture.display()
             ),
