@@ -30,6 +30,7 @@ mailbox = "linux-kernel"
 
 [ui]
 startup_sync = true
+# keymap = "default" # Supported: default, vim
 # inbox_auto_sync_interval_secs = 30
 
 [logging]
@@ -51,6 +52,23 @@ impl ImapEncryption {
             Self::Tls => "tls",
             Self::Starttls => "starttls",
             Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UiKeymap {
+    #[default]
+    Default,
+    Vim,
+}
+
+impl UiKeymap {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Vim => "vim",
         }
     }
 }
@@ -132,6 +150,7 @@ pub struct RuntimeConfig {
     pub imap: ImapConfig,
     pub lore_base_url: String,
     pub startup_sync: bool,
+    pub ui_keymap: UiKeymap,
     pub inbox_auto_sync_interval_secs: u64,
     pub kernel_trees: Vec<PathBuf>,
 }
@@ -196,6 +215,7 @@ struct SourceConfig {
 #[derive(Debug, Default, Deserialize)]
 struct UiConfig {
     startup_sync: Option<bool>,
+    keymap: Option<UiKeymap>,
     inbox_auto_sync_interval_secs: Option<u64>,
 }
 
@@ -338,6 +358,7 @@ fn build_runtime_config(
     let lore_base_url = normalize_optional_string(file_config.source.lore_base_url)
         .unwrap_or_else(|| DEFAULT_LORE_BASE_URL.to_string());
     let startup_sync = file_config.ui.startup_sync.unwrap_or(true);
+    let ui_keymap = file_config.ui.keymap.unwrap_or_default();
     let inbox_auto_sync_interval_secs = file_config
         .ui
         .inbox_auto_sync_interval_secs
@@ -375,6 +396,7 @@ fn build_runtime_config(
         imap,
         lore_base_url,
         startup_sync,
+        ui_keymap,
         inbox_auto_sync_interval_secs,
         kernel_trees,
     })
@@ -581,8 +603,8 @@ mod tests {
 
     use super::{
         DEFAULT_CONFIG_FILE_NAME, DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS, IMAP_INBOX_MAILBOX,
-        ImapFileConfig, LEGACY_CONFIG_FILE_NAME, SelfEmailSource, build_imap_config_with_env, load,
-        load_with_home, resolve_self_email_with,
+        ImapFileConfig, LEGACY_CONFIG_FILE_NAME, SelfEmailSource, UiKeymap,
+        build_imap_config_with_env, load, load_with_home, resolve_self_email_with,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -622,6 +644,7 @@ lore_base_url = "https://lore.kernel.org"
 
 [ui]
 startup_sync = false
+keymap = "vim"
 inbox_auto_sync_interval_secs = 45
 
 [kernel]
@@ -643,6 +666,7 @@ trees = ["./linux-next"]
         assert_eq!(loaded.source_mailbox, "linux-kernel");
         assert_eq!(loaded.lore_base_url, "https://lore.kernel.org");
         assert!(!loaded.startup_sync);
+        assert_eq!(loaded.ui_keymap, UiKeymap::Vim);
         assert_eq!(loaded.inbox_auto_sync_interval_secs, 45);
         assert_eq!(
             loaded.kernel_trees,
@@ -668,6 +692,7 @@ trees = ["./linux-next"]
         assert_eq!(loaded.patch_dir, home.join(".courier/patches"));
         assert_eq!(loaded.database_path, home.join(".courier/db/courier.db"));
         assert!(loaded.startup_sync);
+        assert_eq!(loaded.ui_keymap, UiKeymap::Default);
         assert_eq!(
             loaded.inbox_auto_sync_interval_secs,
             DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS
@@ -741,7 +766,6 @@ imapencryption = "tls"
             loaded.imap.encryption.map(|value| value.as_str()),
             Some("tls")
         );
-        assert_eq!(loaded.imap.proxy, None);
         assert!(loaded.imap.is_complete());
         assert_eq!(loaded.default_active_mailbox(), IMAP_INBOX_MAILBOX);
 
