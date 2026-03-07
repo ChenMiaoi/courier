@@ -47,17 +47,9 @@ pub fn init(default_filter: &str, log_dir: &Path) -> Result<()> {
             .compact()
             .with_filter(LevelFilter::ERROR);
 
-        let error_stderr_layer = tracing_subscriber::fmt::layer()
-            .with_target(false)
-            .with_ansi(false)
-            .with_writer(std::io::stderr)
-            .compact()
-            .with_filter(LevelFilter::ERROR);
-
         if let Err(err) = tracing_subscriber::registry()
             .with(normal_layer)
             .with(error_file_layer)
-            .with(error_stderr_layer)
             .try_init()
         {
             result = Err(CourierError::new(

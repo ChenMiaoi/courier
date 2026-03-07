@@ -8,4 +8,6 @@ pub mod logging;
 pub mod mail_parser;
 pub mod mail_store;
 pub mod patch_store;
+pub mod reply_store;
+pub mod sendmail;
 pub mod ui_state;

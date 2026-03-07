@@ -313,6 +313,36 @@ fn handle_reply_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
         return LoopAction::Continue;
     }
 
+    if let Some(notice_action) = state
+        .reply_panel
+        .as_ref()
+        .and_then(|panel| panel.reply_notice.as_ref().and_then(|notice| notice.action))
+    {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                state.close_reply_notice("reply notice closed");
+            }
+            KeyCode::Char(character)
+                if character.eq_ignore_ascii_case(&'p')
+                    && matches!(notice_action, super::ReplyNoticeAction::OpenPreview) =>
+            {
+                state.close_reply_notice("opening send preview");
+                state.open_send_preview();
+            }
+            KeyCode::Char(character)
+                if character.eq_ignore_ascii_case(&'s')
+                    && matches!(notice_action, super::ReplyNoticeAction::Send) =>
+            {
+                state.close_reply_notice("sending reply");
+                state.attempt_reply_send();
+            }
+            _ => {
+                state.close_reply_notice("reply notice closed");
+            }
+        }
+        return LoopAction::Continue;
+    }
+
     let Some(mode) = state.reply_panel.as_ref().map(|panel| panel.mode) else {
         return LoopAction::Continue;
     };

@@ -391,8 +391,9 @@ MVP 范围与阶段目标已迁移至独立文档：
 - 自身邮箱地址解析优先级固定为：`[imap].email` -> `git config user.email`；
   若 Courier 配置存在，则覆盖 git 结果，并在 `doctor` 中显示最终来源。
 - TUI 左栏新增内置 `My Inbox` 订阅，映射 IMAP `INBOX`，在 IMAP 配置完整时
-  默认启用并参与启动自动同步；其余 vger 模板订阅仍保持默认禁用，并继续使用
-  lore/web 抓取，不切换到 IMAP。
+  默认启用并参与启动自动同步；TUI 保持打开期间，`My Inbox` 继续按
+  `ui.inbox_auto_sync_interval_secs` 指定的间隔做后台增量同步，默认 30 秒。
+  其余 vger 模板订阅仍保持默认禁用，并继续使用 lore/web 抓取，不切换到 IMAP。
 - 真实 IMAP 客户端首版覆盖 `LOGIN`、`SELECT`、`UID SEARCH`、`UID FETCH`
   最小链路，并复用既有 checkpoint、幂等写入和 `UIDVALIDITY` 重建逻辑。
 - `encryption` 首版固定枚举 `tls` / `starttls` / `none`，默认建议使用 `tls`。
@@ -428,6 +429,28 @@ MVP 范围与阶段目标已迁移至独立文档：
   草稿保留，需要补充持久化策略。
 - 正文仍以纯文本单缓冲区编辑为主，尚未加入 72 列辅助换行、地址补全或 alias 管理；
   这些增强应在不破坏当前头部构造规则的前提下后续追加。
+
+## 19. M8（已完成）：Send Email 发送链路
+
+### 19.1 已决策项
+
+- Reply Panel 在 `preview_confirmed` 为真时接入真实发送，仍保持唯一用户入口 `Send`；
+  实际发送器固定为统一接口下的 `git send-email` 适配器。
+- 发送内容先规范化为最终 RFC 5322 纯文本消息，预览与真实发送复用同一份头部/正文
+  规范化结果，避免“预览内容”和“实际发出内容”漂移。
+- 每次发送都会生成并记录 `Message-ID`、`preview_confirmed_at`、命令行、退出码、
+  `stdout/stderr` 摘要与关联 `mail_id/thread_id`，落到本地 SQLite `reply_send` 表。
+- 成功发送后关闭 Reply Panel 并回到原预览上下文；失败或超时则保留当前草稿与确认状态，
+  允许用户直接重试。
+- `doctor` 已固定增加两项诊断：`git send-email` 可用性、默认回信身份
+  （`sendemail.from` 或 `user.name/user.email`）。
+
+### 19.2 风险与后续动作
+
+- 当前发送后只持久化审计结果，不持久化完整 draft 内容；若后续需要跨重启重试，
+  需补草稿存储与恢复策略。
+- MVP 仍依赖外部 `git send-email` 与用户本地 git mail 配置；后续在不改变 Reply Panel
+  交互的前提下，可替换为 Courier 自实现 SMTP 发送器。
 
 ---
 

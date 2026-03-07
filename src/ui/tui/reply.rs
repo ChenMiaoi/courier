@@ -33,6 +33,18 @@ pub(super) struct ReplyPreview {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PreparedReplyMessage {
+    pub from: String,
+    pub from_email: Option<String>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub subject: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
+    pub body: String,
+}
+
 pub(super) struct ReplyPreviewRequest<'a> {
     pub from: &'a str,
     pub to: &'a str,
@@ -81,7 +93,7 @@ pub(super) fn build_reply_seed(
     let headers = parse_header_block(raw);
     let self_set = collect_self_addresses(identity, self_addresses);
 
-    let mut to = normalize_recipient_values(header_values(&headers, "to"), &self_set);
+    let mut to = normalize_to_recipient_values(header_values(&headers, "to"), &self_set);
     let mut cc_dedup = self_set.clone();
     cc_dedup.extend(
         to.iter()
@@ -138,10 +150,21 @@ pub(super) fn build_reply_seed(
 }
 
 pub(super) fn render_reply_preview(request: ReplyPreviewRequest<'_>) -> ReplyPreview {
+    let (prepared, errors) = prepare_reply_message(request);
+    ReplyPreview {
+        content: render_prepared_reply_preview(&prepared),
+        errors,
+    }
+}
+
+pub(super) fn prepare_reply_message(
+    request: ReplyPreviewRequest<'_>,
+) -> (PreparedReplyMessage, Vec<String>) {
     let mut errors = Vec::new();
 
     let from = normalize_header_value(request.from);
-    if extract_email_address(&from).is_none() {
+    let from_email = extract_email_address(&from);
+    if from_email.is_none() {
         errors.push("From is missing a valid email address".to_string());
     }
 
@@ -151,11 +174,11 @@ pub(super) fn render_reply_preview(request: ReplyPreviewRequest<'_>) -> ReplyPre
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty())
         .collect::<HashSet<String>>();
-    if let Some(email) = extract_email_address(&from) {
+    if let Some(email) = from_email.as_deref() {
         self_set.insert(email.to_ascii_lowercase());
     }
 
-    let normalized_to = normalize_recipient_values([request.to.to_string()], &self_set);
+    let normalized_to = normalize_to_recipient_values([request.to.to_string()], &self_set);
     let mut cc_dedup = self_set;
     cc_dedup.extend(
         normalized_to
@@ -191,16 +214,32 @@ pub(super) fn render_reply_preview(request: ReplyPreviewRequest<'_>) -> ReplyPre
         normalized_references.push(in_reply_to.clone());
     }
 
-    let rendered_body = render_reply_body(request.body);
-    let content = format!(
-        "From: {from}\nTo: {}\nCc: {}\nSubject: {subject}\nIn-Reply-To: {}\nReferences: {}\n\n{rendered_body}",
-        render_recipient_line(&normalized_to),
-        render_recipient_line(&normalized_cc),
-        render_message_id(&in_reply_to),
-        render_references_line(&normalized_references),
-    );
+    (
+        PreparedReplyMessage {
+            from,
+            from_email,
+            to: normalized_to,
+            cc: normalized_cc,
+            subject,
+            in_reply_to,
+            references: normalized_references,
+            body: render_reply_body(request.body),
+        },
+        errors,
+    )
+}
 
-    ReplyPreview { content, errors }
+fn render_prepared_reply_preview(message: &PreparedReplyMessage) -> String {
+    format!(
+        "From: {}\nTo: {}\nCc: {}\nSubject: {}\nIn-Reply-To: {}\nReferences: {}\n\n{}",
+        message.from,
+        render_recipient_line(&message.to),
+        render_recipient_line(&message.cc),
+        message.subject,
+        render_message_id(&message.in_reply_to),
+        render_references_line(&message.references),
+        message.body,
+    )
 }
 
 fn git_config_value(args: &[&str]) -> std::result::Result<Option<String>, String> {
@@ -326,7 +365,31 @@ fn header_values(headers: &[(String, String)], name: &str) -> Vec<String> {
         .collect()
 }
 
+fn normalize_to_recipient_values<I>(values: I, self_addresses: &HashSet<String>) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let normalized = collect_recipient_values(values);
+    let filtered = filter_self_recipients(&normalized, self_addresses);
+    if filtered.is_empty()
+        && normalized.len() == 1
+        && recipient_matches_self(&normalized[0], self_addresses)
+    {
+        normalized
+    } else {
+        filtered
+    }
+}
+
 fn normalize_recipient_values<I>(values: I, self_addresses: &HashSet<String>) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let normalized = collect_recipient_values(values);
+    filter_self_recipients(&normalized, self_addresses)
+}
+
+fn collect_recipient_values<I>(values: I) -> Vec<String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -341,7 +404,7 @@ where
             let key = extract_email_address(&display)
                 .map(|email| email.to_ascii_lowercase())
                 .unwrap_or_else(|| display.to_ascii_lowercase());
-            if self_addresses.contains(&key) || !dedup.insert(key) {
+            if !dedup.insert(key) {
                 continue;
             }
             recipients.push(display);
@@ -349,6 +412,20 @@ where
     }
 
     recipients
+}
+
+fn filter_self_recipients(recipients: &[String], self_addresses: &HashSet<String>) -> Vec<String> {
+    recipients
+        .iter()
+        .filter(|recipient| !recipient_matches_self(recipient, self_addresses))
+        .cloned()
+        .collect()
+}
+
+fn recipient_matches_self(value: &str, self_addresses: &HashSet<String>) -> bool {
+    extract_email_address(value)
+        .map(|email| self_addresses.contains(&email.to_ascii_lowercase()))
+        .unwrap_or_else(|| self_addresses.contains(&value.to_ascii_lowercase()))
 }
 
 fn normalize_recipient_display(value: &str) -> Option<String> {
@@ -599,6 +676,22 @@ mod tests {
     }
 
     #[test]
+    fn build_reply_seed_preserves_single_self_to() {
+        let raw = b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Courier Test <courier@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n";
+        let thread = sample_thread("[PATCH] demo", "patch@example.com");
+
+        let seed = build_reply_seed(
+            raw,
+            &thread,
+            &identity(),
+            &[identity().email.clone(), "alias@example.com".to_string()],
+        );
+
+        assert_eq!(seed.to, "Courier Test <courier@example.com>");
+        assert!(seed.cc.is_empty());
+    }
+
+    #[test]
     fn preview_validation_reports_missing_recipients() {
         let preview = render_reply_preview(ReplyPreviewRequest {
             from: "Courier Test <courier@example.com>",
@@ -619,6 +712,27 @@ mod tests {
                 .any(|value| value.contains("no recipients"))
         );
         assert!(preview.content.contains("To: <none>"));
+    }
+
+    #[test]
+    fn preview_keeps_single_self_to_recipient() {
+        let preview = render_reply_preview(ReplyPreviewRequest {
+            from: "Courier Test <courier@example.com>",
+            to: "Courier Test <courier@example.com>",
+            cc: "",
+            subject: "Re: [PATCH] demo",
+            in_reply_to: "patch@example.com",
+            references: &["patch@example.com".to_string()],
+            body: &[String::new()],
+            self_addresses: &[identity().email.clone()],
+        });
+
+        assert!(preview.errors.is_empty());
+        assert!(
+            preview
+                .content
+                .contains("To: Courier Test <courier@example.com>")
+        );
     }
 
     #[test]

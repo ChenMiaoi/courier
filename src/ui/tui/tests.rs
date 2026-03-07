@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
@@ -14,8 +14,11 @@ use crate::infra::db;
 use crate::infra::db::DatabaseState;
 use crate::infra::mail_parser;
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch, ThreadRow};
+use crate::infra::reply_store::{self, ReplySendStatus};
+use crate::infra::sendmail::{SendOutcome, SendRequest, SendStatus};
 use crate::infra::ui_state::UiState;
 
+use super::palette::run_palette_sync;
 use super::preview::preview_warning_message;
 use super::reply::ReplyIdentity;
 use super::{
@@ -105,6 +108,7 @@ fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
         imap: crate::infra::config::ImapConfig::default(),
         lore_base_url: "https://lore.kernel.org".to_string(),
         startup_sync: true,
+        inbox_auto_sync_interval_secs: crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
         kernel_trees: Vec::new(),
     }
 }
@@ -237,6 +241,52 @@ fn startup_sync_progress_summary_renders_counts_and_running_mailbox() {
     );
 }
 
+#[test]
+fn inbox_auto_sync_starts_when_due_for_enabled_my_inbox() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.inbox_auto_sync_spawner = inbox_auto_sync_spawner_stub;
+    state
+        .inbox_auto_sync
+        .as_mut()
+        .expect("inbox auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    state.maybe_start_inbox_auto_sync();
+
+    assert!(
+        state
+            .inbox_auto_sync
+            .as_ref()
+            .and_then(|sync| sync.receiver.as_ref())
+            .is_some()
+    );
+}
+
+#[test]
+fn inbox_auto_sync_waits_for_startup_sync_to_finish() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.inbox_auto_sync_spawner = inbox_auto_sync_spawner_stub;
+    state.startup_sync = Some(startup_sync_state(&[(
+        IMAP_INBOX_MAILBOX,
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+    state
+        .inbox_auto_sync
+        .as_mut()
+        .expect("inbox auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    state.maybe_start_inbox_auto_sync();
+
+    assert!(
+        state
+            .inbox_auto_sync
+            .as_ref()
+            .and_then(|sync| sync.receiver.as_ref())
+            .is_none()
+    );
+}
+
 fn external_editor_mock_success(
     _editor: &str,
     file_path: &Path,
@@ -261,6 +311,67 @@ fn reply_identity_mock() -> std::result::Result<ReplyIdentity, String> {
         display: "Courier Test <courier@example.com>".to_string(),
         email: "courier@example.com".to_string(),
     })
+}
+
+fn reply_send_mock_success(_runtime: &RuntimeConfig, _request: &SendRequest) -> SendOutcome {
+    SendOutcome {
+        transport: "git-send-email".to_string(),
+        message_id: "sent@example.com".to_string(),
+        command_line: Some("git send-email reply.eml".to_string()),
+        draft_path: None,
+        exit_code: Some(0),
+        timed_out: false,
+        stdout: "sent".to_string(),
+        stderr: String::new(),
+        error_summary: None,
+        started_at: "2026-03-07T10:00:01Z".to_string(),
+        finished_at: "2026-03-07T10:00:02Z".to_string(),
+        status: SendStatus::Sent,
+    }
+}
+
+fn reply_send_mock_failure(_runtime: &RuntimeConfig, _request: &SendRequest) -> SendOutcome {
+    SendOutcome {
+        transport: "git-send-email".to_string(),
+        message_id: "failed@example.com".to_string(),
+        command_line: Some("git send-email reply.eml".to_string()),
+        draft_path: Some(PathBuf::from("/tmp/reply-failed.eml")),
+        exit_code: Some(1),
+        timed_out: false,
+        stdout: String::new(),
+        stderr: "smtp auth failed".to_string(),
+        error_summary: Some("smtp auth failed".to_string()),
+        started_at: "2026-03-07T10:00:01Z".to_string(),
+        finished_at: "2026-03-07T10:00:02Z".to_string(),
+        status: SendStatus::Failed,
+    }
+}
+
+fn sync_request_mock_success(
+    _runtime: &RuntimeConfig,
+    request: crate::app::sync::SyncRequest,
+) -> crate::infra::error::Result<crate::app::sync::SyncSummary> {
+    Ok(crate::app::sync::SyncSummary {
+        mailbox: request.mailbox,
+        source: "mock".to_string(),
+        fetched: 1,
+        inserted: 1,
+        updated: 0,
+        rebuilt_roots: 0,
+        mailbox_rebuilt: false,
+        uidvalidity: 1,
+        checkpoint_last_seen_uid: 1,
+        checkpoint_highest_modseq: Some(1),
+        checkpoint_synced_at: Some("2026-03-07T10:00:02Z".to_string()),
+    })
+}
+
+fn inbox_auto_sync_spawner_stub(
+    _runtime: RuntimeConfig,
+    _mailboxes: Vec<String>,
+) -> mpsc::Receiver<StartupSyncEvent> {
+    let (_sender, receiver) = mpsc::channel();
+    receiver
 }
 
 #[test]
@@ -366,13 +477,13 @@ fn external_editor_session_restores_terminal_after_editor_exit() {
 }
 
 #[test]
-fn mail_page_layout_keeps_preview_at_fixed_80_columns() {
+fn mail_page_layout_keeps_preview_at_fixed_90_columns() {
     let panes = mail_page_panes(Rect::new(0, 0, 180, 20));
 
-    assert_eq!(panes[2].width, 80);
-    assert_eq!(panes[2].x, 100);
-    assert_eq!(panes[0].width, 25);
-    assert_eq!(panes[1].width, 75);
+    assert_eq!(panes[2].width, 90);
+    assert_eq!(panes[2].x, 90);
+    assert_eq!(panes[0].width, 23);
+    assert_eq!(panes[1].width, 67);
     assert_eq!(panes[0].width + panes[1].width + panes[2].width, 180);
 }
 
@@ -620,6 +731,39 @@ startup_sync = true
 }
 
 #[test]
+fn config_editor_saves_inbox_auto_sync_interval() {
+    let root = temp_dir("config-editor-auto-sync-interval");
+    let config_path = root.join("courier-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+inbox_auto_sync_interval_secs = 30
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime_with_imap();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(vec![], runtime);
+
+    state.open_config_editor(Some("ui.inbox_auto_sync_interval_secs"));
+    state.start_config_editor_edit();
+    state.config_editor.input = "45".to_string();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert_eq!(state.runtime.inbox_auto_sync_interval_secs, 45);
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(persisted.contains("inbox_auto_sync_interval_secs = 45"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn config_editor_can_unset_optional_key() {
     let root = temp_dir("config-editor-unset");
     let config_path = root.join("courier-config.toml");
@@ -684,6 +828,44 @@ startup_sync = true
     let persisted = fs::read_to_string(&config_path).expect("read config file");
     assert!(persisted.contains("startup_sync = true"));
     assert!(!persisted.contains("maybe"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_editor_rejects_zero_inbox_auto_sync_interval_without_writing_file() {
+    let root = temp_dir("config-editor-zero-auto-sync-interval");
+    let config_path = root.join("courier-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+inbox_auto_sync_interval_secs = 30
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime_with_imap();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(vec![], runtime);
+
+    state.open_config_editor(Some("ui.inbox_auto_sync_interval_secs"));
+    state.start_config_editor_edit();
+    state.config_editor.input = "0".to_string();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(
+        state
+            .status
+            .contains("failed to set config key ui.inbox_auto_sync_interval_secs")
+    );
+    assert_eq!(state.runtime.inbox_auto_sync_interval_secs, 30);
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(persisted.contains("inbox_auto_sync_interval_secs = 30"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1813,6 +1995,60 @@ fn startup_sync_failure_for_empty_inbox_falls_back_to_cached_mailbox() {
 }
 
 #[test]
+fn command_palette_sync_resets_my_inbox_auto_sync_deadline() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.sync_request_executor = sync_request_mock_success;
+    state
+        .inbox_auto_sync
+        .as_mut()
+        .expect("inbox auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    run_palette_sync(&mut state, "sync INBOX");
+
+    assert!(state.status.contains("sync ok"));
+    assert!(
+        state
+            .inbox_auto_sync
+            .as_ref()
+            .expect("inbox auto-sync state")
+            .next_due_at
+            > Instant::now() + Duration::from_secs(20)
+    );
+}
+
+#[test]
+fn foreground_inbox_sync_defers_next_auto_sync_tick() {
+    let root = temp_dir("imap-open-inbox-sync");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    fs::create_dir_all(runtime.database_path.parent().expect("db parent"))
+        .expect("create db parent");
+    db::initialize(&runtime.database_path).expect("initialize db");
+
+    let mut state = AppState::new(vec![], runtime);
+    state.sync_request_executor = sync_request_mock_success;
+    state
+        .inbox_auto_sync
+        .as_mut()
+        .expect("inbox auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    state.open_threads_for_selected_subscription();
+
+    assert!(state.status.contains("synced INBOX"));
+    assert!(
+        state
+            .inbox_auto_sync
+            .as_ref()
+            .expect("inbox auto-sync state")
+            .next_due_at
+            > Instant::now() + Duration::from_secs(20)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn enter_on_mailbox_pending_startup_sync_stays_non_blocking() {
     let root = temp_dir("imap-pending-enter");
     let runtime = test_runtime_with_imap_in(root.clone());
@@ -2228,6 +2464,50 @@ fn mail_preview_e_opens_reply_panel_with_autofilled_headers() {
 }
 
 #[test]
+fn reply_panel_body_renders_80_column_guide_marker() {
+    let root = temp_dir("reply-body-guide");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let panel = state.reply_panel.as_mut().expect("reply panel should open");
+    panel.body = vec!["short line".to_string(), String::new()];
+    panel.body_row = 0;
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw reply panel with guide");
+    let rendered = format!("{}", terminal.backend());
+
+    assert!(rendered.contains("Reply Body"));
+    assert!(rendered.contains("80 cols"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn reply_send_preview_requires_confirmation_before_send() {
     let root = temp_dir("reply-send-gate");
     let raw = root.join("patch.eml");
@@ -2237,6 +2517,15 @@ fn reply_send_preview_requires_confirmation_before_send() {
         )
         .expect("write raw reply fixture");
 
+    let runtime = test_runtime_in(root.clone());
+    seed_mailbox_thread(
+        &runtime.database_path,
+        "inbox",
+        1,
+        "patch@example.com",
+        "[PATCH] demo",
+    );
+
     let mut state = AppState::new(
         vec![sample_thread_with_raw(
             "[PATCH] demo",
@@ -2244,10 +2533,11 @@ fn reply_send_preview_requires_confirmation_before_send() {
             0,
             raw.clone(),
         )],
-        test_runtime(),
+        runtime.clone(),
     );
     state.focus = Pane::Preview;
     state.reply_identity_resolver = reply_identity_mock;
+    state.reply_send_executor = reply_send_mock_success;
 
     let _ = handle_key_event(
         &mut state,
@@ -2258,6 +2548,13 @@ fn reply_send_preview_requires_confirmation_before_send() {
         KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
     );
     assert!(state.status.contains("run Send Preview and confirm first"));
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .and_then(|panel| panel.reply_notice.as_ref())
+            .is_some_and(|notice| notice.title == "Send Blocked")
+    );
 
     let _ = handle_key_event(
         &mut state,
@@ -2279,12 +2576,148 @@ fn reply_send_preview_requires_confirmation_before_send() {
             .as_ref()
             .is_some_and(|panel| panel.preview_confirmed)
     );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .and_then(|panel| panel.reply_notice.as_ref())
+            .is_some_and(|notice| notice.title == "Ready To Send")
+    );
 
     let _ = handle_key_event(
         &mut state,
         KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
     );
-    assert!(state.status.contains("send is not available until M8"));
+    assert!(state.status.contains("reply sent as <sent@example.com>"));
+    assert!(state.reply_panel.is_none());
+
+    let record = reply_store::latest_reply_send_for_mail(&runtime.database_path, 1)
+        .expect("load latest reply send")
+        .expect("reply send record");
+    assert_eq!(record.status, ReplySendStatus::Sent);
+    assert_eq!(record.message_id, "sent@example.com");
+    assert_eq!(record.subject, "Re: [PATCH] demo");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_send_blocked_notice_and_ready_notice_are_rendered_as_overlays() {
+    let root = temp_dir("reply-notice-overlay");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw blocked notice");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Send Blocked"));
+    assert!(rendered.contains("You must open Send Preview"));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    );
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw ready notice");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Ready To Send"));
+    assert!(rendered.contains("Press S to send the reply"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_send_failure_keeps_panel_open_and_persists_failure() {
+    let root = temp_dir("reply-send-failure");
+    let raw = root.join("patch.eml");
+    fs::write(
+            &raw,
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+        )
+        .expect("write raw reply fixture");
+
+    let runtime = test_runtime_in(root.clone());
+    seed_mailbox_thread(
+        &runtime.database_path,
+        "inbox",
+        1,
+        "patch@example.com",
+        "[PATCH] demo",
+    );
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+    state.reply_send_executor = reply_send_mock_failure;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    );
+
+    assert!(state.status.contains("smtp auth failed"));
+    assert!(state.reply_panel.is_some());
+
+    let record = reply_store::latest_reply_send_for_mail(&runtime.database_path, 1)
+        .expect("load latest reply send")
+        .expect("reply send record");
+    assert_eq!(record.status, ReplySendStatus::Failed);
+    assert_eq!(record.message_id, "failed@example.com");
+    assert_eq!(record.error_summary.as_deref(), Some("smtp auth failed"));
 
     let _ = fs::remove_dir_all(root);
 }

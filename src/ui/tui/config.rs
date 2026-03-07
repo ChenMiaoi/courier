@@ -519,6 +519,7 @@ fn config_editor_field_index(key: &str) -> Option<usize> {
 }
 
 fn apply_runtime_update(state: &mut AppState, runtime: RuntimeConfig) {
+    let old_inbox_auto_sync_interval_secs = state.runtime.inbox_auto_sync_interval_secs;
     let selected_path_hint = state.selected_kernel_tree_path();
     let enabled_mailboxes: HashSet<String> = state.enabled_mailboxes().into_iter().collect();
     let active_mailbox = state.active_thread_mailbox.clone();
@@ -540,6 +541,10 @@ fn apply_runtime_update(state: &mut AppState, runtime: RuntimeConfig) {
     {
         state.subscription_index = index;
         state.sync_subscription_row_to_selected_item();
+    }
+    state.reconcile_inbox_auto_sync();
+    if state.runtime.inbox_auto_sync_interval_secs != old_inbox_auto_sync_interval_secs {
+        state.defer_inbox_auto_sync();
     }
     state.refresh_kernel_tree_rows(selected_path_hint.as_deref());
     if matches!(state.ui_page, UiPage::CodeBrowser) && !state.supports_code_browser() {
@@ -583,6 +588,9 @@ fn effective_config_value(state: &AppState, key: &str) -> Option<String> {
         "imap.proxy" => state.runtime.imap.proxy.clone(),
         "source.lore_base_url" => Some(state.runtime.lore_base_url.clone()),
         "ui.startup_sync" => Some(state.runtime.startup_sync.to_string()),
+        "ui.inbox_auto_sync_interval_secs" => {
+            Some(state.runtime.inbox_auto_sync_interval_secs.to_string())
+        }
         "kernel.trees" => Some(format!(
             "[{}]",
             state
@@ -791,6 +799,13 @@ fn config_value_suggestions(state: &AppState, key: Option<&String>) -> Vec<Palet
             .map(|value| PaletteSuggestion {
                 value: (*value).to_string(),
                 description: Some("Auto-sync on TUI startup".to_string()),
+            })
+            .collect(),
+        "ui.inbox_auto_sync_interval_secs" => ["15", "30", "60", "300"]
+            .iter()
+            .map(|value| PaletteSuggestion {
+                value: (*value).to_string(),
+                description: Some("Seconds between My Inbox background sync runs".to_string()),
             })
             .collect(),
         "b4.path" => vec![PaletteSuggestion {

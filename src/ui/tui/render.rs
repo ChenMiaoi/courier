@@ -13,6 +13,8 @@ use super::config::draw_config_editor;
 use super::palette::palette_overlay_suggestions;
 use super::*;
 
+const REPLY_BODY_GUIDE_COLUMN: usize = 80;
+
 pub(super) fn draw(
     frame: &mut Frame<'_>,
     state: &AppState,
@@ -72,6 +74,12 @@ pub(super) fn draw(
                 .is_some_and(|panel| panel.preview_open)
             {
                 "j/k scroll preview | Enter/c confirm | Esc close | S send"
+            } else if state
+                .reply_panel
+                .as_ref()
+                .is_some_and(|panel| panel.reply_notice.is_some())
+            {
+                "Enter/Esc close notice | P preview | S send"
             } else {
                 "Esc normal/close | Enter/o open below+insert | h/j/k/l move | i insert | x delete | p send preview | S send | :preview :send :q :q!"
             }
@@ -725,19 +733,38 @@ fn draw_reply_panel(frame: &mut Frame<'_>, state: &AppState) {
     let body_inner = body_block.inner(body_area);
     frame.render_widget(body_block, body_area);
     frame.render_widget(Clear, body_inner);
+    let body_content_area = if body_inner.height > 1 {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(body_inner);
+        frame.render_widget(
+            Paragraph::new(render_reply_body_guide_line(sections[0].width as usize)).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            sections[0],
+        );
+        sections[1]
+    } else {
+        body_inner
+    };
     frame.render_widget(
         Paragraph::new(render_reply_body_content(panel))
             .scroll((panel.scroll, 0))
             .wrap(Wrap { trim: false }),
-        body_inner,
+        body_content_area,
     );
 
-    if let Some(cursor) = reply_panel_cursor_position(panel, header_inner, body_inner) {
+    if let Some(cursor) = reply_panel_cursor_position(panel, header_inner, body_content_area) {
         frame.set_cursor_position(cursor);
     }
 
     if panel.preview_open {
         draw_send_preview_overlay(frame, panel);
+    } else if panel.reply_notice.is_some() {
+        draw_reply_notice_overlay(frame, panel);
     }
 }
 
@@ -800,6 +827,41 @@ fn render_reply_body_content(panel: &ReplyPanelState) -> String {
     lines.join("\n")
 }
 
+fn render_reply_body_guide_line(width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let body_start = reply_body_prefix_width(0);
+    if body_start >= width {
+        return String::new();
+    }
+
+    let guide_offset = reply_body_prefix_width(0) + REPLY_BODY_GUIDE_COLUMN - 1;
+    let label = "| 80 cols";
+
+    let mut chars = vec![' '; width];
+    let pre_label_end = guide_offset.min(width);
+    for ch in chars.iter_mut().take(pre_label_end).skip(body_start) {
+        *ch = '=';
+    }
+
+    for (index, ch) in label.chars().enumerate() {
+        let position = guide_offset + index;
+        if position >= width {
+            break;
+        }
+        chars[position] = ch;
+    }
+
+    let label_end = (guide_offset + label.len()).min(width);
+    for ch in chars.iter_mut().take(width).skip(label_end) {
+        *ch = '=';
+    }
+
+    chars.into_iter().collect()
+}
+
 fn reply_panel_section_style(focused: bool, command_mode: bool) -> Style {
     if focused {
         if command_mode {
@@ -821,7 +883,7 @@ fn reply_panel_cursor_position(
     header_inner: Rect,
     body_inner: Rect,
 ) -> Option<(u16, u16)> {
-    if panel.preview_open {
+    if panel.preview_open || panel.reply_notice.is_some() {
         return None;
     }
 
@@ -963,6 +1025,38 @@ fn draw_send_preview_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
         .scroll((panel.preview_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(preview, content_area);
+}
+
+fn draw_reply_notice_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
+    let Some(notice) = panel.reply_notice.as_ref() else {
+        return;
+    };
+
+    let area = centered_rect(62, 34, frame.area());
+    frame.render_widget(Clear, area);
+
+    let border = match notice.kind {
+        ReplyNoticeKind::Warning => Style::default().fg(Color::LightRed),
+        ReplyNoticeKind::Info => Style::default().fg(Color::LightGreen),
+    };
+    let block = Block::default()
+        .title(notice.title.as_str())
+        .borders(Borders::ALL)
+        .border_style(border);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Clear, inner);
+
+    let text = format!("{}\n\n{}", notice.message, notice.hint);
+    let paragraph = Paragraph::new(Text::from(text))
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
 }
 
 fn code_edit_source_line_logical_row(buffer_row: usize) -> usize {

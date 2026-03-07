@@ -51,6 +51,10 @@ filter = "info"
 # Default: true
 # startup_sync = true
 
+# Optional. Seconds between `My Inbox` background auto-sync runs while TUI stays open.
+# Must be greater than 0. Default: 30
+# inbox_auto_sync_interval_secs = 30
+
 [kernel]
 # Optional. Single kernel tree root path shown in left pane tree view (Tab toggles).
 # tree = "/path/to/linux"

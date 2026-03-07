@@ -16,7 +16,10 @@ use crate::infra::bootstrap::BootstrapState;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CourierError, ErrorCode, Result};
 use crate::infra::mail_store::{self, ThreadRow};
+use crate::infra::reply_store::{self, ReplySendRecordRequest, ReplySendStatus};
+use crate::infra::sendmail::{self, SendOutcome, SendRequest, SendStatus};
 use crate::infra::ui_state::{self, UiState};
+use chrono::Utc;
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -51,8 +54,8 @@ use preview::{MailPreview, load_mail_preview};
 #[cfg(test)]
 use preview::{extract_mail_body_preview, extract_mail_preview};
 use reply::{
-    ReplyIdentity, ReplyPreview, ReplyPreviewRequest, ReplySeed, build_reply_seed,
-    render_reply_preview,
+    PreparedReplyMessage, ReplyIdentity, ReplyPreview, ReplyPreviewRequest, ReplySeed,
+    build_reply_seed, prepare_reply_message, render_reply_preview,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +152,7 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
 const PALETTE_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
 const PREVIEW_TAB_SPACES: &str = "    ";
 const PREVIEW_RECIPIENT_PREVIEW_LIMIT: usize = 2;
-const PREVIEW_PANE_FIXED_WIDTH: u16 = 80;
+const PREVIEW_PANE_FIXED_WIDTH: u16 = 90;
 const THREAD_LINE_MAX_CHARS: usize = 120;
 const KERNEL_TREE_MAX_ROWS: usize = 2048;
 const CODE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
@@ -175,6 +178,7 @@ const CONFIG_GET_KEYS: &[&str] = &[
     "imap.proxy",
     "source.lore_base_url",
     "ui.startup_sync",
+    "ui.inbox_auto_sync_interval_secs",
     "kernel.tree",
     "kernel.trees",
 ];
@@ -197,6 +201,7 @@ const CONFIG_SET_KEYS: &[&str] = &[
     "imap.proxy",
     "source.lore_base_url",
     "ui.startup_sync",
+    "ui.inbox_auto_sync_interval_secs",
     "kernel.tree",
     "kernel.trees",
 ];
@@ -212,6 +217,10 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
     ConfigEditorField {
         key: "ui.startup_sync",
         description: "Whether enabled subscriptions start syncing automatically after TUI launch.",
+    },
+    ConfigEditorField {
+        key: "ui.inbox_auto_sync_interval_secs",
+        description: "Seconds between My Inbox background auto-sync runs while TUI stays open.",
     },
     ConfigEditorField {
         key: "logging.filter",
@@ -290,6 +299,10 @@ struct ExternalEditorProcessResult {
 type ExternalEditorRunner =
     fn(&str, &Path) -> std::result::Result<ExternalEditorProcessResult, String>;
 type ReplyIdentityResolver = fn() -> std::result::Result<ReplyIdentity, String>;
+type SyncRequestExecutor =
+    fn(&RuntimeConfig, sync_worker::SyncRequest) -> Result<sync_worker::SyncSummary>;
+type ReplySendExecutor = fn(&RuntimeConfig, &SendRequest) -> SendOutcome;
+type InboxAutoSyncSpawner = fn(RuntimeConfig, Vec<String>) -> Receiver<StartupSyncEvent>;
 
 #[derive(Debug, Clone)]
 enum StartupSyncEvent {
@@ -407,6 +420,25 @@ impl StartupSyncState {
             self.pending_count(),
             self.inflight_mailboxes_display()
         )
+    }
+}
+
+#[derive(Debug)]
+struct InboxAutoSyncState {
+    receiver: Option<Receiver<StartupSyncEvent>>,
+    next_due_at: Instant,
+}
+
+impl InboxAutoSyncState {
+    fn new(next_due_at: Instant) -> Self {
+        Self {
+            receiver: None,
+            next_due_at,
+        }
+    }
+
+    fn in_flight(&self) -> bool {
+        self.receiver.is_some()
     }
 }
 
@@ -578,8 +610,31 @@ impl ReplySection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyNoticeKind {
+    Warning,
+    Info,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyNoticeAction {
+    OpenPreview,
+    Send,
+}
+
+#[derive(Debug, Clone)]
+struct ReplyNoticeState {
+    kind: ReplyNoticeKind,
+    title: String,
+    message: String,
+    hint: String,
+    action: Option<ReplyNoticeAction>,
+}
+
 #[derive(Debug, Clone)]
 struct ReplyPanelState {
+    thread_id: i64,
+    mail_id: i64,
     from: String,
     to: String,
     cc: String,
@@ -600,11 +655,15 @@ struct ReplyPanelState {
     preview_rendered: String,
     preview_errors: Vec<String>,
     preview_confirmed: bool,
+    preview_confirmed_at: Option<String>,
+    reply_notice: Option<ReplyNoticeState>,
 }
 
 impl ReplyPanelState {
-    fn new(seed: ReplySeed, self_addresses: Vec<String>) -> Self {
+    fn new(seed: ReplySeed, self_addresses: Vec<String>, mail_id: i64, thread_id: i64) -> Self {
         let mut state = Self {
+            thread_id,
+            mail_id,
             from: seed.from,
             to: seed.to,
             cc: seed.cc,
@@ -629,6 +688,8 @@ impl ReplyPanelState {
             preview_rendered: String::new(),
             preview_errors: Vec::new(),
             preview_confirmed: false,
+            preview_confirmed_at: None,
+            reply_notice: None,
         };
         state.clamp_cursor();
         state
@@ -637,6 +698,8 @@ impl ReplyPanelState {
     fn mark_dirty(&mut self) {
         self.dirty = true;
         self.preview_confirmed = false;
+        self.preview_confirmed_at = None;
+        self.reply_notice = None;
     }
 
     fn current_value(&self) -> &str {
@@ -963,8 +1026,12 @@ struct AppState {
     config_editor: ConfigEditorState,
     external_editor_runner: ExternalEditorRunner,
     reply_identity_resolver: ReplyIdentityResolver,
+    sync_request_executor: SyncRequestExecutor,
+    reply_send_executor: ReplySendExecutor,
+    inbox_auto_sync_spawner: InboxAutoSyncSpawner,
     needs_terminal_refresh: bool,
     startup_sync: Option<StartupSyncState>,
+    inbox_auto_sync: Option<InboxAutoSyncState>,
 }
 
 impl AppState {
@@ -1048,8 +1115,12 @@ impl AppState {
             config_editor: ConfigEditorState::default(),
             external_editor_runner: run_external_editor_session,
             reply_identity_resolver: resolve_git_reply_identity,
+            sync_request_executor: run_sync_request_guarded,
+            reply_send_executor: send_reply_message,
+            inbox_auto_sync_spawner: spawn_startup_sync_worker,
             needs_terminal_refresh: false,
             startup_sync: None,
+            inbox_auto_sync: None,
         };
         if state.runtime.imap.is_complete() {
             state.imap_defaults_initialized = true;
@@ -1064,6 +1135,7 @@ impl AppState {
         state.refresh_series_summaries();
         state.apply_thread_filter();
         state.sync_subscription_row_to_selected_item();
+        state.reconcile_inbox_auto_sync();
         state
     }
 
@@ -1108,6 +1180,39 @@ impl AppState {
         self.thread_index = 0;
         self.preview_scroll = 0;
         self.apply_thread_filter();
+    }
+
+    fn replace_threads_preserving_selection(&mut self, threads: Vec<ThreadRow>) {
+        let selected_message_id = self.selected_thread().map(|row| row.message_id.clone());
+        let selected_thread_id = self.selected_thread().map(|row| row.thread_id);
+        let selected_preview_scroll = self.preview_scroll;
+
+        self.replace_threads(threads);
+
+        if let Some(message_id) = selected_message_id
+            && let Some(position) = self.filtered_thread_indices.iter().position(|index| {
+                self.threads
+                    .get(*index)
+                    .is_some_and(|row| row.message_id == message_id)
+            })
+        {
+            self.thread_index = position;
+            self.preview_scroll = selected_preview_scroll;
+            self.refresh_selected_mail_preview();
+            return;
+        }
+
+        if let Some(thread_id) = selected_thread_id
+            && let Some(position) = self.filtered_thread_indices.iter().position(|index| {
+                self.threads
+                    .get(*index)
+                    .is_some_and(|row| row.thread_id == thread_id)
+            })
+        {
+            self.thread_index = position;
+            self.preview_scroll = selected_preview_scroll;
+            self.refresh_selected_mail_preview();
+        }
     }
 
     fn show_mailbox_threads(
@@ -1184,6 +1289,23 @@ impl AppState {
             .and_then(|state| state.mailboxes.get(mailbox).copied())
     }
 
+    fn inbox_auto_sync_mailbox_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
+        mailbox
+            .eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
+            .then(|| {
+                self.inbox_auto_sync
+                    .as_ref()
+                    .filter(|state| state.in_flight())
+                    .map(|_| StartupSyncMailboxStatus::InFlight)
+            })
+            .flatten()
+    }
+
+    fn mailbox_sync_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
+        self.startup_sync_mailbox_status(mailbox)
+            .or_else(|| self.inbox_auto_sync_mailbox_status(mailbox))
+    }
+
     fn startup_sync_mailbox_pending(&self, mailbox: &str) -> bool {
         matches!(
             self.startup_sync_mailbox_status(mailbox),
@@ -1191,10 +1313,24 @@ impl AppState {
         )
     }
 
+    fn mailbox_sync_pending(&self, mailbox: &str) -> bool {
+        self.startup_sync_mailbox_pending(mailbox)
+            || matches!(
+                self.inbox_auto_sync_mailbox_status(mailbox),
+                Some(StartupSyncMailboxStatus::InFlight)
+            )
+    }
+
     fn startup_sync_progress_text(&self) -> Option<String> {
         self.startup_sync
             .as_ref()
             .map(|state| format!("sync: {}", state.progress_summary()))
+            .or_else(|| {
+                self.inbox_auto_sync
+                    .as_ref()
+                    .filter(|state| state.in_flight())
+                    .map(|_| "sync: inbox auto-sync running=INBOX".to_string())
+            })
     }
 
     fn refresh_series_summaries(&mut self) {
@@ -1219,6 +1355,155 @@ impl AppState {
             .filter(|item| item.enabled)
             .map(|item| item.mailbox.clone())
             .collect()
+    }
+
+    fn my_inbox_auto_sync_enabled(&self) -> bool {
+        self.runtime.imap.is_complete()
+            && self
+                .subscriptions
+                .iter()
+                .any(|item| item.enabled && item.mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+    }
+
+    fn reconcile_inbox_auto_sync(&mut self) {
+        if self.my_inbox_auto_sync_enabled() {
+            self.inbox_auto_sync.get_or_insert_with(|| {
+                InboxAutoSyncState::new(Instant::now() + self.runtime.inbox_auto_sync_interval())
+            });
+        } else {
+            self.inbox_auto_sync = None;
+        }
+    }
+
+    fn defer_inbox_auto_sync(&mut self) {
+        if let Some(state) = self.inbox_auto_sync.as_mut() {
+            state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
+        }
+    }
+
+    fn defer_inbox_auto_sync_for_mailbox(&mut self, mailbox: &str) {
+        if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+            self.defer_inbox_auto_sync();
+        }
+    }
+
+    fn run_sync_request(
+        &self,
+        request: sync_worker::SyncRequest,
+    ) -> Result<sync_worker::SyncSummary> {
+        (self.sync_request_executor)(&self.runtime, request)
+    }
+
+    fn maybe_start_inbox_auto_sync(&mut self) {
+        self.reconcile_inbox_auto_sync();
+        let startup_pending = self.startup_sync_mailbox_pending(IMAP_INBOX_MAILBOX);
+        let now = Instant::now();
+        let Some(state) = self.inbox_auto_sync.as_mut() else {
+            return;
+        };
+        if state.in_flight() || startup_pending || now < state.next_due_at {
+            return;
+        }
+
+        tracing::info!(
+            op = "inbox_auto_sync",
+            status = "started",
+            mailbox = IMAP_INBOX_MAILBOX
+        );
+        state.receiver = Some((self.inbox_auto_sync_spawner)(
+            self.runtime.clone(),
+            vec![IMAP_INBOX_MAILBOX.to_string()],
+        ));
+    }
+
+    fn pump_inbox_auto_sync_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        {
+            let Some(sync_state) = self.inbox_auto_sync.as_ref() else {
+                return;
+            };
+            let Some(receiver) = sync_state.receiver.as_ref() else {
+                return;
+            };
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut worker_completed = false;
+        for event in events {
+            if matches!(event, StartupSyncEvent::WorkerCompleted) {
+                worker_completed = true;
+            }
+            self.apply_inbox_auto_sync_event(event);
+        }
+
+        if (disconnected || worker_completed)
+            && let Some(state) = self.inbox_auto_sync.as_mut()
+        {
+            state.receiver = None;
+        }
+    }
+
+    fn apply_inbox_auto_sync_event(&mut self, event: StartupSyncEvent) {
+        match event {
+            StartupSyncEvent::MailboxStarted { mailbox, .. } => {
+                tracing::info!(
+                    op = "inbox_auto_sync",
+                    status = "progress",
+                    phase = "started",
+                    mailbox = %mailbox
+                );
+            }
+            StartupSyncEvent::MailboxFinished {
+                mailbox,
+                fetched,
+                inserted,
+                updated,
+            } => {
+                if let Some(state) = self.inbox_auto_sync.as_mut() {
+                    state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
+                }
+                if mailbox == self.active_thread_mailbox {
+                    self.reload_mailbox_threads_preserving_selection(&mailbox);
+                }
+                if inserted > 0 || updated > 0 {
+                    self.status = format!(
+                        "My Inbox auto-sync: fetched={} inserted={} updated={}",
+                        fetched, inserted, updated
+                    );
+                }
+                tracing::info!(
+                    op = "inbox_auto_sync",
+                    status = "succeeded",
+                    mailbox = %mailbox,
+                    fetched,
+                    inserted,
+                    updated
+                );
+            }
+            StartupSyncEvent::MailboxFailed { mailbox, error } => {
+                if let Some(state) = self.inbox_auto_sync.as_mut() {
+                    state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
+                }
+                self.status = format!("My Inbox auto-sync failed: {error}");
+                tracing::error!(
+                    op = "inbox_auto_sync",
+                    status = "failed",
+                    mailbox = %mailbox,
+                    error = %error
+                );
+            }
+            StartupSyncEvent::WorkerCompleted => {}
+        }
     }
 
     fn start_startup_sync_if_enabled(&mut self) {
@@ -1357,6 +1642,9 @@ impl AppState {
                 inserted,
                 updated,
             } => {
+                if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                    self.defer_inbox_auto_sync();
+                }
                 if let Some(sync_state) = self.startup_sync.as_mut() {
                     sync_state
                         .mailboxes
@@ -1396,6 +1684,9 @@ impl AppState {
                 }
             }
             StartupSyncEvent::MailboxFailed { mailbox, error } => {
+                if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                    self.defer_inbox_auto_sync();
+                }
                 if let Some(sync_state) = self.startup_sync.as_mut() {
                     sync_state
                         .mailboxes
@@ -1479,6 +1770,28 @@ impl AppState {
         }
     }
 
+    fn reload_mailbox_threads_preserving_selection(&mut self, mailbox: &str) {
+        match mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, mailbox, 500) {
+            Ok(rows) => {
+                if mailbox == self.active_thread_mailbox {
+                    self.replace_threads_preserving_selection(rows);
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    op = "inbox_auto_sync",
+                    status = "failed",
+                    mailbox = %mailbox,
+                    error = %error
+                );
+                self.status = format!(
+                    "background sync ok but failed to reload threads for {}: {}",
+                    mailbox, error
+                );
+            }
+        }
+    }
+
     fn to_ui_state(&self) -> UiState {
         UiState {
             enabled_mailboxes: self.enabled_mailboxes(),
@@ -1529,7 +1842,7 @@ impl AppState {
                     kind: SubscriptionRowKind::Item(index),
                     text: format!(
                         "  {}",
-                        subscription_line(item, self.startup_sync_mailbox_status(&item.mailbox))
+                        subscription_line(item, self.mailbox_sync_status(&item.mailbox))
                     ),
                 });
             }
@@ -1556,7 +1869,7 @@ impl AppState {
                     kind: SubscriptionRowKind::Item(index),
                     text: format!(
                         "  {}",
-                        subscription_line(item, self.startup_sync_mailbox_status(&item.mailbox))
+                        subscription_line(item, self.mailbox_sync_status(&item.mailbox))
                     ),
                 });
             }
@@ -1632,6 +1945,7 @@ impl AppState {
         self.sort_subscriptions_keep_selected(&mailbox);
         let marker = if enabled { "enabled" } else { "disabled" };
         self.status = format!("{marker} subscription {label}");
+        self.reconcile_inbox_auto_sync();
         self.persist_ui_state();
     }
 
@@ -1718,7 +2032,7 @@ impl AppState {
                 );
             }
             Ok(_) => {
-                if self.startup_sync_mailbox_pending(&mailbox) {
+                if self.mailbox_sync_pending(&mailbox) {
                     self.show_mailbox_threads(
                         &mailbox,
                         Vec::new(),
@@ -1740,7 +2054,10 @@ impl AppState {
                     reconnect_attempts: PALETTE_SYNC_RECONNECT_ATTEMPTS,
                 };
 
-                match run_sync_request_guarded(&self.runtime, request) {
+                let sync_result = self.run_sync_request(request);
+                self.defer_inbox_auto_sync_for_mailbox(&mailbox);
+
+                match sync_result {
                     Ok(summary) => match mail_store::load_thread_rows_by_mailbox(
                         &self.runtime.database_path,
                         &mailbox,
@@ -1861,7 +2178,12 @@ impl AppState {
         }
 
         let seed = build_reply_seed(&raw, &thread, &identity, &self_addresses);
-        self.reply_panel = Some(ReplyPanelState::new(seed, self_addresses));
+        self.reply_panel = Some(ReplyPanelState::new(
+            seed,
+            self_addresses,
+            thread.mail_id,
+            thread.thread_id,
+        ));
         self.status = format!("reply panel opened for <{}>", thread.message_id);
     }
 
@@ -1870,11 +2192,40 @@ impl AppState {
         self.status = status.into();
     }
 
+    fn open_reply_notice(
+        &mut self,
+        kind: ReplyNoticeKind,
+        title: impl Into<String>,
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        action: Option<ReplyNoticeAction>,
+        status: impl Into<String>,
+    ) {
+        if let Some(panel) = self.reply_panel.as_mut() {
+            panel.reply_notice = Some(ReplyNoticeState {
+                kind,
+                title: title.into(),
+                message: message.into(),
+                hint: hint.into(),
+                action,
+            });
+        }
+        self.status = status.into();
+    }
+
+    fn close_reply_notice(&mut self, status: impl Into<String>) {
+        if let Some(panel) = self.reply_panel.as_mut() {
+            panel.reply_notice = None;
+        }
+        self.status = status.into();
+    }
+
     fn open_send_preview(&mut self) {
         let Some(panel) = self.reply_panel.as_mut() else {
             self.status = "reply panel is not open".to_string();
             return;
         };
+        panel.reply_notice = None;
 
         let ReplyPreview { content, errors } = render_reply_preview(ReplyPreviewRequest {
             from: &panel.from,
@@ -1924,20 +2275,109 @@ impl AppState {
 
         panel.preview_open = false;
         panel.preview_confirmed = true;
-        self.status = "send preview confirmed".to_string();
+        panel.preview_confirmed_at = Some(now_timestamp());
+        self.open_reply_notice(
+            ReplyNoticeKind::Info,
+            "Ready To Send",
+            "Send Preview has been confirmed. Press S to send the reply, or Esc/Enter to keep editing.",
+            "S send | Esc/Enter close",
+            Some(ReplyNoticeAction::Send),
+            "send preview confirmed; ready to send",
+        );
     }
 
     fn attempt_reply_send(&mut self) {
-        let Some(panel) = self.reply_panel.as_ref() else {
+        let Some(panel) = self.reply_panel.as_ref().cloned() else {
             self.status = "reply panel is not open".to_string();
             return;
         };
         if !panel.preview_confirmed {
-            self.status = "send blocked: run Send Preview and confirm first".to_string();
+            self.open_reply_notice(
+                ReplyNoticeKind::Warning,
+                "Send Blocked",
+                "You must open Send Preview and confirm it before Courier will send this reply.",
+                "P preview | Esc/Enter close",
+                Some(ReplyNoticeAction::OpenPreview),
+                "send blocked: run Send Preview and confirm first",
+            );
             return;
         }
 
-        self.status = "send is not available until M8; preview is already confirmed".to_string();
+        let (prepared, errors) = prepare_reply_message(ReplyPreviewRequest {
+            from: &panel.from,
+            to: &panel.to,
+            cc: &panel.cc,
+            subject: &panel.subject,
+            in_reply_to: &panel.in_reply_to,
+            references: &panel.references,
+            body: &panel.body,
+            self_addresses: &panel.self_addresses,
+        });
+        if !errors.is_empty() {
+            self.status = format!("send blocked: {}", errors.join("; "));
+            return;
+        }
+
+        let request = build_send_request(&panel, prepared);
+        tracing::info!(
+            op = "reply.send",
+            status = "started",
+            mail_id = request.mail_id,
+            thread_id = request.thread_id,
+            "sending reply"
+        );
+        let outcome = (self.reply_send_executor)(&self.runtime, &request);
+        let persist_result = persist_reply_send_result(&self.runtime, &request, &outcome);
+
+        match outcome.status {
+            SendStatus::Sent => {
+                tracing::info!(
+                    op = "reply.send",
+                    status = "sent",
+                    mail_id = request.mail_id,
+                    thread_id = request.thread_id,
+                    message_id = %outcome.message_id,
+                    "reply sent"
+                );
+                let status = if let Err(error) = persist_result {
+                    format!(
+                        "reply sent as <{}> but failed to persist send result: {}",
+                        outcome.message_id, error
+                    )
+                } else {
+                    format!("reply sent as <{}>", outcome.message_id)
+                };
+                self.close_reply_panel(status);
+            }
+            SendStatus::Failed | SendStatus::TimedOut => {
+                let summary = outcome
+                    .error_summary
+                    .as_deref()
+                    .unwrap_or("reply send failed");
+                tracing::error!(
+                    op = "reply.send",
+                    status = "failed",
+                    mail_id = request.mail_id,
+                    thread_id = request.thread_id,
+                    message_id = %outcome.message_id,
+                    exit_code = outcome.exit_code,
+                    timed_out = outcome.timed_out,
+                    error = %summary,
+                    "reply send failed"
+                );
+                self.status = if let Err(error) = persist_result {
+                    format!(
+                        "send failed: {}; retry with S after fixing the issue (persist failed: {})",
+                        summary, error
+                    )
+                } else {
+                    format!(
+                        "send failed: {}; retry with S after fixing the issue",
+                        summary
+                    )
+                };
+            }
+        }
     }
 
     fn execute_reply_command(&mut self) {
@@ -3049,6 +3489,75 @@ fn resolve_git_reply_identity() -> std::result::Result<ReplyIdentity, String> {
     reply::resolve_git_identity()
 }
 
+fn send_reply_message(runtime: &RuntimeConfig, request: &SendRequest) -> SendOutcome {
+    sendmail::send(runtime, request)
+}
+
+fn build_send_request(panel: &ReplyPanelState, prepared: PreparedReplyMessage) -> SendRequest {
+    SendRequest {
+        mail_id: panel.mail_id,
+        thread_id: panel.thread_id,
+        from: prepared.from,
+        to: prepared.to,
+        cc: prepared.cc,
+        subject: prepared.subject,
+        in_reply_to: prepared.in_reply_to,
+        references: prepared.references,
+        body: prepared.body,
+        preview_confirmed_at: panel
+            .preview_confirmed_at
+            .clone()
+            .unwrap_or_else(now_timestamp),
+    }
+}
+
+fn persist_reply_send_result(
+    runtime: &RuntimeConfig,
+    request: &SendRequest,
+    outcome: &SendOutcome,
+) -> Result<i64> {
+    reply_store::insert_reply_send(
+        &runtime.database_path,
+        &ReplySendRecordRequest {
+            thread_id: request.thread_id,
+            mail_id: request.mail_id,
+            transport: outcome.transport.clone(),
+            message_id: outcome.message_id.clone(),
+            from_addr: request.from.clone(),
+            to_addrs: request.to.join(", "),
+            cc_addrs: request.cc.join(", "),
+            subject: request.subject.clone(),
+            preview_confirmed_at: request.preview_confirmed_at.clone(),
+            status: match outcome.status {
+                SendStatus::Sent => ReplySendStatus::Sent,
+                SendStatus::Failed => ReplySendStatus::Failed,
+                SendStatus::TimedOut => ReplySendStatus::TimedOut,
+            },
+            command: outcome.command_line.clone(),
+            draft_path: outcome.draft_path.clone(),
+            exit_code: outcome.exit_code,
+            timed_out: outcome.timed_out,
+            error_summary: outcome.error_summary.clone(),
+            stdout: if outcome.stdout.is_empty() {
+                None
+            } else {
+                Some(outcome.stdout.clone())
+            },
+            stderr: if outcome.stderr.is_empty() {
+                None
+            } else {
+                Some(outcome.stderr.clone())
+            },
+            started_at: outcome.started_at.clone(),
+            finished_at: outcome.finished_at.clone(),
+        },
+    )
+}
+
+fn now_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 fn reply_body_line_logical_row(body_row: usize) -> usize {
     body_row
 }
@@ -3156,6 +3665,8 @@ fn tui_loop(
 ) -> Result<TuiAction> {
     loop {
         state.pump_startup_sync_events();
+        state.pump_inbox_auto_sync_events();
+        state.maybe_start_inbox_auto_sync();
 
         if state.take_terminal_refresh_needed() {
             terminal.clear().map_err(|error| {

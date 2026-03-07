@@ -10,6 +10,7 @@ use crate::infra::config::{self, IMAP_INBOX_MAILBOX};
 use crate::infra::error::Result;
 use crate::infra::imap::{ImapClient, RemoteImapClient};
 use crate::infra::logging;
+use crate::infra::sendmail::{self, GitSendEmailStatus};
 
 const DEFAULT_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
 
@@ -60,6 +61,8 @@ pub fn run() -> Result<()> {
         }
         cli::Command::Doctor => {
             let b4_status = b4::check(runtime.b4_path.as_deref());
+            let send_email_status = sendmail::check();
+            let reply_identity = sendmail::resolve_reply_identity();
 
             println!("courier doctor");
             println!("  config_path: {}", runtime.config_path.display());
@@ -75,6 +78,10 @@ pub fn run() -> Result<()> {
             );
             println!("  lore_base_url: {}", runtime.lore_base_url);
             println!("  startup_sync: {}", runtime.startup_sync);
+            println!(
+                "  inbox_auto_sync_interval_secs: {}",
+                runtime.inbox_auto_sync_interval_secs
+            );
             if runtime.kernel_trees.is_empty() {
                 println!("  kernel_trees: <none>");
             } else {
@@ -162,6 +169,37 @@ pub fn run() -> Result<()> {
                     }
                 );
                 println!("  imap_connect_status: skipped");
+            }
+
+            match send_email_status.status {
+                GitSendEmailStatus::Available { path, version } => {
+                    println!("  git_send_email_path: {}", path.display());
+                    println!("  git_send_email_version: {}", version);
+                    println!("  git_send_email_status: ok");
+                }
+                GitSendEmailStatus::Broken { path, reason } => {
+                    println!("  git_send_email_path: {}", path.display());
+                    println!("  git_send_email_status: broken ({reason})");
+                }
+                GitSendEmailStatus::Missing => {
+                    println!("  git_send_email_path: <not found>");
+                    println!("  git_send_email_status: missing");
+                }
+            }
+
+            match reply_identity {
+                Ok(identity) => {
+                    println!("  reply_from: {}", identity.display);
+                    println!("  reply_from_email: {}", identity.email);
+                    println!("  reply_from_source: {}", identity.source.as_str());
+                    println!("  reply_identity_status: ok");
+                }
+                Err(error) => {
+                    println!("  reply_from: <missing>");
+                    println!("  reply_from_email: <missing>");
+                    println!("  reply_from_source: <none>");
+                    println!("  reply_identity_status: error ({error})");
+                }
             }
 
             match b4_status.status {

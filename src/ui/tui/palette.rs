@@ -190,9 +190,13 @@ pub(super) fn run_palette_sync(state: &mut AppState, command: &str) {
     let mut total_inserted = 0usize;
     let mut total_updated = 0usize;
     let mut first_error: Option<String> = None;
+    let mut defer_inbox_auto_sync = false;
     let total = mailboxes.len();
 
     for (index, mailbox) in mailboxes.into_iter().enumerate() {
+        if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+            defer_inbox_auto_sync = true;
+        }
         tracing::info!(
             op = "sync",
             status = "progress",
@@ -211,7 +215,7 @@ pub(super) fn run_palette_sync(state: &mut AppState, command: &str) {
             reconnect_attempts: PALETTE_SYNC_RECONNECT_ATTEMPTS,
         };
 
-        match run_sync_request_guarded(&state.runtime, request) {
+        match state.run_sync_request(request) {
             Ok(summary) => {
                 success += 1;
                 total_fetched += summary.fetched;
@@ -251,6 +255,10 @@ pub(super) fn run_palette_sync(state: &mut AppState, command: &str) {
                 );
             }
         }
+    }
+
+    if defer_inbox_auto_sync {
+        state.defer_inbox_auto_sync();
     }
 
     if success > 0
