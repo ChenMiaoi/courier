@@ -72,7 +72,7 @@ refresh your checkout or reinstall the binary and bootstrap a new CRIEW runtime 
 ### Install from crates.io
 
 ```bash
-cargo install criew --locked
+cargo install criew
 ```
 
 This build keeps a minimal vendored `b4` runtime embedded in the binary.

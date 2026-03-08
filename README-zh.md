@@ -56,7 +56,7 @@ criew doctor
 ### 从 crates.io 安装
 
 ```bash
-cargo install criew --locked
+cargo install criew
 ```
 
 这个安装包会把一个最小可运行的 vendored `b4` fallback 内嵌进二进制。
