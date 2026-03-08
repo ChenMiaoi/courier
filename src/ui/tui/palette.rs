@@ -199,11 +199,15 @@ pub(super) fn run_palette_sync(state: &mut AppState, command: &str) {
     let mut total_updated = 0usize;
     let mut first_error: Option<String> = None;
     let mut defer_inbox_auto_sync = false;
+    let mut defer_subscription_auto_sync = false;
     let total = mailboxes.len();
 
     for (index, mailbox) in mailboxes.into_iter().enumerate() {
         if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
             defer_inbox_auto_sync = true;
+        }
+        if !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+            defer_subscription_auto_sync = true;
         }
         tracing::info!(
             op = "sync",
@@ -267,6 +271,9 @@ pub(super) fn run_palette_sync(state: &mut AppState, command: &str) {
 
     if defer_inbox_auto_sync {
         state.defer_inbox_auto_sync();
+    }
+    if defer_subscription_auto_sync {
+        state.defer_subscription_auto_sync();
     }
 
     if success > 0

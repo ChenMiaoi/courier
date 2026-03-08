@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use chrono::DateTime;
+use chrono::{DateTime, NaiveDateTime, Utc};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use rustls::pki_types::ServerName;
@@ -23,10 +23,13 @@ use crate::infra::config::{ImapConfig, ImapEncryption};
 use crate::infra::error::{CourierError, ErrorCode, Result};
 
 const LORE_BASE_URL: &str = "https://lore.kernel.org";
+const GNU_ARCHIVE_MBOX_BASE_URL: &str = "https://lists.gnu.org/archive/mbox";
 const LORE_HTTP_TIMEOUT_SECS: u64 = 20;
 const REMOTE_IMAP_TIMEOUT_SECS: u64 = 20;
 const HTTP_PROXY_RESPONSE_MAX_BYTES: usize = 8 * 1024;
 const IMAP_FETCH_BATCH_SIZE: usize = 100;
+const GNU_ARCHIVE_INITIAL_MONTH_LIMIT: usize = 2;
+const GNU_ARCHIVE_UID_STRIDE: u32 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -312,6 +315,12 @@ struct LoreFeedEntry {
     modseq: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GnuArchiveMonthEntry {
+    month_key: String,
+    modseq: u64,
+}
+
 impl LoreImapClient {
     pub fn new(base_url: Option<&str>) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
@@ -478,6 +487,171 @@ impl ImapClient for LoreImapClient {
         }
 
         fetched.sort_by_key(|mail| mail.modseq.unwrap_or(0));
+        Ok(fetched)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GnuArchiveClient {
+    base_url: String,
+    connected: bool,
+    client: reqwest::blocking::Client,
+}
+
+impl GnuArchiveClient {
+    pub fn new(base_url: Option<&str>) -> Result<Self> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(LORE_HTTP_TIMEOUT_SECS))
+            .user_agent(format!("courier/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Imap,
+                    "failed to initialize GNU archive HTTP client",
+                    error,
+                )
+            })?;
+
+        Ok(Self {
+            base_url: base_url
+                .unwrap_or(GNU_ARCHIVE_MBOX_BASE_URL)
+                .trim_end_matches('/')
+                .to_string(),
+            connected: false,
+            client,
+        })
+    }
+
+    fn ensure_connected(&self) -> Result<()> {
+        if self.connected {
+            return Ok(());
+        }
+
+        Err(imap_error(
+            ImapErrorKind::Connection,
+            "client is not connected",
+        ))
+    }
+
+    fn index_url(&self, mailbox: &str) -> String {
+        let mailbox = mailbox.trim_matches('/');
+        format!("{}/{mailbox}/", self.base_url)
+    }
+
+    fn month_url(&self, mailbox: &str, month_key: &str) -> String {
+        let mailbox = mailbox.trim_matches('/');
+        format!("{}/{mailbox}/{month_key}", self.base_url)
+    }
+
+    fn fetch_month_entries(&self, mailbox: &str) -> Result<Vec<GnuArchiveMonthEntry>> {
+        let url = self.index_url(mailbox);
+        let response = self.client.get(&url).send().map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Imap,
+                format!("failed to fetch GNU archive index {url}"),
+                error,
+            )
+        })?;
+
+        let status = response.status();
+        let body = response.text().map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Imap,
+                format!("failed to read GNU archive index body {url}"),
+                error,
+            )
+        })?;
+
+        if !status.is_success() {
+            return Err(imap_error(
+                ImapErrorKind::MailboxSelection,
+                format!("failed to fetch GNU archive index {url}: HTTP {status}"),
+            ));
+        }
+
+        parse_gnu_archive_month_entries(&body)
+    }
+
+    fn fetch_month_mbox(&self, mailbox: &str, month_key: &str) -> Result<Vec<u8>> {
+        let url = self.month_url(mailbox, month_key);
+        let response = self.client.get(&url).send().map_err(|error| {
+            CourierError::with_source(
+                ErrorCode::Imap,
+                format!("failed to fetch GNU archive mbox {url}"),
+                error,
+            )
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(imap_error(
+                ImapErrorKind::Protocol,
+                format!("failed to fetch GNU archive mbox {url}: HTTP {status}"),
+            ));
+        }
+
+        response
+            .bytes()
+            .map(|bytes| bytes.to_vec())
+            .map_err(|error| {
+                CourierError::with_source(
+                    ErrorCode::Imap,
+                    format!("failed to read GNU archive mbox body {url}"),
+                    error,
+                )
+            })
+    }
+}
+
+impl ImapClient for GnuArchiveClient {
+    fn connect(&mut self) -> Result<()> {
+        self.connected = true;
+        Ok(())
+    }
+
+    fn select_mailbox(&mut self, mailbox: &str) -> Result<MailboxSnapshot> {
+        self.ensure_connected()?;
+        let entries = self.fetch_month_entries(mailbox)?;
+        let highest_modseq = entries.iter().map(|entry| entry.modseq).max();
+
+        Ok(MailboxSnapshot {
+            uidvalidity: 1,
+            highest_uid: 0,
+            highest_modseq,
+        })
+    }
+
+    fn fetch_incremental(
+        &mut self,
+        mailbox: &str,
+        _after_uid: u32,
+        since_modseq: Option<u64>,
+    ) -> Result<Vec<RemoteMail>> {
+        self.ensure_connected()?;
+        let months = self.fetch_month_entries(mailbox)?;
+        let selected_months = select_gnu_archive_months(&months, since_modseq);
+
+        let mut fetched = Vec::new();
+        for month in selected_months {
+            let raw_mbox = self.fetch_month_mbox(mailbox, &month.month_key)?;
+            for (index, raw) in parse_gnu_archive_mbox_messages(&raw_mbox)
+                .into_iter()
+                .enumerate()
+            {
+                fetched.push(RemoteMail {
+                    uid: gnu_archive_message_uid(&month.month_key, index),
+                    modseq: Some(month.modseq),
+                    flags: Vec::new(),
+                    raw,
+                });
+            }
+        }
+
+        fetched.sort_by(|left, right| {
+            left.modseq
+                .cmp(&right.modseq)
+                .then_with(|| left.uid.cmp(&right.uid))
+        });
         Ok(fetched)
     }
 }
@@ -1769,6 +1943,162 @@ fn parse_atom_timestamp(value: &str) -> Option<u64> {
         .and_then(|datetime| datetime.timestamp().try_into().ok())
 }
 
+fn parse_gnu_archive_month_entries(html: &str) -> Result<Vec<GnuArchiveMonthEntry>> {
+    let mut entries = Vec::new();
+    let mut seen_months = HashSet::new();
+
+    for line in html.lines() {
+        let Some(anchor_start) = line.find("<a href=\"") else {
+            continue;
+        };
+        let href_start = anchor_start + "<a href=\"".len();
+        let Some(href_end) = line[href_start..].find('"') else {
+            continue;
+        };
+        let href = &line[href_start..href_start + href_end];
+        let Some((year, month)) = parse_year_month_key(href) else {
+            continue;
+        };
+
+        let Some(anchor_end) = line.find("</a>") else {
+            continue;
+        };
+        let mut parts = line[anchor_end + "</a>".len()..].split_whitespace();
+        let (Some(date), Some(time)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Some(modseq) = parse_gnu_archive_listing_timestamp(date, time) else {
+            continue;
+        };
+
+        let month_key = format!("{year:04}-{month:02}");
+        if seen_months.insert(month_key.clone()) {
+            entries.push(GnuArchiveMonthEntry { month_key, modseq });
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        left.month_key
+            .cmp(&right.month_key)
+            .then_with(|| left.modseq.cmp(&right.modseq))
+    });
+
+    Ok(entries)
+}
+
+fn parse_year_month_key(value: &str) -> Option<(u32, u32)> {
+    let trimmed = value.trim_matches('/');
+    let (year, month) = trimmed.split_once('-')?;
+    if year.len() != 4 || month.len() != 2 {
+        return None;
+    }
+
+    let year = year.parse::<u32>().ok()?;
+    let month = month.parse::<u32>().ok()?;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+
+    Some((year, month))
+}
+
+fn parse_gnu_archive_listing_timestamp(date: &str, time: &str) -> Option<u64> {
+    let naive = NaiveDateTime::parse_from_str(&format!("{date} {time}"), "%Y-%m-%d %H:%M").ok()?;
+    DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
+        .timestamp()
+        .try_into()
+        .ok()
+}
+
+fn select_gnu_archive_months(
+    months: &[GnuArchiveMonthEntry],
+    since_modseq: Option<u64>,
+) -> Vec<GnuArchiveMonthEntry> {
+    if months.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(checkpoint) = since_modseq {
+        for entry in months.iter().filter(|entry| entry.modseq > checkpoint) {
+            if seen.insert(entry.month_key.clone()) {
+                selected.push(entry.clone());
+            }
+        }
+
+        if let Some(latest) = months.last()
+            && seen.insert(latest.month_key.clone())
+        {
+            // GNU archive directory timestamps are only minute-resolution. Keep
+            // polling the newest month even when the index timestamp has not
+            // advanced yet so current-month mail is not missed.
+            selected.push(latest.clone());
+        }
+    } else {
+        for entry in months
+            .iter()
+            .rev()
+            .take(GNU_ARCHIVE_INITIAL_MONTH_LIMIT)
+            .rev()
+        {
+            if seen.insert(entry.month_key.clone()) {
+                selected.push(entry.clone());
+            }
+        }
+    }
+
+    selected.sort_by(|left, right| left.month_key.cmp(&right.month_key));
+    selected
+}
+
+fn parse_gnu_archive_mbox_messages(raw: &[u8]) -> Vec<Vec<u8>> {
+    let mut messages = Vec::new();
+    let mut current = Vec::new();
+
+    for line in raw.split_inclusive(|byte| *byte == b'\n') {
+        let normalized = trim_ascii_line_ending(line);
+        if normalized.starts_with(b"From ") {
+            if !current.is_empty() {
+                messages.push(current);
+                current = Vec::new();
+            }
+            continue;
+        }
+
+        if normalized.starts_with(b">From ") {
+            current.extend_from_slice(&line[1..]);
+        } else {
+            current.extend_from_slice(line);
+        }
+    }
+
+    if !current.is_empty() {
+        messages.push(current);
+    }
+
+    messages
+}
+
+fn trim_ascii_line_ending(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn gnu_archive_message_uid(month_key: &str, index: usize) -> u32 {
+    let Some((year, month)) = parse_year_month_key(month_key) else {
+        return 0;
+    };
+    if year < 2000 || index + 1 >= GNU_ARCHIVE_UID_STRIDE as usize {
+        return 0;
+    }
+
+    let month_ordinal = (year - 2000) * 12 + (month - 1);
+    let uid = month_ordinal as u64 * GNU_ARCHIVE_UID_STRIDE as u64 + index as u64 + 1;
+    u32::try_from(uid).unwrap_or(0)
+}
+
 fn normalize_lore_message_url(value: &str) -> Option<String> {
     if !value.contains("//") {
         return None;
@@ -1836,11 +2166,13 @@ mod tests {
     use crate::infra::config::{ImapConfig, ImapEncryption};
 
     use super::{
-        FixtureImapClient, ImapClient, ImapErrorKind, RemoteImapClient, ensure_tagged_ok,
-        establish_http_connect_tunnel, establish_socks5_tunnel, format_uid_sequence_set,
-        lore_raw_url_candidates, parse_atom_timestamp, parse_fetch_flags, parse_fetch_modseq,
-        parse_fetch_uid, parse_imap_proxy, parse_literal_len, parse_lore_atom_entries,
-        parse_status_code_u64,
+        FixtureImapClient, GnuArchiveMonthEntry, ImapClient, ImapErrorKind, RemoteImapClient,
+        ensure_tagged_ok, establish_http_connect_tunnel, establish_socks5_tunnel,
+        format_uid_sequence_set, gnu_archive_message_uid, lore_raw_url_candidates,
+        parse_atom_timestamp, parse_fetch_flags, parse_fetch_modseq, parse_fetch_uid,
+        parse_gnu_archive_mbox_messages, parse_gnu_archive_month_entries, parse_imap_proxy,
+        parse_literal_len, parse_lore_atom_entries, parse_status_code_u64,
+        select_gnu_archive_months,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -2114,5 +2446,74 @@ mod tests {
     fn parses_atom_timestamps() {
         let ts = parse_atom_timestamp("2026-03-03T10:00:00+00:00").expect("timestamp");
         assert!(ts > 0);
+    }
+
+    #[test]
+    fn parses_gnu_archive_month_entries() {
+        let html = r#"
+<pre>
+<img src="/icons/unknown.gif" alt="[   ]"> <a href="2026-02">2026-02</a>                 2026-02-26 09:12  855K
+<img src="/icons/unknown.gif" alt="[   ]"> <a href="2026-03">2026-03</a>                 2026-03-07 06:37  341K
+</pre>
+"#;
+
+        let entries = parse_gnu_archive_month_entries(html).expect("parse month entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].month_key, "2026-02");
+        assert_eq!(entries[1].month_key, "2026-03");
+        assert!(entries[1].modseq >= entries[0].modseq);
+    }
+
+    #[test]
+    fn selects_latest_gnu_archive_month_and_recent_history() {
+        let months = vec![
+            GnuArchiveMonthEntry {
+                month_key: "2026-01".to_string(),
+                modseq: 10,
+            },
+            GnuArchiveMonthEntry {
+                month_key: "2026-02".to_string(),
+                modseq: 20,
+            },
+            GnuArchiveMonthEntry {
+                month_key: "2026-03".to_string(),
+                modseq: 30,
+            },
+        ];
+
+        let initial = select_gnu_archive_months(&months, None);
+        assert_eq!(
+            initial
+                .iter()
+                .map(|entry| entry.month_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2026-02", "2026-03"]
+        );
+
+        let incremental = select_gnu_archive_months(&months, Some(30));
+        assert_eq!(
+            incremental
+                .iter()
+                .map(|entry| entry.month_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2026-03"]
+        );
+    }
+
+    #[test]
+    fn parses_gnu_archive_mbox_messages() {
+        let raw = b"From MAILER-DAEMON Tue Mar 03 04:39:31 2026\nMessage-ID: <msg-a@example.com>\nSubject: one\n\nbody\n>From escaped\nFrom MAILER-DAEMON Tue Mar 03 04:40:31 2026\nMessage-ID: <msg-b@example.com>\nSubject: two\n\nbody two\n";
+
+        let messages = parse_gnu_archive_mbox_messages(raw);
+        assert_eq!(messages.len(), 2);
+        assert!(String::from_utf8_lossy(&messages[0]).contains("Message-ID: <msg-a@example.com>"));
+        assert!(String::from_utf8_lossy(&messages[0]).contains("\nFrom escaped\n"));
+        assert!(String::from_utf8_lossy(&messages[1]).contains("Message-ID: <msg-b@example.com>"));
+    }
+
+    #[test]
+    fn assigns_stable_gnu_archive_uids() {
+        assert_eq!(gnu_archive_message_uid("2026-03", 0), 314_000_001);
+        assert_eq!(gnu_archive_message_uid("2026-03", 41), 314_000_042);
     }
 }

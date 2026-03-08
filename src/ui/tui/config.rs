@@ -545,7 +545,11 @@ fn apply_runtime_update(state: &mut AppState, runtime: RuntimeConfig) {
         &state.runtime,
         &enabled_mailboxes,
         Some(active_mailbox.as_str()),
-        state.runtime.imap.is_complete() && !state.imap_defaults_initialized,
+        if state.runtime.imap.is_complete() && !state.imap_defaults_initialized {
+            MyInboxDefault::EnableOnFirstOpen
+        } else {
+            MyInboxDefault::PreservePersistedChoice
+        },
     );
     if state.runtime.imap.is_complete() {
         state.imap_defaults_initialized = true;
@@ -553,14 +557,16 @@ fn apply_runtime_update(state: &mut AppState, runtime: RuntimeConfig) {
     if let Some(index) = state
         .subscriptions
         .iter()
-        .position(|item| item.mailbox == state.active_thread_mailbox)
+        .position(|item| same_mailbox_name(&item.mailbox, &state.active_thread_mailbox))
     {
         state.subscription_index = index;
         state.sync_subscription_row_to_selected_item();
     }
     state.reconcile_inbox_auto_sync();
+    state.reconcile_subscription_auto_sync();
     if state.runtime.inbox_auto_sync_interval_secs != old_inbox_auto_sync_interval_secs {
         state.defer_inbox_auto_sync();
+        state.defer_subscription_auto_sync();
     }
     state.refresh_kernel_tree_rows(selected_path_hint.as_deref());
     if matches!(state.ui_page, UiPage::CodeBrowser) && !state.supports_code_browser() {

@@ -165,6 +165,7 @@ courier tui
 - `!<shell command>`
 
 如果 IMAP 配置完整，`My Inbox` 会参与启动自动同步，并在 TUI 保持打开时按配置周期持续做后台增量同步。
+启用的邮件列表订阅也会在 TUI 保持打开时按同一周期做后台增量同步，以持续拉取 Linux lore 和 QEMU GNU archive 上的新邮件。
 
 ## 回复邮件
 

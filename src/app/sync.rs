@@ -11,10 +11,11 @@ use std::thread;
 use std::time::Duration;
 
 use crate::app::patch as patch_worker;
+use crate::domain::subscriptions::uses_gnu_qemu_archive;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CourierError, ErrorCode, Result};
 use crate::infra::imap::{
-    FixtureImapClient, ImapClient, LoreImapClient, RemoteImapClient, RemoteMail,
+    FixtureImapClient, GnuArchiveClient, ImapClient, LoreImapClient, RemoteImapClient, RemoteMail,
 };
 use crate::infra::mail_parser::{self, ParsedMailHeaders};
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch};
@@ -65,6 +66,7 @@ enum SyncSource {
         uidvalidity_hint: u64,
     },
     Imap,
+    GnuArchive,
     Lore {
         base_url: String,
     },
@@ -75,6 +77,7 @@ impl SyncSource {
         match self {
             Self::Fixture { fixture_dir, .. } => fixture_dir.display().to_string(),
             Self::Imap => "imap".to_string(),
+            Self::GnuArchive => "https://lists.gnu.org/archive/mbox".to_string(),
             Self::Lore { base_url } => base_url.clone(),
         }
     }
@@ -139,6 +142,10 @@ fn resolve_sync_source(config: &RuntimeConfig, request: &SyncRequest) -> Result<
         ));
     }
 
+    if uses_gnu_qemu_archive(&request.mailbox) {
+        return Ok(SyncSource::GnuArchive);
+    }
+
     Ok(SyncSource::Lore {
         base_url: config.lore_base_url.clone(),
     })
@@ -165,6 +172,7 @@ fn run_once(config: &RuntimeConfig, mailbox: &str, source: &SyncSource) -> Resul
             *uidvalidity_hint,
         )),
         SyncSource::Imap => Box::new(RemoteImapClient::new(config.imap.clone())?),
+        SyncSource::GnuArchive => Box::new(GnuArchiveClient::new(None)?),
         SyncSource::Lore { base_url } => Box::new(LoreImapClient::new(Some(base_url))?),
     };
 
@@ -904,5 +912,47 @@ mod tests {
         .expect("resolve source");
 
         assert!(matches!(source, SyncSource::Lore { .. }));
+    }
+
+    #[test]
+    fn qemu_subscriptions_route_to_gnu_archive() {
+        let runtime = RuntimeConfig {
+            config_path: PathBuf::from("/tmp/courier-sync-route.toml"),
+            data_dir: PathBuf::from("/tmp/courier-sync-route-data"),
+            database_path: PathBuf::from("/tmp/courier-sync-route.db"),
+            raw_mail_dir: PathBuf::from("/tmp/courier-sync-route-raw"),
+            patch_dir: PathBuf::from("/tmp/courier-sync-route-patches"),
+            log_dir: PathBuf::from("/tmp/courier-sync-route-logs"),
+            b4_path: None,
+            log_filter: "info".to_string(),
+            source_mailbox: "qemu-rust".to_string(),
+            imap: crate::infra::config::ImapConfig {
+                email: Some("me@example.com".to_string()),
+                user: Some("imap-user".to_string()),
+                pass: Some("imap-pass".to_string()),
+                server: Some("imap.example.com".to_string()),
+                server_port: Some(993),
+                encryption: Some(crate::infra::config::ImapEncryption::Tls),
+                proxy: None,
+            },
+            lore_base_url: "https://lore.kernel.org".to_string(),
+            startup_sync: true,
+            inbox_auto_sync_interval_secs:
+                crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            kernel_trees: Vec::new(),
+        };
+
+        let source = resolve_sync_source(
+            &runtime,
+            &SyncRequest {
+                mailbox: "qemu-rust".to_string(),
+                fixture_dir: None,
+                uidvalidity: None,
+                reconnect_attempts: 1,
+            },
+        )
+        .expect("resolve source");
+
+        assert!(matches!(source, SyncSource::GnuArchive));
     }
 }

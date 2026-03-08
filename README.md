@@ -163,6 +163,7 @@ Inside the TUI:
 - `Tab` switches between the mail page and the code browser
 
 When IMAP is configured, `My Inbox` joins startup sync and continues periodic background sync while the TUI remains open.
+Enabled mailing-list subscriptions also keep doing periodic background sync while the TUI remains open so Linux lore and QEMU archive mailboxes keep pulling new mail.
 
 ## Documentation
 

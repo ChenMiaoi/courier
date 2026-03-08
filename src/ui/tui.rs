@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 
 use crate::app::patch as patch_worker;
 use crate::app::sync as sync_worker;
-use crate::domain::subscriptions::VGER_SUBSCRIPTIONS;
+use crate::domain::subscriptions::{
+    DEFAULT_SUBSCRIPTIONS, SubscriptionCategory, category_for_mailbox,
+};
 use crate::infra::bootstrap::BootstrapState;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CourierError, ErrorCode, Result};
@@ -308,7 +310,7 @@ type ReplyIdentityResolver = fn() -> std::result::Result<ReplyIdentity, String>;
 type SyncRequestExecutor =
     fn(&RuntimeConfig, sync_worker::SyncRequest) -> Result<sync_worker::SyncSummary>;
 type ReplySendExecutor = fn(&RuntimeConfig, &SendRequest) -> SendOutcome;
-type InboxAutoSyncSpawner = fn(RuntimeConfig, Vec<String>) -> Receiver<StartupSyncEvent>;
+type MailboxSyncSpawner = fn(RuntimeConfig, Vec<String>) -> Receiver<StartupSyncEvent>;
 
 #[derive(Debug, Clone)]
 enum StartupSyncEvent {
@@ -448,6 +450,47 @@ impl InboxAutoSyncState {
     }
 }
 
+#[derive(Debug)]
+struct SubscriptionAutoSyncState {
+    receiver: Option<Receiver<StartupSyncEvent>>,
+    next_due_at: Instant,
+    in_flight_mailboxes: HashSet<String>,
+}
+
+impl SubscriptionAutoSyncState {
+    fn new(next_due_at: Instant) -> Self {
+        Self {
+            receiver: None,
+            next_due_at,
+            in_flight_mailboxes: HashSet::new(),
+        }
+    }
+
+    fn in_flight(&self) -> bool {
+        self.receiver.is_some()
+    }
+
+    fn mailbox_in_flight(&self, mailbox: &str) -> bool {
+        self.in_flight_mailboxes
+            .iter()
+            .any(|in_flight| same_mailbox_name(in_flight, mailbox))
+    }
+
+    fn inflight_mailboxes_display(&self) -> String {
+        if self.in_flight_mailboxes.is_empty() {
+            "-".to_string()
+        } else {
+            let mut mailboxes: Vec<&str> = self
+                .in_flight_mailboxes
+                .iter()
+                .map(|mailbox| mailbox.as_str())
+                .collect();
+            mailboxes.sort_unstable();
+            mailboxes.join(",")
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct CommandPaletteState {
     open: bool,
@@ -503,12 +546,32 @@ struct SubscriptionItem {
     mailbox: String,
     label: String,
     enabled: bool,
+    category: Option<SubscriptionCategory>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubscriptionSection {
+    Enabled,
+    Disabled,
+}
+
+impl SubscriptionSection {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubscriptionRowKind {
     EnabledHeader,
     DisabledHeader,
+    CategoryHeader {
+        section: SubscriptionSection,
+        category: SubscriptionCategory,
+    },
     Item(usize),
 }
 
@@ -1004,6 +1067,10 @@ struct AppState {
     subscriptions: Vec<SubscriptionItem>,
     enabled_group_expanded: bool,
     disabled_group_expanded: bool,
+    enabled_linux_subsystem_expanded: bool,
+    enabled_qemu_subsystem_expanded: bool,
+    disabled_linux_subsystem_expanded: bool,
+    disabled_qemu_subsystem_expanded: bool,
     threads: Vec<ThreadRow>,
     series_summaries: HashMap<i64, patch_worker::SeriesSummary>,
     filtered_thread_indices: Vec<usize>,
@@ -1034,10 +1101,11 @@ struct AppState {
     reply_identity_resolver: ReplyIdentityResolver,
     sync_request_executor: SyncRequestExecutor,
     reply_send_executor: ReplySendExecutor,
-    inbox_auto_sync_spawner: InboxAutoSyncSpawner,
+    mailbox_sync_spawner: MailboxSyncSpawner,
     needs_terminal_refresh: bool,
     startup_sync: Option<StartupSyncState>,
     inbox_auto_sync: Option<InboxAutoSyncState>,
+    subscription_auto_sync: Option<SubscriptionAutoSyncState>,
 }
 
 impl AppState {
@@ -1067,11 +1135,17 @@ impl AppState {
             .filter(|mailbox| !mailbox.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| runtime.default_active_mailbox().to_string());
+        let my_inbox_default = if runtime.imap.is_complete() && !persisted_imap_defaults_initialized
+        {
+            MyInboxDefault::EnableOnFirstOpen
+        } else {
+            MyInboxDefault::PreservePersistedChoice
+        };
         let subscriptions = default_subscriptions(
             &runtime,
             &enabled_mailboxes,
             Some(active_thread_mailbox.as_str()),
-            runtime.imap.is_complete() && !persisted_imap_defaults_initialized,
+            my_inbox_default,
         );
         let kernel_tree_expanded_paths = default_kernel_tree_expanded_paths(&runtime.kernel_trees);
         let kernel_tree_rows =
@@ -1092,6 +1166,22 @@ impl AppState {
             disabled_group_expanded: persisted
                 .as_ref()
                 .map(|state| state.disabled_group_expanded)
+                .unwrap_or(true),
+            enabled_linux_subsystem_expanded: persisted
+                .as_ref()
+                .map(|state| state.enabled_linux_subsystem_expanded)
+                .unwrap_or(true),
+            enabled_qemu_subsystem_expanded: persisted
+                .as_ref()
+                .map(|state| state.enabled_qemu_subsystem_expanded)
+                .unwrap_or(true),
+            disabled_linux_subsystem_expanded: persisted
+                .as_ref()
+                .map(|state| state.disabled_linux_subsystem_expanded)
+                .unwrap_or(true),
+            disabled_qemu_subsystem_expanded: persisted
+                .as_ref()
+                .map(|state| state.disabled_qemu_subsystem_expanded)
                 .unwrap_or(true),
             threads,
             series_summaries: HashMap::new(),
@@ -1123,10 +1213,11 @@ impl AppState {
             reply_identity_resolver: resolve_git_reply_identity,
             sync_request_executor: run_sync_request_guarded,
             reply_send_executor: send_reply_message,
-            inbox_auto_sync_spawner: spawn_startup_sync_worker,
+            mailbox_sync_spawner: spawn_startup_sync_worker,
             needs_terminal_refresh: false,
             startup_sync: None,
             inbox_auto_sync: None,
+            subscription_auto_sync: None,
         };
         if state.runtime.imap.is_complete() {
             state.imap_defaults_initialized = true;
@@ -1134,7 +1225,7 @@ impl AppState {
         if let Some(index) = state
             .subscriptions
             .iter()
-            .position(|item| item.mailbox == state.active_thread_mailbox)
+            .position(|item| same_mailbox_name(&item.mailbox, &state.active_thread_mailbox))
         {
             state.subscription_index = index;
         }
@@ -1142,6 +1233,7 @@ impl AppState {
         state.apply_thread_filter();
         state.sync_subscription_row_to_selected_item();
         state.reconcile_inbox_auto_sync();
+        state.reconcile_subscription_auto_sync();
         state
     }
 
@@ -1232,7 +1324,7 @@ impl AppState {
         if let Some(index) = self
             .subscriptions
             .iter()
-            .position(|item| item.mailbox == mailbox)
+            .position(|item| same_mailbox_name(&item.mailbox, mailbox))
         {
             self.subscription_index = index;
             self.sync_subscription_row_to_selected_item();
@@ -1253,14 +1345,23 @@ impl AppState {
         let mut candidates = self.enabled_mailboxes();
         if !candidates
             .iter()
-            .any(|mailbox| mailbox == &self.runtime.source_mailbox)
+            .any(|mailbox| same_mailbox_name(mailbox, &self.runtime.source_mailbox))
         {
             candidates.push(self.runtime.source_mailbox.clone());
         }
-        candidates.retain(|mailbox| mailbox != &current_mailbox);
-        candidates.dedup();
-
+        let mut unique_candidates: Vec<String> = Vec::new();
         for mailbox in candidates {
+            if same_mailbox_name(&mailbox, &current_mailbox)
+                || unique_candidates
+                    .iter()
+                    .any(|candidate| same_mailbox_name(candidate, &mailbox))
+            {
+                continue;
+            }
+            unique_candidates.push(mailbox);
+        }
+
+        for mailbox in unique_candidates {
             match mail_store::load_thread_rows_by_mailbox(
                 &self.runtime.database_path,
                 &mailbox,
@@ -1290,9 +1391,13 @@ impl AppState {
     }
 
     fn startup_sync_mailbox_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
-        self.startup_sync
-            .as_ref()
-            .and_then(|state| state.mailboxes.get(mailbox).copied())
+        self.startup_sync.as_ref().and_then(|state| {
+            state
+                .mailboxes
+                .iter()
+                .find(|(name, _)| same_mailbox_name(name, mailbox))
+                .map(|(_, status)| *status)
+        })
     }
 
     fn inbox_auto_sync_mailbox_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
@@ -1307,9 +1412,20 @@ impl AppState {
             .flatten()
     }
 
+    fn subscription_auto_sync_mailbox_status(
+        &self,
+        mailbox: &str,
+    ) -> Option<StartupSyncMailboxStatus> {
+        self.subscription_auto_sync
+            .as_ref()
+            .filter(|state| state.mailbox_in_flight(mailbox))
+            .map(|_| StartupSyncMailboxStatus::InFlight)
+    }
+
     fn mailbox_sync_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
         self.startup_sync_mailbox_status(mailbox)
             .or_else(|| self.inbox_auto_sync_mailbox_status(mailbox))
+            .or_else(|| self.subscription_auto_sync_mailbox_status(mailbox))
     }
 
     fn startup_sync_mailbox_pending(&self, mailbox: &str) -> bool {
@@ -1325,6 +1441,10 @@ impl AppState {
                 self.inbox_auto_sync_mailbox_status(mailbox),
                 Some(StartupSyncMailboxStatus::InFlight)
             )
+            || matches!(
+                self.subscription_auto_sync_mailbox_status(mailbox),
+                Some(StartupSyncMailboxStatus::InFlight)
+            )
     }
 
     fn startup_sync_progress_text(&self) -> Option<String> {
@@ -1336,6 +1456,17 @@ impl AppState {
                     .as_ref()
                     .filter(|state| state.in_flight())
                     .map(|_| "sync: inbox auto-sync running=INBOX".to_string())
+            })
+            .or_else(|| {
+                self.subscription_auto_sync
+                    .as_ref()
+                    .filter(|state| state.in_flight())
+                    .map(|state| {
+                        format!(
+                            "sync: subscription auto-sync running={}",
+                            state.inflight_mailboxes_display()
+                        )
+                    })
             })
     }
 
@@ -1363,12 +1494,24 @@ impl AppState {
             .collect()
     }
 
+    fn enabled_background_sync_mailboxes(&self) -> Vec<String> {
+        self.subscriptions
+            .iter()
+            .filter(|item| item.enabled && !item.mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+            .map(|item| item.mailbox.clone())
+            .collect()
+    }
+
     fn my_inbox_auto_sync_enabled(&self) -> bool {
         self.runtime.imap.is_complete()
             && self
                 .subscriptions
                 .iter()
                 .any(|item| item.enabled && item.mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+    }
+
+    fn subscription_auto_sync_enabled(&self) -> bool {
+        !self.enabled_background_sync_mailboxes().is_empty()
     }
 
     fn reconcile_inbox_auto_sync(&mut self) {
@@ -1381,6 +1524,26 @@ impl AppState {
         }
     }
 
+    fn reconcile_subscription_auto_sync(&mut self) {
+        let enabled_mailboxes = self.enabled_background_sync_mailboxes();
+        if self.subscription_auto_sync_enabled() {
+            // Reuse the existing background sync cadence so enabled mailing-list
+            // subscriptions keep refreshing without adding a second timer knob.
+            let state = self.subscription_auto_sync.get_or_insert_with(|| {
+                SubscriptionAutoSyncState::new(
+                    Instant::now() + self.runtime.inbox_auto_sync_interval(),
+                )
+            });
+            state.in_flight_mailboxes.retain(|mailbox| {
+                enabled_mailboxes
+                    .iter()
+                    .any(|enabled| same_mailbox_name(enabled, mailbox))
+            });
+        } else {
+            self.subscription_auto_sync = None;
+        }
+    }
+
     fn defer_inbox_auto_sync(&mut self) {
         if let Some(state) = self.inbox_auto_sync.as_mut() {
             state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
@@ -1390,6 +1553,18 @@ impl AppState {
     fn defer_inbox_auto_sync_for_mailbox(&mut self, mailbox: &str) {
         if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
             self.defer_inbox_auto_sync();
+        }
+    }
+
+    fn defer_subscription_auto_sync(&mut self) {
+        if let Some(state) = self.subscription_auto_sync.as_mut() {
+            state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
+        }
+    }
+
+    fn defer_subscription_auto_sync_for_mailbox(&mut self, mailbox: &str) {
+        if !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+            self.defer_subscription_auto_sync();
         }
     }
 
@@ -1416,10 +1591,33 @@ impl AppState {
             status = "started",
             mailbox = IMAP_INBOX_MAILBOX
         );
-        state.receiver = Some((self.inbox_auto_sync_spawner)(
+        state.receiver = Some((self.mailbox_sync_spawner)(
             self.runtime.clone(),
             vec![IMAP_INBOX_MAILBOX.to_string()],
         ));
+    }
+
+    fn maybe_start_subscription_auto_sync(&mut self) {
+        self.reconcile_subscription_auto_sync();
+        let mailboxes = self.enabled_background_sync_mailboxes();
+        let startup_pending = mailboxes
+            .iter()
+            .any(|mailbox| self.startup_sync_mailbox_pending(mailbox));
+        let now = Instant::now();
+        let Some(state) = self.subscription_auto_sync.as_mut() else {
+            return;
+        };
+        if mailboxes.is_empty() || state.in_flight() || startup_pending || now < state.next_due_at {
+            return;
+        }
+
+        tracing::info!(
+            op = "subscription_auto_sync",
+            status = "started",
+            mailboxes = %mailboxes.join(",")
+        );
+        state.in_flight_mailboxes.clear();
+        state.receiver = Some((self.mailbox_sync_spawner)(self.runtime.clone(), mailboxes));
     }
 
     fn pump_inbox_auto_sync_events(&mut self) {
@@ -1459,6 +1657,45 @@ impl AppState {
         }
     }
 
+    fn pump_subscription_auto_sync_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        {
+            let Some(sync_state) = self.subscription_auto_sync.as_ref() else {
+                return;
+            };
+            let Some(receiver) = sync_state.receiver.as_ref() else {
+                return;
+            };
+            loop {
+                match receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut worker_completed = false;
+        for event in events {
+            if matches!(event, StartupSyncEvent::WorkerCompleted) {
+                worker_completed = true;
+            }
+            self.apply_subscription_auto_sync_event(event);
+        }
+
+        if (disconnected || worker_completed)
+            && let Some(state) = self.subscription_auto_sync.as_mut()
+        {
+            state.receiver = None;
+            state.in_flight_mailboxes.clear();
+            state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
+        }
+    }
+
     fn apply_inbox_auto_sync_event(&mut self, event: StartupSyncEvent) {
         match event {
             StartupSyncEvent::MailboxStarted { mailbox, .. } => {
@@ -1478,7 +1715,7 @@ impl AppState {
                 if let Some(state) = self.inbox_auto_sync.as_mut() {
                     state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
                 }
-                if mailbox == self.active_thread_mailbox {
+                if same_mailbox_name(&mailbox, &self.active_thread_mailbox) {
                     self.reload_mailbox_threads_preserving_selection(&mailbox);
                 }
                 if inserted > 0 || updated > 0 {
@@ -1503,6 +1740,66 @@ impl AppState {
                 self.status = format!("My Inbox auto-sync failed: {error}");
                 tracing::error!(
                     op = "inbox_auto_sync",
+                    status = "failed",
+                    mailbox = %mailbox,
+                    error = %error
+                );
+            }
+            StartupSyncEvent::WorkerCompleted => {}
+        }
+    }
+
+    fn apply_subscription_auto_sync_event(&mut self, event: StartupSyncEvent) {
+        match event {
+            StartupSyncEvent::MailboxStarted { mailbox, .. } => {
+                if let Some(state) = self.subscription_auto_sync.as_mut() {
+                    state.in_flight_mailboxes.insert(mailbox.clone());
+                }
+                tracing::info!(
+                    op = "subscription_auto_sync",
+                    status = "progress",
+                    phase = "started",
+                    mailbox = %mailbox
+                );
+            }
+            StartupSyncEvent::MailboxFinished {
+                mailbox,
+                fetched,
+                inserted,
+                updated,
+            } => {
+                if let Some(state) = self.subscription_auto_sync.as_mut() {
+                    state
+                        .in_flight_mailboxes
+                        .retain(|in_flight| !same_mailbox_name(in_flight, &mailbox));
+                }
+                if same_mailbox_name(&mailbox, &self.active_thread_mailbox) {
+                    self.reload_mailbox_threads_preserving_selection(&mailbox);
+                }
+                if inserted > 0 || updated > 0 {
+                    self.status = format!(
+                        "Subscription auto-sync {mailbox}: fetched={} inserted={} updated={}",
+                        fetched, inserted, updated
+                    );
+                }
+                tracing::info!(
+                    op = "subscription_auto_sync",
+                    status = "succeeded",
+                    mailbox = %mailbox,
+                    fetched,
+                    inserted,
+                    updated
+                );
+            }
+            StartupSyncEvent::MailboxFailed { mailbox, error } => {
+                if let Some(state) = self.subscription_auto_sync.as_mut() {
+                    state
+                        .in_flight_mailboxes
+                        .retain(|in_flight| !same_mailbox_name(in_flight, &mailbox));
+                }
+                self.status = format!("subscription auto-sync failed for {mailbox}: {error}");
+                tracing::error!(
+                    op = "subscription_auto_sync",
                     status = "failed",
                     mailbox = %mailbox,
                     error = %error
@@ -1651,6 +1948,9 @@ impl AppState {
                 if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
                     self.defer_inbox_auto_sync();
                 }
+                if !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                    self.defer_subscription_auto_sync();
+                }
                 if let Some(sync_state) = self.startup_sync.as_mut() {
                     sync_state
                         .mailboxes
@@ -1659,7 +1959,7 @@ impl AppState {
                     sync_state.succeeded += 1;
                 }
 
-                if mailbox == self.active_thread_mailbox {
+                if same_mailbox_name(&mailbox, &self.active_thread_mailbox) {
                     self.reload_active_mailbox_threads_after_sync();
                 }
                 if self.threads.is_empty()
@@ -1693,6 +1993,9 @@ impl AppState {
                 if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
                     self.defer_inbox_auto_sync();
                 }
+                if !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                    self.defer_subscription_auto_sync();
+                }
                 if let Some(sync_state) = self.startup_sync.as_mut() {
                     sync_state
                         .mailboxes
@@ -1701,7 +2004,9 @@ impl AppState {
                     sync_state.failed += 1;
                 }
                 self.status = format!("startup sync failed for {mailbox}: {error}");
-                if mailbox == self.active_thread_mailbox && self.threads.is_empty() {
+                if same_mailbox_name(&mailbox, &self.active_thread_mailbox)
+                    && self.threads.is_empty()
+                {
                     let _ = self.recover_from_empty_active_mailbox(&format!(
                         "startup sync failed for {mailbox}: {error}"
                     ));
@@ -1779,13 +2084,13 @@ impl AppState {
     fn reload_mailbox_threads_preserving_selection(&mut self, mailbox: &str) {
         match mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, mailbox, 500) {
             Ok(rows) => {
-                if mailbox == self.active_thread_mailbox {
+                if same_mailbox_name(mailbox, &self.active_thread_mailbox) {
                     self.replace_threads_preserving_selection(rows);
                 }
             }
             Err(error) => {
                 tracing::error!(
-                    op = "inbox_auto_sync",
+                    op = "background_auto_sync",
                     status = "failed",
                     mailbox = %mailbox,
                     error = %error
@@ -1803,6 +2108,10 @@ impl AppState {
             enabled_mailboxes: self.enabled_mailboxes(),
             enabled_group_expanded: self.enabled_group_expanded,
             disabled_group_expanded: self.disabled_group_expanded,
+            enabled_linux_subsystem_expanded: self.enabled_linux_subsystem_expanded,
+            enabled_qemu_subsystem_expanded: self.enabled_qemu_subsystem_expanded,
+            disabled_linux_subsystem_expanded: self.disabled_linux_subsystem_expanded,
+            disabled_qemu_subsystem_expanded: self.disabled_qemu_subsystem_expanded,
             imap_defaults_initialized: self.imap_defaults_initialized,
             active_mailbox: Some(self.active_thread_mailbox.clone()),
         }
@@ -1815,6 +2124,111 @@ impl AppState {
                 error = %error,
                 "failed to persist ui state"
             );
+        }
+    }
+
+    fn subscription_category_expanded(
+        &self,
+        section: SubscriptionSection,
+        category: SubscriptionCategory,
+    ) -> bool {
+        // Keep expansion state scoped to the enabled/disabled section so
+        // collapsing one bucket does not unexpectedly hide the other one.
+        match (section, category) {
+            (SubscriptionSection::Enabled, SubscriptionCategory::LinuxSubsystem) => {
+                self.enabled_linux_subsystem_expanded
+            }
+            (SubscriptionSection::Enabled, SubscriptionCategory::QemuSubsystem) => {
+                self.enabled_qemu_subsystem_expanded
+            }
+            (SubscriptionSection::Disabled, SubscriptionCategory::LinuxSubsystem) => {
+                self.disabled_linux_subsystem_expanded
+            }
+            (SubscriptionSection::Disabled, SubscriptionCategory::QemuSubsystem) => {
+                self.disabled_qemu_subsystem_expanded
+            }
+        }
+    }
+
+    fn toggle_subscription_category_group(
+        &mut self,
+        section: SubscriptionSection,
+        category: SubscriptionCategory,
+    ) {
+        let expanded = match (section, category) {
+            (SubscriptionSection::Enabled, SubscriptionCategory::LinuxSubsystem) => {
+                self.enabled_linux_subsystem_expanded = !self.enabled_linux_subsystem_expanded;
+                self.enabled_linux_subsystem_expanded
+            }
+            (SubscriptionSection::Enabled, SubscriptionCategory::QemuSubsystem) => {
+                self.enabled_qemu_subsystem_expanded = !self.enabled_qemu_subsystem_expanded;
+                self.enabled_qemu_subsystem_expanded
+            }
+            (SubscriptionSection::Disabled, SubscriptionCategory::LinuxSubsystem) => {
+                self.disabled_linux_subsystem_expanded = !self.disabled_linux_subsystem_expanded;
+                self.disabled_linux_subsystem_expanded
+            }
+            (SubscriptionSection::Disabled, SubscriptionCategory::QemuSubsystem) => {
+                self.disabled_qemu_subsystem_expanded = !self.disabled_qemu_subsystem_expanded;
+                self.disabled_qemu_subsystem_expanded
+            }
+        };
+        let state = if expanded { "expanded" } else { "collapsed" };
+        self.status = format!("{} {} group {}", section.label(), category.label(), state);
+        self.clamp_subscription_row_selection();
+        self.persist_ui_state();
+    }
+
+    fn push_subscription_group_rows(
+        &self,
+        rows: &mut Vec<SubscriptionRow>,
+        section: SubscriptionSection,
+        items: Vec<(usize, &SubscriptionItem)>,
+    ) {
+        // Leave uncategorized entries visible above subsystem buckets so
+        // `My Inbox` and user-added mailboxes stay easy to discover.
+        for (index, item) in items
+            .iter()
+            .copied()
+            .filter(|(_, item)| item.category.is_none())
+        {
+            rows.push(SubscriptionRow {
+                kind: SubscriptionRowKind::Item(index),
+                text: format!(
+                    "  {}",
+                    subscription_line(item, self.mailbox_sync_status(&item.mailbox))
+                ),
+            });
+        }
+
+        for category in SubscriptionCategory::ALL {
+            let category_items: Vec<(usize, &SubscriptionItem)> = items
+                .iter()
+                .copied()
+                .filter(|(_, item)| item.category == Some(category))
+                .collect();
+            if category_items.is_empty() {
+                continue;
+            }
+
+            let expanded = self.subscription_category_expanded(section, category);
+            let marker = if expanded { "▼" } else { "▶" };
+            rows.push(SubscriptionRow {
+                kind: SubscriptionRowKind::CategoryHeader { section, category },
+                text: format!("  {marker} {} ({})", category.label(), category_items.len()),
+            });
+
+            if expanded {
+                for (index, item) in category_items {
+                    rows.push(SubscriptionRow {
+                        kind: SubscriptionRowKind::Item(index),
+                        text: format!(
+                            "    {}",
+                            subscription_line(item, self.mailbox_sync_status(&item.mailbox))
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -1838,20 +2252,13 @@ impl AppState {
         });
 
         if self.enabled_group_expanded {
-            for (index, item) in self
+            let items: Vec<(usize, &SubscriptionItem)> = self
                 .subscriptions
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| item.enabled)
-            {
-                rows.push(SubscriptionRow {
-                    kind: SubscriptionRowKind::Item(index),
-                    text: format!(
-                        "  {}",
-                        subscription_line(item, self.mailbox_sync_status(&item.mailbox))
-                    ),
-                });
-            }
+                .collect();
+            self.push_subscription_group_rows(&mut rows, SubscriptionSection::Enabled, items);
         }
 
         let disabled_marker = if self.disabled_group_expanded {
@@ -1865,20 +2272,13 @@ impl AppState {
         });
 
         if self.disabled_group_expanded {
-            for (index, item) in self
+            let items: Vec<(usize, &SubscriptionItem)> = self
                 .subscriptions
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| !item.enabled)
-            {
-                rows.push(SubscriptionRow {
-                    kind: SubscriptionRowKind::Item(index),
-                    text: format!(
-                        "  {}",
-                        subscription_line(item, self.mailbox_sync_status(&item.mailbox))
-                    ),
-                });
-            }
+                .collect();
+            self.push_subscription_group_rows(&mut rows, SubscriptionSection::Disabled, items);
         }
 
         rows
@@ -1952,22 +2352,17 @@ impl AppState {
         let marker = if enabled { "enabled" } else { "disabled" };
         self.status = format!("{marker} subscription {label}");
         self.reconcile_inbox_auto_sync();
+        self.reconcile_subscription_auto_sync();
         self.persist_ui_state();
     }
 
     fn sort_subscriptions_keep_selected(&mut self, selected_mailbox: &str) {
-        self.subscriptions.sort_by(|left, right| {
-            right
-                .enabled
-                .cmp(&left.enabled)
-                .then_with(|| left.label.cmp(&right.label))
-                .then_with(|| left.mailbox.cmp(&right.mailbox))
-        });
+        self.subscriptions.sort_by(compare_subscription_items);
 
         self.subscription_index = self
             .subscriptions
             .iter()
-            .position(|item| item.mailbox == selected_mailbox)
+            .position(|item| same_mailbox_name(&item.mailbox, selected_mailbox))
             .unwrap_or(0);
         self.sync_subscription_row_to_selected_item();
     }
@@ -1996,6 +2391,9 @@ impl AppState {
                 self.clamp_subscription_row_selection();
                 self.persist_ui_state();
             }
+            Some(SubscriptionRowKind::CategoryHeader { section, category }) => {
+                self.toggle_subscription_category_group(section, category);
+            }
             _ => {}
         }
     }
@@ -2003,7 +2401,8 @@ impl AppState {
     fn handle_subscription_enter(&mut self) {
         match self.selected_subscription_row_kind() {
             Some(SubscriptionRowKind::EnabledHeader)
-            | Some(SubscriptionRowKind::DisabledHeader) => {
+            | Some(SubscriptionRowKind::DisabledHeader)
+            | Some(SubscriptionRowKind::CategoryHeader { .. }) => {
                 self.toggle_selected_subscription_group()
             }
             Some(SubscriptionRowKind::Item(_)) => self.open_threads_for_selected_subscription(),
@@ -2062,6 +2461,7 @@ impl AppState {
 
                 let sync_result = self.run_sync_request(request);
                 self.defer_inbox_auto_sync_for_mailbox(&mailbox);
+                self.defer_subscription_auto_sync_for_mailbox(&mailbox);
 
                 match sync_result {
                     Ok(summary) => match mail_store::load_thread_rows_by_mailbox(
@@ -3685,7 +4085,9 @@ fn tui_loop(
         // background sync state and can request a full refresh when needed.
         state.pump_startup_sync_events();
         state.pump_inbox_auto_sync_events();
+        state.pump_subscription_auto_sync_events();
         state.maybe_start_inbox_auto_sync();
+        state.maybe_start_subscription_auto_sync();
 
         if state.take_terminal_refresh_needed() {
             terminal.clear().map_err(|error| {
@@ -3902,36 +4304,35 @@ fn default_subscriptions(
     runtime: &RuntimeConfig,
     enabled_mailboxes: &HashSet<String>,
     active_mailbox: Option<&str>,
-    allow_default_my_inbox: bool,
+    my_inbox_default: MyInboxDefault,
 ) -> Vec<SubscriptionItem> {
-    let mut items: Vec<SubscriptionItem> = VGER_SUBSCRIPTIONS
+    let mut items: Vec<SubscriptionItem> = DEFAULT_SUBSCRIPTIONS
         .iter()
         .map(|entry| SubscriptionItem {
             mailbox: entry.mailbox.to_string(),
             label: entry.mailbox.to_string(),
-            enabled: enabled_mailboxes.contains(entry.mailbox),
+            enabled: mailbox_set_contains(enabled_mailboxes, entry.mailbox),
+            category: Some(entry.category),
         })
         .collect();
 
     if runtime.imap.is_complete() {
         // `My Inbox` is special: expose it only when the account is usable, but
         // default it on so IMAP users do not have to discover it manually.
-        let enable_my_inbox = enabled_mailboxes.contains(IMAP_INBOX_MAILBOX)
-            || (allow_default_my_inbox && !enabled_mailboxes.contains(IMAP_INBOX_MAILBOX));
+        let enable_my_inbox = mailbox_set_contains(enabled_mailboxes, IMAP_INBOX_MAILBOX)
+            || my_inbox_default.should_enable_when_missing();
         items.insert(
             0,
             SubscriptionItem {
                 mailbox: IMAP_INBOX_MAILBOX.to_string(),
                 label: MY_INBOX_LABEL.to_string(),
                 enabled: enable_my_inbox,
+                category: None,
             },
         );
     }
 
-    if items
-        .iter()
-        .all(|item| item.mailbox != runtime.source_mailbox)
-    {
+    if !subscription_items_contain_mailbox(&items, &runtime.source_mailbox) {
         // Always keep the configured source mailbox visible even if the static
         // catalog changes, because it is the user's declared sync target.
         items.insert(
@@ -3939,13 +4340,14 @@ fn default_subscriptions(
             SubscriptionItem {
                 mailbox: runtime.source_mailbox.clone(),
                 label: runtime.source_mailbox.clone(),
-                enabled: enabled_mailboxes.contains(runtime.source_mailbox.as_str()),
+                enabled: mailbox_set_contains(enabled_mailboxes, runtime.source_mailbox.as_str()),
+                category: category_for_mailbox(&runtime.source_mailbox),
             },
         );
     }
 
     for mailbox in enabled_mailboxes {
-        if items.iter().any(|item| item.mailbox == *mailbox) {
+        if subscription_items_contain_mailbox(&items, mailbox) {
             continue;
         }
         items.push(SubscriptionItem {
@@ -3956,12 +4358,13 @@ fn default_subscriptions(
                 mailbox.clone()
             },
             enabled: true,
+            category: category_for_mailbox(mailbox),
         });
     }
 
     if let Some(mailbox) = active_mailbox
         && !mailbox.is_empty()
-        && items.iter().all(|item| item.mailbox != mailbox)
+        && !subscription_items_contain_mailbox(&items, mailbox)
     {
         // Preserve access to the last active mailbox even if it no longer
         // appears in defaults, otherwise persisted UI state could point at an
@@ -3973,19 +4376,61 @@ fn default_subscriptions(
             } else {
                 mailbox.to_string()
             },
-            enabled: enabled_mailboxes.contains(mailbox),
+            enabled: mailbox_set_contains(enabled_mailboxes, mailbox),
+            category: category_for_mailbox(mailbox),
         });
     }
 
-    items.sort_by(|left, right| {
-        right
-            .enabled
-            .cmp(&left.enabled)
-            .then_with(|| left.label.cmp(&right.label))
-            .then_with(|| left.mailbox.cmp(&right.mailbox))
-    });
+    items.sort_by(compare_subscription_items);
 
     items
+}
+
+fn subscription_category_rank(category: Option<SubscriptionCategory>) -> u8 {
+    category.map_or(0, SubscriptionCategory::sort_rank)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MyInboxDefault {
+    EnableOnFirstOpen,
+    PreservePersistedChoice,
+}
+
+impl MyInboxDefault {
+    fn should_enable_when_missing(self) -> bool {
+        matches!(self, Self::EnableOnFirstOpen)
+    }
+}
+
+fn same_mailbox_name(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn mailbox_set_contains(mailboxes: &HashSet<String>, candidate: &str) -> bool {
+    mailboxes
+        .iter()
+        .any(|mailbox| same_mailbox_name(mailbox, candidate))
+}
+
+fn subscription_items_contain_mailbox(items: &[SubscriptionItem], candidate: &str) -> bool {
+    items
+        .iter()
+        .any(|item| same_mailbox_name(&item.mailbox, candidate))
+}
+
+fn compare_subscription_items(
+    left: &SubscriptionItem,
+    right: &SubscriptionItem,
+) -> std::cmp::Ordering {
+    right
+        .enabled
+        .cmp(&left.enabled)
+        .then_with(|| {
+            subscription_category_rank(left.category)
+                .cmp(&subscription_category_rank(right.category))
+        })
+        .then_with(|| left.label.cmp(&right.label))
+        .then_with(|| left.mailbox.cmp(&right.mailbox))
 }
 
 fn char_to_byte_index(value: &str, char_index: usize) -> usize {

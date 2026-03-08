@@ -20,6 +20,14 @@ pub struct UiState {
     pub enabled_group_expanded: bool,
     #[serde(default = "default_true")]
     pub disabled_group_expanded: bool,
+    #[serde(default = "default_true")]
+    pub enabled_linux_subsystem_expanded: bool,
+    #[serde(default = "default_true")]
+    pub enabled_qemu_subsystem_expanded: bool,
+    #[serde(default = "default_true")]
+    pub disabled_linux_subsystem_expanded: bool,
+    #[serde(default = "default_true")]
+    pub disabled_qemu_subsystem_expanded: bool,
     #[serde(default)]
     pub imap_defaults_initialized: bool,
     #[serde(default)]
@@ -36,6 +44,10 @@ impl Default for UiState {
             enabled_mailboxes: Vec::new(),
             enabled_group_expanded: true,
             disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: true,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: false,
             active_mailbox: None,
         }
@@ -146,6 +158,10 @@ mod tests {
             enabled_mailboxes: vec!["bpf".to_string(), "linux-mm".to_string(), "bpf".to_string()],
             enabled_group_expanded: false,
             disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: false,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: false,
             imap_defaults_initialized: true,
             active_mailbox: Some("bpf".to_string()),
         };
@@ -159,6 +175,10 @@ mod tests {
         );
         assert!(!loaded.enabled_group_expanded);
         assert!(loaded.disabled_group_expanded);
+        assert!(!loaded.enabled_linux_subsystem_expanded);
+        assert!(loaded.enabled_qemu_subsystem_expanded);
+        assert!(loaded.disabled_linux_subsystem_expanded);
+        assert!(!loaded.disabled_qemu_subsystem_expanded);
         assert!(loaded.imap_defaults_initialized);
         assert_eq!(loaded.active_mailbox.as_deref(), Some("bpf"));
 
@@ -179,6 +199,10 @@ mod tests {
         let loaded = load(&path).expect("load state").expect("state exists");
 
         assert!(!loaded.imap_defaults_initialized);
+        assert!(loaded.enabled_linux_subsystem_expanded);
+        assert!(loaded.enabled_qemu_subsystem_expanded);
+        assert!(loaded.disabled_linux_subsystem_expanded);
+        assert!(loaded.disabled_qemu_subsystem_expanded);
 
         let _ = fs::remove_dir_all(root);
     }

@@ -14,6 +14,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 
+use crate::domain::subscriptions::SubscriptionCategory;
 use crate::infra::bootstrap::BootstrapState;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::db;
@@ -117,6 +118,18 @@ fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
         inbox_auto_sync_interval_secs: crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
         kernel_trees: Vec::new(),
     }
+}
+
+fn subscription_category_rank(category: Option<SubscriptionCategory>) -> u8 {
+    category.map_or(0, SubscriptionCategory::sort_rank)
+}
+
+fn subscription_sort_key(item: &SubscriptionItem) -> (u8, &str, &str) {
+    (
+        subscription_category_rank(item.category),
+        item.label.as_str(),
+        item.mailbox.as_str(),
+    )
 }
 
 fn test_runtime() -> RuntimeConfig {
@@ -250,7 +263,7 @@ fn startup_sync_progress_summary_renders_counts_and_running_mailbox() {
 #[test]
 fn inbox_auto_sync_starts_when_due_for_enabled_my_inbox() {
     let mut state = AppState::new(vec![], test_runtime_with_imap());
-    state.inbox_auto_sync_spawner = inbox_auto_sync_spawner_stub;
+    state.mailbox_sync_spawner = mailbox_sync_spawner_stub;
     state
         .inbox_auto_sync
         .as_mut()
@@ -271,7 +284,7 @@ fn inbox_auto_sync_starts_when_due_for_enabled_my_inbox() {
 #[test]
 fn inbox_auto_sync_waits_for_startup_sync_to_finish() {
     let mut state = AppState::new(vec![], test_runtime_with_imap());
-    state.inbox_auto_sync_spawner = inbox_auto_sync_spawner_stub;
+    state.mailbox_sync_spawner = mailbox_sync_spawner_stub;
     state.startup_sync = Some(startup_sync_state(&[(
         IMAP_INBOX_MAILBOX,
         StartupSyncMailboxStatus::InFlight,
@@ -287,6 +300,66 @@ fn inbox_auto_sync_waits_for_startup_sync_to_finish() {
     assert!(
         state
             .inbox_auto_sync
+            .as_ref()
+            .and_then(|sync| sync.receiver.as_ref())
+            .is_none()
+    );
+}
+
+#[test]
+fn subscription_auto_sync_starts_when_due_for_enabled_linux_subscription() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.mailbox_sync_spawner = mailbox_sync_spawner_stub;
+    let io_uring_index = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "io-uring")
+        .expect("io-uring subscription exists");
+    state.subscriptions[io_uring_index].enabled = true;
+    state.reconcile_subscription_auto_sync();
+    state
+        .subscription_auto_sync
+        .as_mut()
+        .expect("subscription auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    state.maybe_start_subscription_auto_sync();
+
+    assert!(
+        state
+            .subscription_auto_sync
+            .as_ref()
+            .and_then(|sync| sync.receiver.as_ref())
+            .is_some()
+    );
+}
+
+#[test]
+fn subscription_auto_sync_waits_for_startup_sync_to_finish() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.mailbox_sync_spawner = mailbox_sync_spawner_stub;
+    let qemu_devel_index = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "qemu-devel")
+        .expect("qemu-devel subscription exists");
+    state.subscriptions[qemu_devel_index].enabled = true;
+    state.reconcile_subscription_auto_sync();
+    state.startup_sync = Some(startup_sync_state(&[(
+        "qemu-devel",
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+    state
+        .subscription_auto_sync
+        .as_mut()
+        .expect("subscription auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    state.maybe_start_subscription_auto_sync();
+
+    assert!(
+        state
+            .subscription_auto_sync
             .as_ref()
             .and_then(|sync| sync.receiver.as_ref())
             .is_none()
@@ -372,7 +445,7 @@ fn sync_request_mock_success(
     })
 }
 
-fn inbox_auto_sync_spawner_stub(
+fn mailbox_sync_spawner_stub(
     _runtime: RuntimeConfig,
     _mailboxes: Vec<String>,
 ) -> mpsc::Receiver<StartupSyncEvent> {
@@ -508,11 +581,13 @@ fn subscription_line_shows_marker_and_mailbox_name_only() {
         mailbox: "io-uring".to_string(),
         label: "io-uring".to_string(),
         enabled: true,
+        category: Some(SubscriptionCategory::LinuxSubsystem),
     };
     let disabled = SubscriptionItem {
         mailbox: "linux-mm".to_string(),
         label: "linux-mm".to_string(),
         enabled: false,
+        category: Some(SubscriptionCategory::LinuxSubsystem),
     };
 
     assert_eq!(subscription_line(&enabled, None), "[y] io-uring");
@@ -525,6 +600,7 @@ fn subscription_line_shows_sync_suffix_when_progress_is_active() {
         mailbox: "INBOX".to_string(),
         label: "My Inbox".to_string(),
         enabled: true,
+        category: None,
     };
 
     assert_eq!(
@@ -1855,9 +1931,110 @@ fn enter_on_group_header_toggles_expand_and_collapse() {
 }
 
 #[test]
+fn enter_on_category_header_toggles_expand_and_collapse() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.focus = Pane::Subscriptions;
+    state.subscription_row_index = state
+        .subscription_rows()
+        .iter()
+        .position(|row| row.text.contains("linux subsystem"))
+        .expect("linux category header exists");
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(!state.disabled_linux_subsystem_expanded);
+    let rows_after_collapse = state.subscription_rows();
+    let linux_header_after_collapse = rows_after_collapse
+        .iter()
+        .find(|row| row.text.contains("linux subsystem"))
+        .expect("linux category header exists after collapse");
+    assert!(linux_header_after_collapse.text.starts_with("  ▶"));
+    assert!(
+        !rows_after_collapse
+            .iter()
+            .any(|row| row.text.contains("[n] io-uring"))
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.disabled_linux_subsystem_expanded);
+    let rows_after_expand = state.subscription_rows();
+    let linux_header_after_expand = rows_after_expand
+        .iter()
+        .find(|row| row.text.contains("linux subsystem"))
+        .expect("linux category header exists after expand");
+    assert!(linux_header_after_expand.text.starts_with("  ▼"));
+    assert!(
+        rows_after_expand
+            .iter()
+            .any(|row| row.text.contains("[n] io-uring"))
+    );
+}
+
+#[test]
 fn first_open_starts_with_all_subscriptions_disabled() {
     let state = AppState::new(vec![], test_runtime());
     assert!(state.subscriptions.iter().all(|item| !item.enabled));
+}
+
+#[test]
+fn subscription_rows_show_linux_and_qemu_categories() {
+    let state = AppState::new(vec![], test_runtime());
+    let rows = state.subscription_rows();
+
+    let linux_header = rows
+        .iter()
+        .position(|row| row.text.contains("linux subsystem"))
+        .expect("linux category header exists");
+    let qemu_header = rows
+        .iter()
+        .position(|row| row.text.contains("qemu subsystem"))
+        .expect("qemu category header exists");
+    let qemu_devel = rows
+        .iter()
+        .position(|row| row.text.contains("[n] qemu-devel"))
+        .expect("qemu-devel row exists");
+
+    assert!(linux_header < qemu_header);
+    assert!(qemu_header < qemu_devel);
+}
+
+#[test]
+fn qemu_mailbox_case_variants_reuse_the_default_subscription() {
+    let mut runtime = test_runtime();
+    runtime.source_mailbox = "QEMU-devel".to_string();
+
+    let state = AppState::new_with_ui_state(
+        vec![],
+        runtime,
+        Some(UiState {
+            enabled_mailboxes: vec!["QEMU-devel".to_string()],
+            active_mailbox: Some("QEMU-devel".to_string()),
+            ..UiState::default()
+        }),
+    );
+
+    let qemu_devel_items: Vec<&SubscriptionItem> = state
+        .subscriptions
+        .iter()
+        .filter(|item| item.mailbox.eq_ignore_ascii_case("qemu-devel"))
+        .collect();
+
+    assert_eq!(qemu_devel_items.len(), 1);
+    assert_eq!(qemu_devel_items[0].mailbox, "qemu-devel");
+    assert!(qemu_devel_items[0].enabled);
+    assert_eq!(
+        qemu_devel_items[0].category,
+        Some(SubscriptionCategory::QemuSubsystem)
+    );
+    assert_eq!(
+        state.subscriptions[state.subscription_index].mailbox,
+        "qemu-devel"
+    );
 }
 
 #[test]
@@ -1883,6 +2060,10 @@ fn legacy_ui_state_with_complete_imap_enables_my_inbox_once() {
             enabled_mailboxes: vec!["io-uring".to_string()],
             enabled_group_expanded: true,
             disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: true,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: false,
             active_mailbox: Some("io-uring".to_string()),
         }),
@@ -1907,6 +2088,10 @@ fn initialized_ui_state_keeps_my_inbox_disabled_when_user_opted_out() {
             enabled_mailboxes: vec!["io-uring".to_string()],
             enabled_group_expanded: true,
             disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: true,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some("io-uring".to_string()),
         }),
@@ -1951,6 +2136,10 @@ fn empty_active_inbox_recovers_to_cached_enabled_mailbox() {
             enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "kvm".to_string()],
             enabled_group_expanded: true,
             disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: true,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
         }),
@@ -1983,6 +2172,10 @@ fn startup_sync_failure_for_empty_inbox_falls_back_to_cached_mailbox() {
             enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "io-uring".to_string()],
             enabled_group_expanded: true,
             disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: true,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
         }),
@@ -2055,6 +2248,36 @@ fn foreground_inbox_sync_defers_next_auto_sync_tick() {
 }
 
 #[test]
+fn command_palette_sync_resets_subscription_auto_sync_deadline() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.sync_request_executor = sync_request_mock_success;
+    let io_uring_index = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "io-uring")
+        .expect("io-uring subscription exists");
+    state.subscriptions[io_uring_index].enabled = true;
+    state.reconcile_subscription_auto_sync();
+    state
+        .subscription_auto_sync
+        .as_mut()
+        .expect("subscription auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    run_palette_sync(&mut state, "sync io-uring");
+
+    assert!(state.status.contains("sync ok"));
+    assert!(
+        state
+            .subscription_auto_sync
+            .as_ref()
+            .expect("subscription auto-sync state")
+            .next_due_at
+            > Instant::now() + Duration::from_secs(20)
+    );
+}
+
+#[test]
 fn enter_on_mailbox_pending_startup_sync_stays_non_blocking() {
     let root = temp_dir("imap-pending-enter");
     let runtime = test_runtime_with_imap_in(root.clone());
@@ -2069,6 +2292,10 @@ fn enter_on_mailbox_pending_startup_sync_stays_non_blocking() {
             enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string()],
             enabled_group_expanded: true,
             disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: true,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
         }),
@@ -2107,6 +2334,10 @@ fn background_success_does_not_steal_focus_from_pending_inbox() {
             enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "kvm".to_string()],
             enabled_group_expanded: true,
             disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: true,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
         }),
@@ -2165,7 +2396,7 @@ fn y_and_n_toggle_subscription_and_keep_grouped_sort_order() {
     assert!(
         enabled_group
             .windows(2)
-            .all(|pair| pair[0].mailbox <= pair[1].mailbox)
+            .all(|pair| subscription_sort_key(&pair[0]) <= subscription_sort_key(&pair[1]))
     );
 
     let _ = handle_key_event(
@@ -2188,7 +2419,7 @@ fn y_and_n_toggle_subscription_and_keep_grouped_sort_order() {
         assert!(
             disabled_group
                 .windows(2)
-                .all(|pair| pair[0].mailbox <= pair[1].mailbox)
+                .all(|pair| subscription_sort_key(&pair[0]) <= subscription_sort_key(&pair[1]))
         );
     } else {
         assert!(state.subscriptions.iter().all(|item| !item.enabled));
@@ -2196,7 +2427,7 @@ fn y_and_n_toggle_subscription_and_keep_grouped_sort_order() {
             state
                 .subscriptions
                 .windows(2)
-                .all(|pair| pair[0].mailbox <= pair[1].mailbox)
+                .all(|pair| subscription_sort_key(&pair[0]) <= subscription_sort_key(&pair[1]))
         );
     }
 }
