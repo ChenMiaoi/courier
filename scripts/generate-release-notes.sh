@@ -55,6 +55,9 @@ mkdir -p "$(dirname "${output_file}")"
 
 {
     printf '## %s %s\n\n' "${package_name}" "${tag_name}"
+    printf '[![build](https://github.com/ChenMiaoi/CRIEW/actions/workflows/ci.yml/badge.svg)](https://github.com/ChenMiaoi/CRIEW/actions/workflows/ci.yml)\n'
+    printf '[![crates.io](https://img.shields.io/crates/v/criew?label=latest)](https://crates.io/crates/criew)\n'
+    printf '[![docs](https://docs.rs/criew/badge.svg)](https://docs.rs/criew/)\n'
     printf '[![codecov](https://codecov.io/github/ChenMiaoi/CRIEW/graph/badge.svg?token=AH99YLKKPD)](https://codecov.io/github/ChenMiaoi/CRIEW)\n\n'
     printf 'Source release for `%s`.\n\n' "$(git rev-list -n 1 "${tag_name}")"
     printf '### Release Assets\n\n'

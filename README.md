@@ -1,5 +1,8 @@
 # CRIEW
 
+[![build](https://github.com/ChenMiaoi/CRIEW/actions/workflows/ci.yml/badge.svg)](https://github.com/ChenMiaoi/CRIEW/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/criew?label=latest)](https://crates.io/crates/criew)
+[![docs](https://docs.rs/criew/badge.svg)](https://docs.rs/criew/)
 [![codecov](https://codecov.io/github/ChenMiaoi/CRIEW/graph/badge.svg?token=AH99YLKKPD)](https://codecov.io/github/ChenMiaoi/CRIEW)
 
 CRIEW is a Rust TUI for Linux kernel patch mail workflows.

@@ -1,5 +1,10 @@
 # CRIEW 中文使用说明
 
+[![build](https://github.com/ChenMiaoi/CRIEW/actions/workflows/ci.yml/badge.svg)](https://github.com/ChenMiaoi/CRIEW/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/criew?label=latest)](https://crates.io/crates/criew)
+[![docs](https://docs.rs/criew/badge.svg)](https://docs.rs/criew/)
+[![codecov](https://codecov.io/github/ChenMiaoi/CRIEW/graph/badge.svg?token=AH99YLKKPD)](https://codecov.io/github/ChenMiaoi/CRIEW)
+
 CRIEW 是一个面向 Linux kernel patch 邮件工作流的 Rust TUI 工具，用来把“订阅 -> 同步 -> 阅读 -> 应用 patch -> 回复邮件”放进同一条终端内、本地优先的工作流中。
 `CRIEW` 的含义是 `Code Review in Efficient Workflow`。
 仓库名保持大写 `CRIEW`，crate 和 CLI 命令使用小写 `criew`。
