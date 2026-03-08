@@ -116,24 +116,35 @@ pub(super) fn draw(
                 .as_ref()
                 .is_some_and(|panel| panel.preview_open)
             {
-                "j/k scroll preview | Enter/c confirm | Esc close | S send"
+                "j/k scroll preview | Enter/c confirm | Esc close | S send".to_string()
             } else if state
                 .reply_panel
                 .as_ref()
                 .is_some_and(|panel| panel.reply_notice.is_some())
             {
-                "Enter/Esc close notice | P preview | S send"
+                "Enter/Esc close notice | P preview | S send".to_string()
             } else {
-                "Esc normal/close | Enter/o open below+insert | h/j/k/l move | i insert | x delete | p send preview | S send | :preview :send :q :q!"
+                "Esc normal/close | Enter/o open below+insert | h/j/k/l move | i insert | x delete | p send preview | S send | :preview :send :q :q!".to_string()
             }
         }
-        UiPage::Mail => "/ search | Tab page | : palette | Enter | e/r reply",
+        UiPage::Mail if state.palette.open => {
+            "/ search | Tab page | : palette | Enter | e/r reply".to_string()
+        }
+        UiPage::Mail => format!(
+            "/ search | Tab page | : palette | Enter | e/r reply | {}",
+            main_page_navigation_shortcuts(state.runtime.ui_keymap)
+        ),
         UiPage::CodeBrowser if state.is_code_edit_active() => {
-            "Esc normal/exit | h/j/k/l move | i insert | x delete | s save | E external vim | :w :q :q! :wq :vim"
+            "Esc normal/exit | h/j/k/l move | i insert | x delete | s save | E external vim | :w :q :q! :wq :vim".to_string()
         }
-        UiPage::CodeBrowser => {
+        UiPage::CodeBrowser if state.palette.open => {
             "Tab page | : palette | Enter expand/collapse | e inline edit | E external vim"
+                .to_string()
         }
+        UiPage::CodeBrowser => format!(
+            "Tab page | : palette | Enter expand/collapse | e inline edit | E external vim | {}",
+            main_page_navigation_shortcuts(state.runtime.ui_keymap)
+        ),
     };
     let footer_background =
         Paragraph::new("").style(Style::default().fg(Color::White).bg(Color::DarkGray));
