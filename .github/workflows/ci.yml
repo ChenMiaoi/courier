@@ -49,6 +49,8 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
@@ -67,6 +69,11 @@ jobs:
         with:
           components: llvm-tools-preview
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
@@ -76,7 +83,16 @@ jobs:
       - name: Coverage
         run: ./scripts/check-coverage.sh
 
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: target/coverage/lcov.info
+          disable_search: true
+          fail_ci_if_error: true
+
       - name: Upload coverage artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
