@@ -418,6 +418,7 @@ impl StartupSyncState {
             .join(" ")
     }
 
+    #[cfg(test)]
     fn progress_summary(&self) -> String {
         format!(
             "{}/{} ok={} fail={} queued={} running={}",
