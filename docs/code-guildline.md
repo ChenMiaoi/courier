@@ -84,6 +84,8 @@ Must:
 - `atomic-commits`: keep one logical change per commit.
 - `refactor-then-feature`: separate refactors from feature changes.
 - `focused-prs`: keep each pull request focused on a single theme.
+- `signed-commits`: create repository commits with `git commit -s` so each commit carries a valid `Signed-off-by:` trailer.
+- `large-commit-body`: simple commits may use only the subject line, but larger commits must include a body with bullet points that summarize the main changes.
 
 Commit message policy
 (compatible with this project and the referenced Asterinas rules):
@@ -91,6 +93,10 @@ Commit message policy
 - An optional scope is allowed, such as `feat(ci): ...` or `fix(sync): ...`.
 - Write the subject line in the imperative mood.
 - Keep the subject line under 72 characters when practical.
+- Use `git commit -s` for authored commits; `.githooks/commit-msg` and CI validate the `Signed-off-by:` trailer.
+- Simple commits may use only the subject line.
+- Larger commits must include a body with bullet points such as `- add ...` and `- refactor ...`.
+- The current hook and CI treat a commit as larger when it touches at least 6 files or changes at least 150 added/deleted lines.
 
 ## Review Checklist
 
@@ -105,6 +111,8 @@ Commit message policy
 - [ ] Tests validate observable behavior and clean up resources (`test-visible-behavior`, `test-cleanup`).
 - [ ] `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`, and `./scripts/check-coverage.sh` pass.
 - [ ] Commits and pull requests stay atomic and focused (`atomic-commits`, `focused-prs`).
+- [ ] Each authored commit carries a valid `Signed-off-by:` trailer (`signed-commits`).
+- [ ] Larger commits include a bullet-point body that explains the main changes (`large-commit-body`).
 
 ## Gradual Adoption
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CRIEW Development"
+  short_description: "CRIEW repo workflow and coding rules"
+  default_prompt: "Use $criew-development to make a focused change in the CRIEW repository."
