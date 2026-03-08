@@ -604,6 +604,7 @@ fn effective_config_value(state: &AppState, key: &str) -> Option<String> {
         "imap.proxy" => state.runtime.imap.proxy.clone(),
         "source.lore_base_url" => Some(state.runtime.lore_base_url.clone()),
         "ui.startup_sync" => Some(state.runtime.startup_sync.to_string()),
+        "ui.keymap" => Some(state.runtime.ui_keymap.as_str().to_string()),
         "ui.inbox_auto_sync_interval_secs" => {
             Some(state.runtime.inbox_auto_sync_interval_secs.to_string())
         }
@@ -820,6 +821,16 @@ fn config_value_suggestions(state: &AppState, key: Option<&String>) -> Vec<Palet
                 description: Some("Auto-sync on TUI startup".to_string()),
             })
             .collect(),
+        "ui.keymap" => [
+            ("default", "j/l focus, i/k move"),
+            ("vim", "h/l focus, j/k move"),
+        ]
+        .iter()
+        .map(|(value, description)| PaletteSuggestion {
+            value: (*value).to_string(),
+            description: Some((*description).to_string()),
+        })
+        .collect(),
         "ui.inbox_auto_sync_interval_secs" => ["15", "30", "60", "300"]
             .iter()
             .map(|value| PaletteSuggestion {

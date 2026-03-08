@@ -51,6 +51,11 @@ filter = "info"
 # Default: true
 # startup_sync = true
 
+# Optional. Main-page navigation scheme.
+# Supported: "default" (j/l focus, i/k move), "vim" (h/l focus, j/k move).
+# Default: "default"
+# keymap = "default"
+
 # Optional. Seconds between `My Inbox` background auto-sync runs while TUI stays open.
 # Must be greater than 0. Default: 30
 # inbox_auto_sync_interval_secs = 30
