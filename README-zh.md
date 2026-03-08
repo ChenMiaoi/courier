@@ -1,8 +1,10 @@
-# Courier 中文使用说明
+# CRIEW 中文使用说明
 
-Courier 是一个面向 Linux kernel patch 邮件工作流的 Rust TUI 工具，用来把“订阅 -> 同步 -> 阅读 -> 应用 patch -> 回复邮件”放进同一条终端内、本地优先的工作流中。
+CRIEW 是一个面向 Linux kernel patch 邮件工作流的 Rust TUI 工具，用来把“订阅 -> 同步 -> 阅读 -> 应用 patch -> 回复邮件”放进同一条终端内、本地优先的工作流中。
+`CRIEW` 的含义是 `Code Review in Efficient Workflow`。
+仓库名保持大写 `CRIEW`，crate 和 CLI 命令使用小写 `criew`。
 
-![Courier TUI demo](docs/media/courier-tui-demo.gif)
+![CRIEW TUI demo](docs/media/criew-tui-demo.gif)
 
 English README: [README.md](README.md)
 
@@ -15,34 +17,55 @@ English README: [README.md](README.md)
 - 在 TUI 中撰写回信，并通过 `git send-email` 发送
 - 浏览本地 kernel tree，支持内联 Vim-like 编辑和外部 Vim 编辑
 
+## 发布基线
+
+`v0.0.1` 是 CRIEW 第一版对外支持的发布基线。
+从 `v0.0.1` 开始，项目只使用 CRIEW 这一套命名：
+`criew`、`~/.criew/`、`criew-config.toml`、`criew.db`、`CRIEW_B4_PATH`、`CRIEW_IMAP_PROXY`。
+
+更早的 Courier 命名不再视为受支持的升级路径。
+如果你之前测试过 rename 落定前的预发布快照，或者更早打出的 `v0.0.1` tag，
+请重新拉取代码或重新安装，并按当前命名重新初始化 CRIEW 运行目录。
+
 ## 依赖
 
 - Rust stable
 - Git
 - Python 3
-  - 当你使用仓库内 vendored 的 `vendor/b4/b4.sh` 时需要
+  - 当你使用仓库内 `vendor/b4/b4.sh`，或内置的 runtime fallback 时需要
 - `b4`
-  - Courier 的查找顺序是：`[b4].path` -> `COURIER_B4_PATH` -> `./vendor/b4/b4.sh` -> `b4` in `PATH`
+  - CRIEW 的查找顺序是：`[b4].path` -> `CRIEW_B4_PATH` -> `./vendor/b4/b4.sh` -> `~/.criew/vendor/b4/b4.sh` 内置展开副本 -> `b4` in `PATH`
 - `git send-email`
   - 仅在发送回信时需要
 
 建议先运行：
 
 ```bash
-courier doctor
+criew doctor
 ```
 
 它会检查 `b4`、`git send-email`、git 邮件身份和 IMAP 连接状态。
 
 ## 安装
 
-### 从源码仓库安装
-
-如果你希望直接使用仓库内 vendored 的 `b4`，建议递归拉取子模块：
+### 从 crates.io 安装
 
 ```bash
-git clone --recurse-submodules https://github.com/ChenMiaoi/courier.git
-cd courier
+cargo install criew --locked
+```
+
+这个安装包会把一个最小可运行的 vendored `b4` fallback 内嵌进二进制。
+当 `[b4].path`、`CRIEW_B4_PATH` 和 `./vendor/b4/b4.sh` 都不可用时，
+CRIEW 会在首次需要时把它展开到 `~/.criew/vendor/b4/`。
+这个 fallback 仍然需要系统可用的 Python 3。
+
+### 从源码仓库安装
+
+如果你希望直接使用工作区里的 `./vendor/b4/b4.sh`，建议递归拉取子模块：
+
+```bash
+git clone --recurse-submodules https://github.com/ChenMiaoi/CRIEW.git
+cd CRIEW
 cargo install --path . --locked
 ```
 
@@ -55,10 +78,11 @@ git submodule update --init --recursive
 ### 直接从 GitHub 安装
 
 ```bash
-cargo install --git https://github.com/ChenMiaoi/courier.git --locked courier
+cargo install --git https://github.com/ChenMiaoi/CRIEW.git --locked criew
 ```
 
-这种方式下，建议你自行通过 `b4.path`、`COURIER_B4_PATH` 或系统 `PATH` 提供 `b4`。
+这种方式下，建议你自行通过 `b4.path`、`CRIEW_B4_PATH` 或系统 `PATH` 提供 `b4`。
+如果 checkout 里也带着 `vendor/b4`，CRIEW 也能像源码模式一样直接使用它。
 
 ### 开发时直接运行
 
@@ -72,16 +96,16 @@ cargo run -- tui
 默认配置文件路径：
 
 ```text
-~/.courier/courier-config.toml
+~/.criew/criew-config.toml
 ```
 
 默认运行数据目录：
 
 ```text
-~/.courier/
+~/.criew/
 ```
 
-首次运行时，Courier 会自动生成一个最小配置文件。完整示例见 [docs/config.example.toml](docs/config.example.toml)。
+首次运行时，CRIEW 会自动生成一个最小配置文件。完整示例见 [docs/config.example.toml](docs/config.example.toml)。
 
 一个常见配置如下：
 
@@ -110,37 +134,38 @@ tree = "/path/to/linux"
 - 回信身份优先读取 `git config sendemail.from`，否则回退到 `git config user.name` / `git config user.email`
 - `ui.startup_sync` 默认是 `true`
 - `ui.inbox_auto_sync_interval_secs` 默认是 `30`
+- `~/.courier`、`courier-config.toml`、`courier.db`、`COURIER_B4_PATH`、`COURIER_IMAP_PROXY` 从 `v0.0.1` 起都不再受支持
 
 ## 基本使用
 
 ### 1. 环境自检
 
 ```bash
-courier doctor
+criew doctor
 ```
 
 ### 2. 同步 lore 邮箱
 
 ```bash
-courier sync --mailbox io-uring
+criew sync --mailbox io-uring
 ```
 
 ### 3. 同步真实 IMAP 收件箱
 
 ```bash
-courier sync --mailbox INBOX
+criew sync --mailbox INBOX
 ```
 
 ### 4. 使用本地 `.eml` fixture 调试
 
 ```bash
-courier sync --mailbox test --fixture-dir ./fixtures
+criew sync --mailbox test --fixture-dir ./fixtures
 ```
 
 ### 5. 启动 TUI
 
 ```bash
-courier tui
+criew tui
 ```
 
 ## TUI 常用操作
@@ -169,7 +194,7 @@ courier tui
 
 ## 回复邮件
 
-Courier 的 Reply Panel 会自动填充：
+CRIEW 的 Reply Panel 会自动填充：
 
 - `From`
 - `To`
@@ -199,4 +224,6 @@ cargo test --all-targets --all-features
 
 ## License
 
-Courier 使用 [LGPL-2.1](LICENSE) 许可证发布。仓库内 vendored 第三方组件保留各自上游许可证。
+CRIEW 自身的 Rust 代码使用 [LGPL-2.1](LICENSE) 许可证发布。
+打包进来的 vendored 组件保留各自上游许可证，包括 `vendor/b4`（GPL-2.0）
+和 `vendor/b4/patatt`（MIT-0）。

@@ -1,16 +1,18 @@
-# Courier
+# CRIEW
 
-Courier is a Rust TUI for Linux kernel patch mail workflows.
+CRIEW is a Rust TUI for Linux kernel patch mail workflows.
+`CRIEW` stands for `Code Review in Efficient Workflow`.
+The repository name stays uppercase as `CRIEW`, while the crate and CLI use lowercase `criew`.
 
 It is built for developers who work on mailing-list-driven review, especially in Linux kernel style flows, and want a terminal-first tool that keeps subscription, sync, review, patch application, and reply in one local workflow.
 
-![Courier TUI demo](docs/media/courier-tui-demo.gif)
+![CRIEW TUI demo](docs/media/criew-tui-demo.gif)
 
 Chinese usage guide: [README-zh.md](README-zh.md)
 
 ## Status
 
-Courier is under active development. The current `develop` branch already covers the core workflow:
+CRIEW is under active development. The current `develop` branch already covers the core workflow:
 
 - sync mail from `lore.kernel.org`
 - sync a real IMAP `INBOX` through the built-in `My Inbox` subscription
@@ -18,9 +20,19 @@ Courier is under active development. The current `develop` branch already covers
 - apply or export patches through `b4`
 - compose and send replies from the TUI through `git send-email`
 
+## Release Baseline
+
+`v0.0.1` is the first supported public baseline for CRIEW.
+Starting from `v0.0.1`, the project uses only the CRIEW naming set:
+`criew`, `~/.criew/`, `criew-config.toml`, `criew.db`, `CRIEW_B4_PATH`, and `CRIEW_IMAP_PROXY`.
+
+Earlier Courier-era names are not treated as a supported upgrade path.
+If you tested an older pre-release snapshot or an earlier `v0.0.1` tag before this rename settled,
+refresh your checkout or reinstall the binary and bootstrap a new CRIEW runtime directory.
+
 ## Features
 
-- Rust CLI with `courier tui`, `courier sync`, `courier doctor`, and `courier version`
+- Rust CLI with `criew tui`, `criew sync`, `criew doctor`, and `criew version`
 - local SQLite storage with automatic runtime bootstrap
 - incremental lore sync with checkpoint-based updates
 - real IMAP `INBOX` sync with patch-oriented filtering
@@ -40,25 +52,37 @@ Courier is under active development. The current `develop` branch already covers
 - Rust stable
 - Git
 - Python 3
-  - needed when using the vendored `vendor/b4/b4.sh`
+  - needed when using the repo-local `vendor/b4/b4.sh` or the embedded runtime fallback
 - `b4`
-  - Courier resolves it in this order: `[b4].path` -> `COURIER_B4_PATH` -> `./vendor/b4/b4.sh` -> `b4` in `PATH`
+  - CRIEW resolves it in this order: `[b4].path` -> `CRIEW_B4_PATH` -> `./vendor/b4/b4.sh` -> embedded runtime vendor under `~/.criew/vendor/b4/b4.sh` -> `b4` in `PATH`
 - `git send-email`
   - only required if you want to send replies
 
-`courier doctor` checks `b4`, `git send-email`, git mail identity, and IMAP connectivity.
+`criew doctor` checks `b4`, `git send-email`, git mail identity, and IMAP connectivity.
 
 ## Installation
 
-Source installation is the recommended path.
+`crates.io` installation is the recommended path.
+
+### Install from crates.io
+
+```bash
+cargo install criew --locked
+```
+
+This build keeps a minimal vendored `b4` runtime embedded in the binary.
+If `[b4].path`, `CRIEW_B4_PATH`, and `./vendor/b4/b4.sh` are all unavailable,
+CRIEW can materialize that fallback under `~/.criew/vendor/b4/` on first use.
+Python 3 is still required for that fallback.
 
 ### Install from a clone
 
-If you want to use the vendored `b4`, clone the repository with submodules:
+If you want to use the repo-local `./vendor/b4/b4.sh` fallback from a checkout,
+clone the repository with submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/ChenMiaoi/courier.git
-cd courier
+git clone --recurse-submodules https://github.com/ChenMiaoi/CRIEW.git
+cd CRIEW
 cargo install --path . --locked
 ```
 
@@ -71,10 +95,11 @@ git submodule update --init --recursive
 ### Install directly from GitHub
 
 ```bash
-cargo install --git https://github.com/ChenMiaoi/courier.git --locked courier
+cargo install --git https://github.com/ChenMiaoi/CRIEW.git --locked criew
 ```
 
-In this mode, you should provide `b4` through `b4.path`, `COURIER_B4_PATH`, or your system `PATH`.
+In this mode, you should provide `b4` through `b4.path`, `CRIEW_B4_PATH`, or your system `PATH`.
+If the checkout also includes `vendor/b4`, CRIEW can use it the same way as a source clone.
 
 ### Run from source
 
@@ -88,12 +113,12 @@ cargo run -- tui
 ### 1. Check your environment
 
 ```bash
-courier doctor
+criew doctor
 ```
 
 ### 2. Prepare configuration
 
-The default config file is `~/.courier/courier-config.toml`, and the default runtime directory is `~/.courier/`. Courier creates a minimal config file automatically on first run.
+The default config file is `~/.criew/criew-config.toml`, and the default runtime directory is `~/.criew/`. CRIEW creates a minimal config file automatically on first run.
 
 See [docs/config.example.toml](docs/config.example.toml) for a complete example.
 
@@ -124,31 +149,32 @@ Notes:
 - reply identity prefers `git config sendemail.from`, then falls back to `git config user.name` and `git config user.email`
 - `ui.startup_sync` defaults to `true`
 - `ui.inbox_auto_sync_interval_secs` defaults to `30`
+- Courier-era names such as `~/.courier`, `courier-config.toml`, `courier.db`, `COURIER_B4_PATH`, and `COURIER_IMAP_PROXY` are intentionally unsupported from `v0.0.1` onward
 
 ### 3. Sync mail
 
 Sync a lore mailbox:
 
 ```bash
-courier sync --mailbox io-uring
+criew sync --mailbox io-uring
 ```
 
 Sync a real IMAP inbox:
 
 ```bash
-courier sync --mailbox INBOX
+criew sync --mailbox INBOX
 ```
 
 Use local `.eml` fixtures for debugging:
 
 ```bash
-courier sync --mailbox test --fixture-dir ./fixtures
+criew sync --mailbox test --fixture-dir ./fixtures
 ```
 
 ### 4. Start the TUI
 
 ```bash
-courier tui
+criew tui
 ```
 
 Inside the TUI:
@@ -202,4 +228,6 @@ If you change user-visible behavior, commands, config keys, or workflows, update
 
 ## License
 
-Courier is licensed under [LGPL-2.1](LICENSE). Vendored third-party components keep their upstream licenses.
+CRIEW's Rust code is licensed under [LGPL-2.1](LICENSE).
+Bundled vendored components keep their upstream licenses, including `vendor/b4` (GPL-2.0)
+and `vendor/b4/patatt` (MIT-0).

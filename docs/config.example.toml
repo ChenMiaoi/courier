@@ -1,24 +1,28 @@
-# Courier config example (minimal).
-# Default config path: ~/.courier/courier-config.toml
+# CRIEW config example (minimal).
+# Default config path: ~/.criew/criew-config.toml
+# Starting with v0.0.1, CRIEW only supports the CRIEW naming set:
+# ~/.criew, criew-config.toml, criew.db, CRIEW_B4_PATH, and CRIEW_IMAP_PROXY.
+# Older Courier-era names are intentionally unsupported.
 # Relative paths are resolved from the config file directory.
 
 [storage]
-# Optional runtime root, default is ~/.courier
-# data_dir = "~/.courier"
+# Optional runtime root, default is ~/.criew
+# data_dir = "~/.criew"
 
-# Required to customize DB location. Default: ~/.courier/db/courier.db
-database = "./.courier/db/courier.db"
+# Required to customize DB location. Default: ~/.criew/db/criew.db
+database = "./.criew/db/criew.db"
 
-# Required to customize patch file location. Default: ~/.courier/patches
-patch_dir = "./.courier/patches"
+# Required to customize patch file location. Default: ~/.criew/patches
+patch_dir = "./.criew/patches"
 
 [logging]
-# Required to customize log directory. Default: ~/.courier/logs
-dir = "./.courier/logs"
+# Required to customize log directory. Default: ~/.criew/logs
+dir = "./.criew/logs"
 filter = "info"
 
 [b4]
-# Optional. When omitted, Courier tries vendor/b4/b4.sh and then b4 in PATH.
+# Optional. When omitted, CRIEW tries CRIEW_B4_PATH, ./vendor/b4/b4.sh,
+# an embedded fallback under <data_dir>/vendor/b4/b4.sh, and then b4 in PATH.
 # path = "./vendor/b4/b4.sh"
 
 [source]
@@ -31,20 +35,20 @@ filter = "info"
 
 [imap]
 # Optional self email address for matching your own mail.
-# When `imap.user` is omitted, Courier also uses this as the IMAP login identity.
+# When `imap.user` is omitted, CRIEW also uses this as the IMAP login identity.
 # email = "you@example.com"
 
 # Optional but required for `My Inbox` / real IMAP sync.
 # Supports legacy aliases: imapuser / imappass / imapserver / imapserverport / imapencryption
 # `user` is the IMAP login account. Gmail usually expects the full email address here.
-# If omitted, Courier falls back to `imap.email`.
+# If omitted, CRIEW falls back to `imap.email`.
 # user = "you@example.com"
 # pass = "imap-pass"
 # server = "imap.example.com"
 # serverport = 993
 # encryption = "ssl" # Gmail IMAP 993 implicit TLS/SSL; "tls" is accepted as the same mode
 # proxy = "socks5://10.0.2.2:7890" # Optional. Supports http://, socks5://, socks5h://
-# When omitted, Courier falls back to COURIER_IMAP_PROXY, ALL_PROXY, HTTPS_PROXY, then HTTP_PROXY.
+# When omitted, CRIEW falls back to CRIEW_IMAP_PROXY, ALL_PROXY, HTTPS_PROXY, then HTTP_PROXY.
 
 [ui]
 # Optional. Whether to auto-sync enabled subscriptions after TUI starts.

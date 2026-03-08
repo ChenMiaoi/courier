@@ -1,6 +1,6 @@
-# Courier MVP 里程碑
+# CRIEW MVP 里程碑
 
-本文档承载 Courier 的 MVP 范围、阶段目标、交付物与验收标准。
+本文档承载 CRIEW 的 MVP 范围、阶段目标、交付物与验收标准。
 
 ## 使用方式
 
@@ -34,15 +34,15 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 ### 交付物
 
-- 可执行程序 `courier`，核心命令可运行。
+- 可执行程序 `criew`，核心命令可运行。
 - 初始数据库 schema 与迁移脚本。
 - 配置样例文件（最小字段）。
 - `doctor` 输出（包含 b4 路径与版本）。
 
 ### 验收标准
 
-- `courier doctor` 可输出配置路径、数据库路径、b4 检查结果。
-- `courier tui` 可稳定启动并退出，无 panic。
+- `criew doctor` 可输出配置路径、数据库路径、b4 检查结果。
+- `criew tui` 可稳定启动并退出，无 panic。
 - 首次运行可自动创建数据库与必要目录。
 - 核心模块通过 `cargo check` 与基础单元测试。
 
@@ -172,7 +172,7 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 ### 阶段目标
 
-在 VM1 的基础上支持从 `Code Preview` 切出到外部 Vim，会话结束后稳定返回 Courier，
+在 VM1 的基础上支持从 `Code Preview` 切出到外部 Vim，会话结束后稳定返回 CRIEW，
 并自动刷新预览内容。
 
 ### 前置依赖
@@ -198,7 +198,7 @@ TUI 主循环，确保项目具备后续迭代基础。
 ### 验收标准
 
 1. 在目标文件上触发 VM2 可成功拉起外部 Vim。
-2. 外部 Vim 退出后能稳定回到 Courier，终端状态正常。
+2. 外部 Vim 退出后能稳定回到 CRIEW，终端状态正常。
 3. 返回后 `Code Preview` 显示外部编辑后的最新内容。
 4. dirty 状态触发 VM2 会被阻止并提示先保存。
 5. 启动失败或异常退出时，状态信息可追踪且不影响继续操作。
@@ -226,7 +226,7 @@ TUI 主循环，确保项目具备后续迭代基础。
    `imapuser`、`imappass`、`imapserver`、`imapserverport`、`imapencryption`；
    同时补齐字段级校验。
 2. 邮箱地址解析：IMAP 相关“自己邮箱”地址按 `[imap].email -> git config user.email`
-   优先级解析；若 Courier 配置显式设置，则覆盖 git 结果，并在诊断信息中标明来源。
+   优先级解析；若 CRIEW 配置显式设置，则覆盖 git 结果，并在诊断信息中标明来源。
 3. 连接与认证：实现真实 IMAP 会话建立、`SELECT INBOX`、最小 `LOGIN` 认证路径，
    支持 `tls` / `starttls` / `none` 三种加密模式。
 4. 默认订阅：左栏新增一个内置 `My Inbox`（命名可实现期微调）订阅，映射当前账号
@@ -253,7 +253,7 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 ### 验收标准
 
-1. 当 `[imap].email` 存在且与 git email 不同时，系统使用 Courier 配置中的值。
+1. 当 `[imap].email` 存在且与 git email 不同时，系统使用 CRIEW 配置中的值。
 2. 当 `[imap].email` 缺失时，系统自动回退到 `git config user.email`。
 3. IMAP 配置完整时，左栏出现默认开启的 `My Inbox` 订阅，并在进入 TUI 后自动同步。
 4. `user`、`pass`、`server`、`serverport`、`encryption`
@@ -394,8 +394,8 @@ TUI 主循环，确保项目具备后续迭代基础。
 
 ### 任务拆分
 
-1. 生成配置模板：`courier config init`。
-2. 配置校验：`courier config check`，输出字段级错误。
+1. 生成配置模板：`criew config init`。
+2. 配置校验：`criew config check`，输出字段级错误。
 3. 版本迁移提示：旧字段兼容与弃用提示。
 4. 文档补齐：字段说明、示例、覆盖优先级规则。
 

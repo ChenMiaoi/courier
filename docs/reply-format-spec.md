@@ -1,6 +1,6 @@
-# Courier 回信格式规范（Kernel 风格）
+# CRIEW 回信格式规范（Kernel 风格）
 
-本文档定义 Courier 在 patch review 场景下的回信格式、自动填充规则与发送策略。
+本文档定义 CRIEW 在 patch review 场景下的回信格式、自动填充规则与发送策略。
 目标是让回复行为与内核社区邮件习惯保持一致，并与 `Patch Preview + Vim` 工作流无缝衔接。
 
 ## 1. 范围与前置条件
@@ -9,7 +9,7 @@
 - 前置能力：
   - VM1 已完成（`Patch Preview` 可进入 Vim 模式）。
   - SMTP 发送链路可用（MVP 阶段允许直接调用 `git send-email`）。
-- 成熟版本会替换为 Courier 自实现 SMTP，但保持相同的回信格式与字段语义。
+- 成熟版本会替换为 CRIEW 自实现 SMTP，但保持相同的回信格式与字段语义。
 
 ## 2. 触发与面板行为
 
@@ -118,17 +118,17 @@ On <date>, <author> wrote:
 
 ### 5.1 MVP（必须）
 
-MVP 通过 Courier 内部发送适配层完成发送：
+MVP 通过 CRIEW 内部发送适配层完成发送：
 
 - 用户侧仅暴露统一动作：`Send Preview`、`Confirm Send`、`Send`。
 - 底层实现默认适配 `git send-email`，但实现细节对用户透明。
-- Courier 负责生成待发送内容、拼装参数、捕获退出码与错误输出。
+- CRIEW 负责生成待发送内容、拼装参数、捕获退出码与错误输出。
 
 MVP 发送时序：
 
 1. 用户在 `Reply Panel` 点击或触发 `Send Preview`。
 2. 系统渲染最终邮件快照（`From/To/Cc/Subject/In-Reply-To/References/Body`）。
-3. 用户执行 `Confirm Send` 后，Courier 调用底层发送器（MVP 为 `git send-email`）。
+3. 用户执行 `Confirm Send` 后，CRIEW 调用底层发送器（MVP 为 `git send-email`）。
 4. 若发送失败，停留在 `Reply Panel` 并保留内容，允许重试。
 
 底层命令形态（示意）：
@@ -146,7 +146,7 @@ git send-email \
 
 ### 5.2 成熟版（增强）
 
-- 在保持同一回信格式构造器前提下，替换为 Courier 自实现 SMTP 发送器。
+- 在保持同一回信格式构造器前提下，替换为 CRIEW 自实现 SMTP 发送器。
 - 支持认证、重试、连接池、错误分类与发送状态追踪增强。
 - 继续沿用 `Send Preview -> Confirm -> Send` 的用户交互，不改变前端行为。
 

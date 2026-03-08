@@ -1,4 +1,4 @@
-# Courier Coding Guidelines
+# CRIEW Coding Guidelines
 
 ## Scope And Priority
 

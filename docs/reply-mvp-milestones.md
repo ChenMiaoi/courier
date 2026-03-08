@@ -1,6 +1,6 @@
-# Courier Reply MVP 里程碑
+# CRIEW Reply MVP 里程碑
 
-本文档定义 Courier 回信能力的 MVP 路线，强调两条前置约束：
+本文档定义 CRIEW 回信能力的 MVP 路线，强调两条前置约束：
 
 1. `Patch Preview` 的 Vim 模式先完成（VM1）。
 2. SMTP 链路先打通（MVP 可直接走 `git send-email`）。
@@ -102,7 +102,7 @@
 
 ### 阶段目标
 
-在不改变回信格式与交互前提下，用 Courier SMTP 发送器替代 `git send-email`。
+在不改变回信格式与交互前提下，用 CRIEW SMTP 发送器替代 `git send-email`。
 
 ### 任务拆分
 
@@ -113,7 +113,7 @@
 
 ### 交付物
 
-- Courier 自实现 SMTP 发送器。
+- CRIEW 自实现 SMTP 发送器。
 - 与 RM1 兼容的发送抽象层。
 
 ### 验收标准

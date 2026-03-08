@@ -1,4 +1,4 @@
-# Courier Vim MVP 里程碑
+# CRIEW Vim MVP 里程碑
 
 本文档定义 `Code Preview` 编辑能力的 MVP 路线：先内联 Vim-like（VM1），再切出外部 Vim（VM2）。
 详细交互原型见 `docs/code-preview-vim-prototype.md`。
@@ -85,7 +85,7 @@
 ### 阶段目标
 
 在保持 VM1 内联编辑能力的基础上，支持从 `Code Preview` 切出到外部 Vim，
-利用完整 Vim 生态完成复杂编辑，并在退出后自动回到 Courier。
+利用完整 Vim 生态完成复杂编辑，并在退出后自动回到 CRIEW。
 
 ### 任务拆分
 
@@ -120,7 +120,7 @@
 ### 验收标准
 
 1. 在目标文件上触发 VM2 可成功拉起外部 Vim。
-2. 外部 Vim 退出后能稳定回到 Courier，终端状态正常。
+2. 外部 Vim 退出后能稳定回到 CRIEW，终端状态正常。
 3. 返回后 `Code Preview` 显示外部编辑后的最新内容。
 4. dirty 状态下触发 VM2 会被阻止并提示先保存。
 5. 启动失败或异常退出时，状态信息可追踪且不导致 TUI 卡死。
