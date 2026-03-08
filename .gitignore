@@ -2,3 +2,4 @@
 *.db
 *.sqlite
 .criew/
+__pycache__/
