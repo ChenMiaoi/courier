@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a bug or regression in Courier
+description: Report a bug or regression in CRIEW
 title: "[Bug]: "
 labels:
   - bug
@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to report a problem in Courier.
+        Thanks for taking the time to report a problem in CRIEW.
 
         English is preferred for public issues. Chinese is also acceptable if that is easier.
   - type: checkboxes
@@ -24,7 +24,7 @@ body:
     attributes:
       label: Summary
       description: Describe the problem in one or two sentences.
-      placeholder: Courier fails to ...
+      placeholder: CRIEW fails to ...
     validations:
       required: true
   - type: textarea
@@ -47,8 +47,8 @@ body:
       label: Steps to reproduce
       description: Provide a minimal, repeatable sequence.
       placeholder: |
-        1. Configure Courier with ...
-        2. Run `courier ...`
+        1. Configure CRIEW with ...
+        2. Run `criew ...`
         3. Observe ...
     validations:
       required: true
@@ -60,7 +60,7 @@ body:
       value: |
         - OS:
         - Installation method:
-        - Courier version:
+        - CRIEW version:
         - Git version:
         - Python version:
         - b4 availability:

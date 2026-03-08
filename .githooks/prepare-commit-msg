@@ -14,7 +14,7 @@ if [[ -z "${comment_char}" || "${comment_char}" == "auto" ]]; then
     comment_char="#"
 fi
 
-marker="${comment_char} Courier commit message guide"
+marker="${comment_char} CRIEW commit message guide"
 
 if grep -Fq "${marker}" "${message_file}"; then
     exit 0
@@ -25,7 +25,7 @@ if grep -Eq "^[[:space:]]*[^${comment_char}[:space:]]" "${message_file}"; then
 fi
 
 cat <<EOF >> "${message_file}"
-${comment_char} Courier commit message guide
+${comment_char} CRIEW commit message guide
 ${comment_char}
 ${comment_char} Allowed forms:
 ${comment_char}   feat: imperative summary

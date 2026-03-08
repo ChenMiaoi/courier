@@ -1,6 +1,6 @@
 # Git Hooks
 
-本目录保存 Courier 仓库版本化管理的 Git hooks。
+本目录保存 CRIEW 仓库版本化管理的 Git hooks。
 
 这些 hooks 基于 [docs/code-guildline-cn.md](../docs/code-guildline-cn.md) 中的
 提交规范实现，目标是让提交信息在本地就能得到提示和校验。

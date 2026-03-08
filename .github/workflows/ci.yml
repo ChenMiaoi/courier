@@ -81,10 +81,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GIT_TAG: ${{ github.ref_name }}
         run: |
-          release_title="Courier ${GIT_TAG}"
+          release_title="CRIEW ${GIT_TAG}"
           notes_file="dist/release/release-notes.md"
-          tar_asset="dist/release/courier-${GIT_TAG}-src.tar.gz"
-          zip_asset="dist/release/courier-${GIT_TAG}-src.zip"
+          tar_asset="dist/release/criew-${GIT_TAG}-src.tar.gz"
+          zip_asset="dist/release/criew-${GIT_TAG}-src.zip"
 
           if gh release view "${GIT_TAG}" >/dev/null 2>&1; then
             gh release upload "${GIT_TAG}" \

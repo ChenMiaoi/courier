@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for helping improve Courier documentation.
+        Thanks for helping improve CRIEW documentation.
 
         English is preferred for public issues. Chinese is also acceptable if that is easier.
   - type: checkboxes

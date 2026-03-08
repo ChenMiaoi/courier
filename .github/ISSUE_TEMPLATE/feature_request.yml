@@ -1,5 +1,5 @@
 name: Feature request
-description: Suggest a new feature or workflow improvement for Courier
+description: Suggest a new feature or workflow improvement for CRIEW
 title: "[Feature]: "
 labels:
   - enhancement
@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for proposing an improvement to Courier.
+        Thanks for proposing an improvement to CRIEW.
 
         English is preferred for public issues. Chinese is also acceptable if that is easier.
   - type: checkboxes
