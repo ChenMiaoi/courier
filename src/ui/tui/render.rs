@@ -12,7 +12,7 @@ use std::path::Path;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Text;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use super::config::draw_config_editor;
@@ -20,12 +20,13 @@ use super::palette::palette_overlay_suggestions;
 use super::*;
 
 const REPLY_BODY_GUIDE_COLUMN: usize = 80;
+const HEADER_BG: Color = Color::Blue;
 
 pub(super) fn draw(
     frame: &mut Frame<'_>,
     state: &AppState,
     config: &RuntimeConfig,
-    bootstrap: &BootstrapState,
+    _bootstrap: &BootstrapState,
 ) {
     // Keep header, body, and footer in fixed bands so transient overlays do
     // not cause the main navigation chrome to jump between frames.
@@ -39,27 +40,61 @@ pub(super) fn draw(
         .split(frame.area());
 
     let uptime = state.started_at.elapsed().as_secs();
-    let page_label = match state.ui_page {
-        UiPage::Mail => "mail",
-        UiPage::CodeBrowser => "code",
-    };
-    let header = format!(
-        "page: {} | mailbox: {} | db schema: {} | db: {} | threads: {} | uptime: {}s",
-        page_label,
-        state.active_thread_mailbox,
-        bootstrap.db.schema_version,
-        bootstrap.db.path.display(),
-        state.filtered_thread_indices.len(),
-        uptime
-    );
-    let header = if let Some(progress) = state.startup_sync_progress_text() {
-        format!("{header} | {progress}")
-    } else {
-        header
-    };
-    let header = sanitize_inline_ui_text(&header);
-    let header_widget =
-        Paragraph::new(header).style(Style::default().fg(Color::Black).bg(Color::Cyan));
+    let mut header = vec![
+        Span::styled(
+            " CRIEW ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            Style::default()
+                .fg(Color::Yellow)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            header_context_text(state),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("{} threads", state.filtered_thread_indices.len()),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(" | ", Style::default().fg(Color::White).bg(HEADER_BG)),
+        Span::styled(
+            format!("up {}s", uptime),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::DIM),
+        ),
+    ];
+    if let Some(sync) = state.startup_sync_progress_text() {
+        header.push(Span::styled(
+            " | ",
+            Style::default().fg(Color::White).bg(HEADER_BG),
+        ));
+        header.push(Span::styled(
+            sanitize_inline_ui_text(&sync),
+            Style::default()
+                .fg(Color::Yellow)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let header_widget = Paragraph::new(Line::from(header)).style(Style::default().bg(HEADER_BG));
     frame.render_widget(header_widget, areas[0]);
 
     match state.ui_page {
@@ -100,46 +135,29 @@ pub(super) fn draw(
             "Tab page | : palette | Enter expand/collapse | e inline edit | E external vim"
         }
     };
-    let sync_progress_text = state
-        .startup_sync_progress_text()
-        .map(|value| sanitize_inline_ui_text(&value));
-    let footer_sections = if let Some(progress_text) = sync_progress_text.as_ref() {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(shortcuts_text.chars().count() as u16),
-                Constraint::Length(progress_text.chars().count().min(48) as u16),
-                Constraint::Min(1),
-            ])
-            .split(areas[2])
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(shortcuts_text.chars().count() as u16),
-                Constraint::Min(1),
-            ])
-            .split(areas[2])
-    };
+    let footer_background =
+        Paragraph::new("").style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    frame.render_widget(footer_background, areas[2]);
+
+    let footer_status_text = footer_status_text(&state.status);
+    let footer_sections = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(shortcuts_text.chars().count() as u16),
+            Constraint::Min(1),
+        ])
+        .split(areas[2]);
 
     let shortcuts =
         Paragraph::new(shortcuts_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(shortcuts, footer_sections[0]);
 
-    let status_area = if let Some(progress_text) = sync_progress_text {
-        let progress = Paragraph::new(progress_text)
-            .style(Style::default().fg(Color::Yellow).bg(Color::DarkGray));
-        frame.render_widget(progress, footer_sections[1]);
-        footer_sections[2]
-    } else {
-        footer_sections[1]
-    };
-
-    let status_line = format!("status: {}", sanitize_inline_ui_text(&state.status));
-    let status = Paragraph::new(status_line)
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(Color::White).bg(Color::DarkGray));
-    frame.render_widget(status, status_area);
+    if let Some(status_line) = footer_status_text {
+        let status = Paragraph::new(status_line)
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+        frame.render_widget(status, footer_sections[1]);
+    }
 
     if state.palette.open {
         draw_command_palette(frame, state);
@@ -153,6 +171,23 @@ pub(super) fn draw(
     if state.reply_panel.is_some() {
         draw_reply_panel(frame, state);
     }
+}
+
+fn footer_status_text(status: &str) -> Option<String> {
+    let sanitized = sanitize_inline_ui_text(status);
+    if sanitized.trim().is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn header_context_text(state: &AppState) -> String {
+    let page_label = match state.ui_page {
+        UiPage::Mail => "Mail",
+        UiPage::CodeBrowser => "Code",
+    };
+    format!("{page_label} / {}", state.active_thread_mailbox)
 }
 
 fn draw_code_browser_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -463,7 +498,7 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         (
             None,
             Cow::Owned(format!(
-                "No synced thread data\n\nRun:\n  courier sync --fixture-dir <DIR>\n\nConfig: {}\nDatabase: {}",
+                "No synced thread data\n\nRun:\n  criew sync --fixture-dir <DIR>\n\nConfig: {}\nDatabase: {}",
                 config.config_path.display(),
                 config.database_path.display(),
             )),

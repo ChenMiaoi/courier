@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, params};
 
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 
 pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
@@ -60,7 +60,7 @@ pub struct DatabaseState {
 pub fn initialize(path: &Path) -> Result<DatabaseState> {
     let created = !path.exists();
     let mut connection = Connection::open(path).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             format!("failed to open sqlite database {}", path.display()),
             error,
@@ -70,7 +70,7 @@ pub fn initialize(path: &Path) -> Result<DatabaseState> {
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to enable sqlite foreign key support",
                 error,
@@ -80,7 +80,7 @@ pub fn initialize(path: &Path) -> Result<DatabaseState> {
     connection
         .execute_batch(CREATE_SCHEMA_VERSION_TABLE)
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to create schema_version table",
                 error,
@@ -97,7 +97,7 @@ pub fn initialize(path: &Path) -> Result<DatabaseState> {
         // Apply each migration atomically so a partial upgrade cannot leave the
         // schema_version table claiming success for SQL that never committed.
         let tx = connection.transaction().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to open migration transaction",
                 error,
@@ -105,7 +105,7 @@ pub fn initialize(path: &Path) -> Result<DatabaseState> {
         })?;
 
         tx.execute_batch(migration.sql).map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to run migration {}", migration.version),
                 error,
@@ -117,7 +117,7 @@ pub fn initialize(path: &Path) -> Result<DatabaseState> {
             params![migration.version, migration.description],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to register migration {}", migration.version),
                 error,
@@ -125,7 +125,7 @@ pub fn initialize(path: &Path) -> Result<DatabaseState> {
         })?;
 
         tx.commit().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to commit migration {}", migration.version),
                 error,
@@ -153,7 +153,7 @@ fn current_version(connection: &Connection) -> Result<i64> {
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| {
-            CourierError::with_source(ErrorCode::Database, "failed to query schema version", error)
+            CriewError::with_source(ErrorCode::Database, "failed to query schema version", error)
         })
 }
 
@@ -172,7 +172,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn initialize_runs_initial_migration() {
         let root = temp_dir("db-init");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
 
         let state = initialize(&db_path).expect("initialize db");
         assert!(state.created);

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::models::PatchSeriesStatus;
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 
 #[derive(Debug, Clone)]
 pub struct UpsertSeriesRequest {
@@ -100,7 +100,7 @@ pub struct SeriesLatestReport {
 pub fn upsert_series(path: &Path, request: &UpsertSeriesRequest) -> Result<SeriesRecord> {
     let mut connection = open_connection(path)?;
     let tx = connection.transaction().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             "failed to open patch series transaction",
             error,
@@ -140,7 +140,7 @@ ON CONFLICT(mailbox, thread_id, version) DO UPDATE SET
         ],
     )
     .map_err(|error| {
-        CourierError::with_source(ErrorCode::Database, "failed to upsert patch series", error)
+        CriewError::with_source(ErrorCode::Database, "failed to upsert patch series", error)
     })?;
 
     let (series_id, status_text): (i64, String) = tx
@@ -150,7 +150,7 @@ ON CONFLICT(mailbox, thread_id, version) DO UPDATE SET
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to load upserted patch series row",
                 error,
@@ -162,7 +162,7 @@ ON CONFLICT(mailbox, thread_id, version) DO UPDATE SET
         params![series_id],
     )
     .map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             format!("failed to clear patch items for series {series_id}"),
             error,
@@ -194,7 +194,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             ],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!(
                     "failed to insert patch item seq={} for series {series_id}",
@@ -206,7 +206,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     }
 
     tx.commit().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             "failed to commit patch series transaction",
             error,
@@ -268,7 +268,7 @@ WHERE id = ?1
             ],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to update patch series result for series {series_id}"),
                 error,
@@ -307,7 +307,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!(
                     "failed to insert patch series run for series {}",
@@ -349,7 +349,7 @@ LIMIT 1
             )
             .optional()
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     format!(
                         "failed to query patch series status for mailbox '{}' thread {}",
@@ -408,7 +408,7 @@ LIMIT 1
         )
         .optional()
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!(
                     "failed to load patch series report for mailbox '{}' thread {}",
@@ -447,7 +447,7 @@ LIMIT 1
         )
         .optional()
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to load latest run summary for series {series_id}"),
                 error,
@@ -471,7 +471,7 @@ LIMIT 1
 
 fn open_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             format!("failed to open sqlite database {}", path.display()),
             error,
@@ -481,7 +481,7 @@ fn open_connection(path: &Path) -> Result<Connection> {
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to enable sqlite foreign key support",
                 error,
@@ -544,7 +544,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-patch-store-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-patch-store-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -567,7 +567,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
     #[test]
     fn upsert_series_creates_rows_and_items() {
         let root = temp_dir("upsert");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         let _ = db::initialize(&db_path).expect("initialize db");
         seed_mail_rows(
             &db_path,
@@ -625,7 +625,7 @@ VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
     #[test]
     fn update_and_run_are_visible_from_latest_report() {
         let root = temp_dir("report");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         let _ = db::initialize(&db_path).expect("initialize db");
         seed_mail_rows(&db_path, &[(1, "p1@example.com")]);
 

@@ -24,7 +24,7 @@ pub fn run() -> Result<()> {
     let command = cli.command.unwrap_or(cli::Command::Tui);
 
     if matches!(command, cli::Command::Version) {
-        println!("courier {}", env!("CARGO_PKG_VERSION"));
+        println!("criew {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -65,11 +65,11 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         cli::Command::Doctor => {
-            let b4_status = b4::check(runtime.b4_path.as_deref());
+            let b4_status = b4::check(runtime.b4_path.as_deref(), Some(&runtime.data_dir));
             let send_email_status = sendmail::check();
             let reply_identity = sendmail::resolve_reply_identity();
 
-            println!("courier doctor");
+            println!("criew doctor");
             println!("  config_path: {}", runtime.config_path.display());
             println!("  data_dir: {}", runtime.data_dir.display());
             println!("  database_path: {}", runtime.database_path.display());

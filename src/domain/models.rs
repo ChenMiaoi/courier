@@ -1,7 +1,7 @@
 //! Small domain types shared across layers.
 //!
 //! These structs intentionally avoid storage- or transport-specific fields so
-//! the rest of the codebase can talk about Courier concepts without depending
+//! the rest of the codebase can talk about CRIEW concepts without depending
 //! on SQLite row layouts or TUI state.
 
 #![allow(dead_code)]

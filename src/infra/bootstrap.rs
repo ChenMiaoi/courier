@@ -8,7 +8,7 @@ use std::fs;
 
 use crate::infra::config::RuntimeConfig;
 use crate::infra::db::{self, DatabaseState};
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::mail_store;
 
 const THREAD_DATE_ORDER_MIGRATION_VERSION: i64 = 4;
@@ -42,7 +42,7 @@ pub fn prepare(config: &RuntimeConfig) -> Result<BootstrapState> {
 fn ensure_runtime_dirs(config: &RuntimeConfig) -> Result<()> {
     if let Some(config_dir) = config.config_path.parent() {
         fs::create_dir_all(config_dir).map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Io,
                 format!("failed to create config directory {}", config_dir.display()),
                 error,
@@ -51,7 +51,7 @@ fn ensure_runtime_dirs(config: &RuntimeConfig) -> Result<()> {
     }
 
     fs::create_dir_all(&config.data_dir).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!(
                 "failed to create data directory {}",
@@ -62,7 +62,7 @@ fn ensure_runtime_dirs(config: &RuntimeConfig) -> Result<()> {
     })?;
 
     fs::create_dir_all(&config.raw_mail_dir).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!(
                 "failed to create raw mail directory {}",
@@ -73,7 +73,7 @@ fn ensure_runtime_dirs(config: &RuntimeConfig) -> Result<()> {
     })?;
 
     fs::create_dir_all(&config.patch_dir).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!(
                 "failed to create patch directory {}",
@@ -84,7 +84,7 @@ fn ensure_runtime_dirs(config: &RuntimeConfig) -> Result<()> {
     })?;
 
     fs::create_dir_all(&config.log_dir).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!(
                 "failed to create log directory {}",
@@ -96,7 +96,7 @@ fn ensure_runtime_dirs(config: &RuntimeConfig) -> Result<()> {
 
     if let Some(db_dir) = config.database_path.parent() {
         fs::create_dir_all(db_dir).map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Io,
                 format!("failed to create database directory {}", db_dir.display()),
                 error,

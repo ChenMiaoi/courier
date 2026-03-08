@@ -5,6 +5,7 @@
 //! interfaces.
 
 pub mod b4;
+mod b4_vendor;
 pub mod bootstrap;
 pub mod config;
 pub mod db;

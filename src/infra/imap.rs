@@ -20,7 +20,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::infra::config::{ImapConfig, ImapEncryption};
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 
 const LORE_BASE_URL: &str = "https://lore.kernel.org";
 const GNU_ARCHIVE_MBOX_BASE_URL: &str = "https://lists.gnu.org/archive/mbox";
@@ -125,7 +125,7 @@ impl FixtureImapClient {
         }
 
         let content = fs::read_to_string(&path).map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to read UIDVALIDITY from {}", path.display()),
                 error,
@@ -138,7 +138,7 @@ impl FixtureImapClient {
         }
 
         value.parse::<u64>().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!(
                     "invalid UIDVALIDITY value '{}' in {}",
@@ -161,7 +161,7 @@ impl FixtureImapClient {
 
         let mut files: Vec<PathBuf> = fs::read_dir(&dir)
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     format!("failed to read mailbox directory {}", dir.display()),
                     error,
@@ -199,7 +199,7 @@ impl FixtureImapClient {
             }
 
             let metadata = fs::metadata(&path).map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     format!("failed to read metadata for {}", path.display()),
                     error,
@@ -281,7 +281,7 @@ impl ImapClient for FixtureImapClient {
             }
 
             let raw = fs::read(&entry.path).map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     format!("failed to read fixture mail {}", entry.path.display()),
                     error,
@@ -325,10 +325,10 @@ impl LoreImapClient {
     pub fn new(base_url: Option<&str>) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(LORE_HTTP_TIMEOUT_SECS))
-            .user_agent(format!("courier/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("criew/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     "failed to initialize lore HTTP client",
                     error,
@@ -364,7 +364,7 @@ impl LoreImapClient {
     fn fetch_feed_entries(&self, mailbox: &str) -> Result<Vec<LoreFeedEntry>> {
         let url = self.feed_url(mailbox);
         let response = self.client.get(&url).send().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to fetch lore feed {url}"),
                 error,
@@ -373,7 +373,7 @@ impl LoreImapClient {
 
         let status = response.status();
         let body = response.text().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to read lore feed body {url}"),
                 error,
@@ -391,13 +391,13 @@ impl LoreImapClient {
     }
 
     fn fetch_raw_mail(&self, message_url: &str) -> Result<Vec<u8>> {
-        let mut last_error: Option<CourierError> = None;
+        let mut last_error: Option<CriewError> = None;
 
         for raw_url in lore_raw_url_candidates(message_url) {
             let response = match self.client.get(&raw_url).send() {
                 Ok(response) => response,
                 Err(error) => {
-                    last_error = Some(CourierError::with_source(
+                    last_error = Some(CriewError::with_source(
                         ErrorCode::Imap,
                         format!("failed to fetch lore raw message {raw_url}"),
                         error,
@@ -418,7 +418,7 @@ impl LoreImapClient {
             }
 
             let bytes = response.bytes().map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     format!("failed to read lore raw message body {raw_url}"),
                     error,
@@ -502,10 +502,10 @@ impl GnuArchiveClient {
     pub fn new(base_url: Option<&str>) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(LORE_HTTP_TIMEOUT_SECS))
-            .user_agent(format!("courier/{}", env!("CARGO_PKG_VERSION")))
+            .user_agent(format!("criew/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     "failed to initialize GNU archive HTTP client",
                     error,
@@ -546,7 +546,7 @@ impl GnuArchiveClient {
     fn fetch_month_entries(&self, mailbox: &str) -> Result<Vec<GnuArchiveMonthEntry>> {
         let url = self.index_url(mailbox);
         let response = self.client.get(&url).send().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to fetch GNU archive index {url}"),
                 error,
@@ -555,7 +555,7 @@ impl GnuArchiveClient {
 
         let status = response.status();
         let body = response.text().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to read GNU archive index body {url}"),
                 error,
@@ -575,7 +575,7 @@ impl GnuArchiveClient {
     fn fetch_month_mbox(&self, mailbox: &str, month_key: &str) -> Result<Vec<u8>> {
         let url = self.month_url(mailbox, month_key);
         let response = self.client.get(&url).send().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to fetch GNU archive mbox {url}"),
                 error,
@@ -594,7 +594,7 @@ impl GnuArchiveClient {
             .bytes()
             .map(|bytes| bytes.to_vec())
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     format!("failed to read GNU archive mbox body {url}"),
                     error,
@@ -1127,14 +1127,14 @@ impl ImapSession {
         self.transport
             .write_all(payload.as_bytes())
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     format!("failed to write IMAP command '{command}'"),
                     error,
                 )
             })?;
         self.transport.flush().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to flush IMAP command '{command}'"),
                 error,
@@ -1162,7 +1162,7 @@ impl ImapSession {
 
             let mut chunk = [0u8; 4096];
             let read = self.transport.read(&mut chunk).map_err(|error| {
-                CourierError::with_source(ErrorCode::Imap, "failed to read from IMAP socket", error)
+                CriewError::with_source(ErrorCode::Imap, "failed to read from IMAP socket", error)
             })?;
             if read == 0 {
                 return Err(imap_error(
@@ -1183,7 +1183,7 @@ impl ImapSession {
             let remaining = len - out.len();
             let mut chunk = vec![0u8; remaining.min(4096)];
             let read = self.transport.read(&mut chunk).map_err(|error| {
-                CourierError::with_source(ErrorCode::Imap, "failed to read IMAP literal", error)
+                CriewError::with_source(ErrorCode::Imap, "failed to read IMAP literal", error)
             })?;
             if read == 0 {
                 return Err(imap_error(
@@ -1235,7 +1235,7 @@ fn render_uid_range(start: u32, end: u32) -> String {
 
 fn parse_imap_proxy(proxy_url: &str) -> Result<ImapProxy> {
     let parsed = reqwest::Url::parse(proxy_url).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::ConfigParse,
             format!("invalid IMAP proxy URL '{proxy_url}'"),
             error,
@@ -1246,7 +1246,7 @@ fn parse_imap_proxy(proxy_url: &str) -> Result<ImapProxy> {
         "http" => ImapProxyScheme::Http,
         "socks5" | "socks5h" => ImapProxyScheme::Socks5,
         unsupported => {
-            return Err(CourierError::new(
+            return Err(CriewError::new(
                 ErrorCode::ConfigParse,
                 format!(
                     "unsupported IMAP proxy scheme '{unsupported}'; use http://, socks5://, or socks5h://"
@@ -1256,7 +1256,7 @@ fn parse_imap_proxy(proxy_url: &str) -> Result<ImapProxy> {
     };
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::ConfigParse,
             "IMAP proxy authentication is not supported yet; use an unauthenticated local proxy",
         ));
@@ -1266,14 +1266,14 @@ fn parse_imap_proxy(proxy_url: &str) -> Result<ImapProxy> {
         || parsed.fragment().is_some()
         || !(parsed.path().is_empty() || parsed.path() == "/")
     {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::ConfigParse,
             format!("invalid IMAP proxy URL '{proxy_url}': remove path, query, and fragment"),
         ));
     }
 
     let host = parsed.host_str().ok_or_else(|| {
-        CourierError::new(
+        CriewError::new(
             ErrorCode::ConfigParse,
             format!("invalid IMAP proxy URL '{proxy_url}': missing host"),
         )
@@ -1294,7 +1294,7 @@ fn configure_tcp_timeouts(stream: &TcpStream, label: &str) -> Result<()> {
     stream
         .set_read_timeout(Some(Duration::from_secs(REMOTE_IMAP_TIMEOUT_SECS)))
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to configure IMAP read timeout for {label}"),
                 error,
@@ -1303,7 +1303,7 @@ fn configure_tcp_timeouts(stream: &TcpStream, label: &str) -> Result<()> {
     stream
         .set_write_timeout(Some(Duration::from_secs(REMOTE_IMAP_TIMEOUT_SECS)))
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to configure IMAP write timeout for {label}"),
                 error,
@@ -1315,7 +1315,7 @@ fn configure_tcp_timeouts(stream: &TcpStream, label: &str) -> Result<()> {
 
 fn connect_direct_tcp(server: &str, port: u16) -> Result<TcpStream> {
     let stream = TcpStream::connect((server, port)).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!("failed to connect to IMAP server {server}:{port}"),
             error,
@@ -1335,7 +1335,7 @@ fn read_http_proxy_response<S: Read>(
     let mut byte = [0u8; 1];
     while !response.ends_with(b"\r\n\r\n") {
         let read = stream.read(&mut byte).map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!(
                     "failed while reading IMAP proxy {} response for {target}",
@@ -1345,7 +1345,7 @@ fn read_http_proxy_response<S: Read>(
             )
         })?;
         if read == 0 {
-            return Err(CourierError::new(
+            return Err(CriewError::new(
                 ErrorCode::Imap,
                 format!(
                     "IMAP proxy {} closed the connection before CONNECT to {target} completed",
@@ -1355,7 +1355,7 @@ fn read_http_proxy_response<S: Read>(
         }
         response.push(byte[0]);
         if response.len() > HTTP_PROXY_RESPONSE_MAX_BYTES {
-            return Err(CourierError::new(
+            return Err(CriewError::new(
                 ErrorCode::Imap,
                 format!(
                     "IMAP proxy {} sent too much HTTP response data while tunneling {target}",
@@ -1379,7 +1379,7 @@ fn establish_http_connect_tunnel<S: Read + Write>(
         "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Connection: Keep-Alive\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to send IMAP CONNECT request through proxy {} for {target}",
@@ -1389,7 +1389,7 @@ fn establish_http_connect_tunnel<S: Read + Write>(
         )
     })?;
     stream.flush().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to flush IMAP CONNECT request through proxy {} for {target}",
@@ -1413,7 +1413,7 @@ fn establish_http_connect_tunnel<S: Read + Write>(
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or_default();
     if !protocol.starts_with("HTTP/") || !(200..300).contains(&status_code) {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Imap,
             format!(
                 "IMAP proxy {} rejected CONNECT to {target}: {status_line}",
@@ -1428,7 +1428,7 @@ fn establish_http_connect_tunnel<S: Read + Write>(
 fn read_socks5_reply_address<S: Read>(stream: &mut S, proxy: &ImapProxy) -> Result<()> {
     let mut atyp = [0u8; 1];
     stream.read_exact(&mut atyp).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to read SOCKS5 reply type from IMAP proxy {}",
@@ -1442,7 +1442,7 @@ fn read_socks5_reply_address<S: Read>(stream: &mut S, proxy: &ImapProxy) -> Resu
         0x03 => {
             let mut length = [0u8; 1];
             stream.read_exact(&mut length).map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     format!(
                         "failed to read SOCKS5 domain length from IMAP proxy {}",
@@ -1455,7 +1455,7 @@ fn read_socks5_reply_address<S: Read>(stream: &mut S, proxy: &ImapProxy) -> Resu
         }
         0x04 => 16usize,
         value => {
-            return Err(CourierError::new(
+            return Err(CriewError::new(
                 ErrorCode::Imap,
                 format!(
                     "IMAP proxy {} returned unsupported SOCKS5 address type 0x{value:02x}",
@@ -1467,7 +1467,7 @@ fn read_socks5_reply_address<S: Read>(stream: &mut S, proxy: &ImapProxy) -> Resu
 
     let mut discard = vec![0u8; address_len + 2];
     stream.read_exact(&mut discard).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to read SOCKS5 bind address from IMAP proxy {}",
@@ -1500,7 +1500,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
     port: u16,
 ) -> Result<()> {
     stream.write_all(&[0x05, 0x01, 0x00]).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to send SOCKS5 greeting to IMAP proxy {}",
@@ -1512,7 +1512,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
 
     let mut greeting_reply = [0u8; 2];
     stream.read_exact(&mut greeting_reply).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to read SOCKS5 greeting reply from IMAP proxy {}",
@@ -1522,7 +1522,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
         )
     })?;
     if greeting_reply[0] != 0x05 {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Imap,
             format!(
                 "IMAP proxy {} returned invalid SOCKS5 version 0x{:02x}",
@@ -1532,7 +1532,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
         ));
     }
     if greeting_reply[1] != 0x00 {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Imap,
             format!(
                 "IMAP proxy {} does not allow unauthenticated SOCKS5 connections",
@@ -1543,7 +1543,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
 
     let host = server.as_bytes();
     if host.len() > u8::MAX as usize {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Imap,
             format!("IMAP server name '{server}' is too long for SOCKS5 proxying"),
         ));
@@ -1554,7 +1554,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
     request.extend_from_slice(host);
     request.extend_from_slice(&port.to_be_bytes());
     stream.write_all(&request).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to send SOCKS5 CONNECT request through IMAP proxy {}",
@@ -1566,7 +1566,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
 
     let mut reply = [0u8; 3];
     stream.read_exact(&mut reply).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to read SOCKS5 CONNECT status from IMAP proxy {}",
@@ -1576,7 +1576,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
         )
     })?;
     if reply[0] != 0x05 {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Imap,
             format!(
                 "IMAP proxy {} returned invalid SOCKS5 version 0x{:02x}",
@@ -1586,7 +1586,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
         ));
     }
     if reply[1] != 0x00 {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Imap,
             format!(
                 "IMAP proxy {} failed to connect to {server}:{port}: {}",
@@ -1603,7 +1603,7 @@ fn establish_socks5_tunnel<S: Read + Write>(
 fn connect_tcp_via_proxy(proxy: &ImapProxy, server: &str, port: u16) -> Result<TcpStream> {
     let target = format!("{server}:{port}");
     let stream = TcpStream::connect((proxy.host.as_str(), proxy.port)).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!(
                 "failed to connect to IMAP proxy {} for {target}",
@@ -1647,7 +1647,7 @@ fn connect_tls(
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Imap,
                     "failed to configure TLS protocol versions for IMAP client",
                     error,
@@ -1656,7 +1656,7 @@ fn connect_tls(
             .with_root_certificates(root_store)
             .with_no_client_auth();
     let server_name = ServerName::try_from(server.to_string()).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Imap,
             format!("invalid IMAP server name '{server}' for TLS"),
             error,
@@ -1664,7 +1664,7 @@ fn connect_tls(
     })?;
     let connection =
         ClientConnection::new(Arc::new(client_config), server_name).map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Imap,
                 format!("failed to initialize TLS session for IMAP server '{server}'"),
                 error,
@@ -1850,7 +1850,7 @@ fn parse_lore_atom_entries(xml: &str) -> Result<Vec<LoreFeedEntry>> {
                 }
 
                 let text = event.unescape().map_err(|error| {
-                    CourierError::with_source(
+                    CriewError::with_source(
                         ErrorCode::Imap,
                         "failed to decode lore atom text",
                         error,
@@ -1895,7 +1895,7 @@ fn parse_lore_atom_entries(xml: &str) -> Result<Vec<LoreFeedEntry>> {
             }
             Ok(Event::Eof) => break,
             Err(error) => {
-                return Err(CourierError::with_source(
+                return Err(CriewError::with_source(
                     ErrorCode::Imap,
                     "failed to parse lore atom feed",
                     error,
@@ -2139,8 +2139,8 @@ fn lore_raw_url_candidates(message_url: &str) -> Vec<String> {
     uniq
 }
 
-fn imap_error(kind: ImapErrorKind, message: impl Into<String>) -> CourierError {
-    CourierError::new(
+fn imap_error(kind: ImapErrorKind, message: impl Into<String>) -> CriewError {
+    CriewError::new(
         ErrorCode::Imap,
         format!("{}: {}", classify(kind), message.into()),
     )
@@ -2180,7 +2180,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-imap-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-imap-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }

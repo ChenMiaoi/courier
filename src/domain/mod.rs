@@ -1,6 +1,6 @@
 //! Domain models and static subscription data.
 //!
-//! The domain layer stays intentionally small: it defines Courier's core
+//! The domain layer stays intentionally small: it defines CRIEW's core
 //! concepts without coupling them to SQLite, IMAP, or ratatui details.
 
 pub mod models;

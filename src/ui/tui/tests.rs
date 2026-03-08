@@ -43,7 +43,7 @@ fn temp_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("courier-ui-{label}-{nonce}"));
+    let path = std::env::temp_dir().join(format!("criew-ui-{label}-{nonce}"));
     fs::create_dir_all(&path).expect("create temp dir");
     path
 }
@@ -105,7 +105,7 @@ fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
     RuntimeConfig {
         config_path: root.join("config.toml"),
         data_dir: root.join("data"),
-        database_path: root.join("data/courier.db"),
+        database_path: root.join("data/criew.db"),
         raw_mail_dir: root.join("data/raw"),
         patch_dir: root.join("data/patches"),
         log_dir: root.join("data/logs"),
@@ -133,7 +133,7 @@ fn subscription_sort_key(item: &SubscriptionItem) -> (u8, &str, &str) {
 }
 
 fn test_runtime() -> RuntimeConfig {
-    test_runtime_in(PathBuf::from("/tmp/courier-ui-test"))
+    test_runtime_in(PathBuf::from("/tmp/criew-ui-test"))
 }
 
 fn test_runtime_with_kernel_tree(tree: PathBuf) -> RuntimeConfig {
@@ -157,7 +157,7 @@ fn test_runtime_with_imap_in(root: PathBuf) -> RuntimeConfig {
 }
 
 fn test_runtime_with_imap() -> RuntimeConfig {
-    test_runtime_with_imap_in(PathBuf::from("/tmp/courier-ui-test"))
+    test_runtime_with_imap_in(PathBuf::from("/tmp/criew-ui-test"))
 }
 
 fn seed_mailbox_thread(db_path: &Path, mailbox: &str, uid: u32, message_id: &str, subject: &str) {
@@ -387,8 +387,8 @@ fn external_editor_mock_failure(
 
 fn reply_identity_mock() -> std::result::Result<ReplyIdentity, String> {
     Ok(ReplyIdentity {
-        display: "Courier Test <courier@example.com>".to_string(),
-        email: "courier@example.com".to_string(),
+        display: "CRIEW Test <criew@example.com>".to_string(),
+        email: "criew@example.com".to_string(),
     })
 }
 
@@ -688,7 +688,7 @@ fn command_palette_help_includes_keyboard_shortcuts() {
 #[test]
 fn config_palette_get_and_set_roundtrip() {
     let root = temp_dir("palette-config");
-    let config_path = root.join("courier-config.toml");
+    let config_path = root.join("criew-config.toml");
     fs::write(
         &config_path,
         r#"
@@ -754,7 +754,7 @@ fn config_command_opens_visual_editor() {
 #[test]
 fn config_editor_saves_selected_value() {
     let root = temp_dir("config-editor-save");
-    let config_path = root.join("courier-config.toml");
+    let config_path = root.join("criew-config.toml");
     fs::write(
         &config_path,
         r#"
@@ -788,7 +788,7 @@ mailbox = "inbox"
 #[test]
 fn config_editor_tab_cycles_boolean_presets() {
     let root = temp_dir("config-editor-toggle");
-    let config_path = root.join("courier-config.toml");
+    let config_path = root.join("criew-config.toml");
     fs::write(
         &config_path,
         r#"
@@ -815,7 +815,7 @@ startup_sync = true
 #[test]
 fn config_editor_saves_inbox_auto_sync_interval() {
     let root = temp_dir("config-editor-auto-sync-interval");
-    let config_path = root.join("courier-config.toml");
+    let config_path = root.join("criew-config.toml");
     fs::write(
         &config_path,
         r#"
@@ -848,7 +848,7 @@ inbox_auto_sync_interval_secs = 30
 #[test]
 fn config_editor_can_unset_optional_key() {
     let root = temp_dir("config-editor-unset");
-    let config_path = root.join("courier-config.toml");
+    let config_path = root.join("criew-config.toml");
     fs::write(
         &config_path,
         r#"
@@ -878,7 +878,7 @@ path = "/usr/bin/b4"
 #[test]
 fn config_editor_rejects_invalid_runtime_value_without_writing_file() {
     let root = temp_dir("config-editor-invalid");
-    let config_path = root.join("courier-config.toml");
+    let config_path = root.join("criew-config.toml");
     fs::write(
         &config_path,
         r#"
@@ -917,7 +917,7 @@ startup_sync = true
 #[test]
 fn config_editor_rejects_zero_inbox_auto_sync_interval_without_writing_file() {
     let root = temp_dir("config-editor-zero-auto-sync-interval");
-    let config_path = root.join("courier-config.toml");
+    let config_path = root.join("criew-config.toml");
     fs::write(
         &config_path,
         r#"
@@ -955,7 +955,7 @@ inbox_auto_sync_interval_secs = 30
 #[test]
 fn config_palette_set_does_not_overwrite_scalar_parent_keys() {
     let root = temp_dir("config-palette-scalar-parent");
-    let config_path = root.join("courier-config.toml");
+    let config_path = root.join("criew-config.toml");
     fs::write(&config_path, "source = \"broken\"\n").expect("write config file");
 
     let mut runtime = test_runtime();
@@ -2112,7 +2112,7 @@ fn catch_sync_panic_converts_panics_into_errors() {
     let error = catch_sync_panic("INBOX", || -> crate::infra::error::Result<()> {
         panic!("boom");
     })
-    .expect_err("panic should become courier error");
+    .expect_err("panic should become criew error");
 
     assert!(error.to_string().contains("sync panicked for INBOX: boom"));
 }
@@ -2644,10 +2644,54 @@ fn multiline_sync_error_does_not_break_footer_or_palette_render() {
         .expect("draw multiline status");
     let rendered = format!("{}", terminal.backend());
 
-    assert!(
-        rendered.contains("status: sync failed: E1007: Could not automatically determine provider")
-    );
+    assert!(rendered.contains("sync failed: E1007: Could not automatically determine provider"));
     assert!(rendered.contains("Command Palette"));
+}
+
+#[test]
+fn header_shows_criew_brand_and_default_footer_hides_empty_status() {
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let state = AppState::new(vec![], runtime.clone());
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 35)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw branded header");
+    let rendered = format!("{}", terminal.backend());
+
+    assert!(rendered.contains("CRIEW"));
+    assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+    assert!(rendered.contains("Mail / inbox"));
+    assert!(!rendered.contains("db schema"));
+    assert!(!rendered.contains("db:"));
+    assert!(!rendered.contains("status:"));
+    assert!(!rendered.contains(" ready "));
+}
+
+#[test]
+fn startup_sync_summary_stays_in_header_not_footer_middle() {
+    let runtime = test_runtime_in(PathBuf::from("/t"));
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.startup_sync = Some(startup_sync_state(&[
+        ("INBOX", StartupSyncMailboxStatus::InFlight),
+        ("io-uring", StartupSyncMailboxStatus::Pending),
+        ("kvm", StartupSyncMailboxStatus::Finished),
+    ]));
+    state.status = "startup sync [1/3] syncing INBOX...".to_string();
+
+    let mut terminal = Terminal::new(TestBackend::new(260, 35)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw startup sync");
+    let rendered = format!("{}", terminal.backend());
+    let progress_summary = "sync INBOX 1/3";
+
+    assert!(rendered.contains("Mail / inbox"));
+    assert!(rendered.contains(progress_summary));
+    assert!(rendered.contains("startup sync [1/3] syncing INBOX..."));
+    assert_eq!(rendered.matches(progress_summary).count(), 1);
 }
 
 #[test]
@@ -2656,7 +2700,7 @@ fn mail_preview_e_opens_reply_panel_with_autofilled_headers() {
     let raw = root.join("patch.eml");
     fs::write(
             &raw,
-            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Courier Test <courier@example.com>, Bob <bob@example.com>\r\nCc: Alice <alice@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+            b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: CRIEW Test <criew@example.com>, Bob <bob@example.com>\r\nCc: Alice <alice@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
         )
         .expect("write raw reply fixture");
 
@@ -2680,7 +2724,7 @@ fn mail_preview_e_opens_reply_panel_with_autofilled_headers() {
     );
 
     let panel = state.reply_panel.as_ref().expect("reply panel should open");
-    assert_eq!(panel.from, "Courier Test <courier@example.com>");
+    assert_eq!(panel.from, "CRIEW Test <criew@example.com>");
     assert_eq!(panel.to, "Bob <bob@example.com>");
     assert_eq!(panel.cc, "Alice <alice@example.com>");
     assert_eq!(panel.subject, "Re: [PATCH] demo");
@@ -2987,7 +3031,7 @@ fn reply_preview_validation_blocks_confirm_on_missing_recipients() {
     );
     if let Some(panel) = state.reply_panel.as_mut() {
         panel.to.clear();
-        panel.cc = "courier@example.com".to_string();
+        panel.cc = "criew@example.com".to_string();
     }
 
     let _ = handle_key_event(

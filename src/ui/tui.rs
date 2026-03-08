@@ -1,4 +1,4 @@
-//! Ratatui-based interface for Courier's interactive workflow.
+//! Ratatui-based interface for CRIEW's interactive workflow.
 //!
 //! Rendering details are split into submodules, but the top-level state
 //! machine stays here so key handling, background work, and side effects remain
@@ -22,7 +22,7 @@ use crate::domain::subscriptions::{
 };
 use crate::infra::bootstrap::BootstrapState;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::mail_store::{self, ThreadRow};
 use crate::infra::reply_store::{self, ReplySendRecordRequest, ReplySendStatus};
 use crate::infra::sendmail::{self, SendOutcome, SendRequest, SendStatus};
@@ -129,11 +129,11 @@ struct LastApplySnapshot {
 const PALETTE_COMMANDS: &[PaletteCommand] = &[
     PaletteCommand {
         name: "quit",
-        description: "Exit Courier",
+        description: "Exit CRIEW",
     },
     PaletteCommand {
         name: "exit",
-        description: "Exit Courier",
+        description: "Exit CRIEW",
     },
     PaletteCommand {
         name: "help",
@@ -232,11 +232,11 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
     },
     ConfigEditorField {
         key: "logging.filter",
-        description: "Tracing/logging filter level for Courier runtime logs.",
+        description: "Tracing/logging filter level for CRIEW runtime logs.",
     },
     ConfigEditorField {
         key: "logging.dir",
-        description: "Directory where Courier writes runtime log files.",
+        description: "Directory where CRIEW writes runtime log files.",
     },
     ConfigEditorField {
         key: "storage.data_dir",
@@ -1204,7 +1204,7 @@ impl AppState {
             preview_scroll: 0,
             selected_mail_preview: None,
             started_at: Instant::now(),
-            status: "ready".to_string(),
+            status: String::new(),
             last_apply_snapshot: None,
             palette: CommandPaletteState::default(),
             search: SearchState::default(),
@@ -1450,23 +1450,25 @@ impl AppState {
     fn startup_sync_progress_text(&self) -> Option<String> {
         self.startup_sync
             .as_ref()
-            .map(|state| format!("sync: {}", state.progress_summary()))
+            .map(|state| {
+                let running = state.inflight_mailboxes_display();
+                if running == "-" {
+                    format!("sync {}/{}", state.completed, state.total)
+                } else {
+                    format!("sync {} {}/{}", running, state.completed, state.total)
+                }
+            })
             .or_else(|| {
                 self.inbox_auto_sync
                     .as_ref()
                     .filter(|state| state.in_flight())
-                    .map(|_| "sync: inbox auto-sync running=INBOX".to_string())
+                    .map(|_| "sync INBOX".to_string())
             })
             .or_else(|| {
                 self.subscription_auto_sync
                     .as_ref()
                     .filter(|state| state.in_flight())
-                    .map(|state| {
-                        format!(
-                            "sync: subscription auto-sync running={}",
-                            state.inflight_mailboxes_display()
-                        )
-                    })
+                    .map(|state| format!("sync {}", state.inflight_mailboxes_display()))
             })
     }
 
@@ -2701,7 +2703,7 @@ impl AppState {
             self.open_reply_notice(
                 ReplyNoticeKind::Warning,
                 "Send Blocked",
-                "You must open Send Preview and confirm it before Courier will send this reply.",
+                "You must open Send Preview and confirm it before CRIEW will send this reply.",
                 "P preview | Esc/Enter close",
                 Some(ReplyNoticeAction::OpenPreview),
                 "send blocked: run Send Preview and confirm first",
@@ -3759,7 +3761,7 @@ where
                 "unknown panic payload".to_string()
             };
 
-            Err(CourierError::new(
+            Err(CriewError::new(
                 ErrorCode::Tui,
                 format!("sync panicked for {mailbox}: {message}"),
             ))
@@ -4028,7 +4030,7 @@ pub fn run(config: &RuntimeConfig, bootstrap: &BootstrapState) -> Result<TuiActi
     if state.filtered_thread_indices.is_empty()
         && !state.recover_from_empty_active_mailbox("active mailbox has no local data")
     {
-        state.status = "no synced thread data, run `courier sync` first".to_string();
+        state.status = "no synced thread data, run `criew sync` first".to_string();
     }
     state.start_startup_sync_if_enabled();
 
@@ -4054,17 +4056,17 @@ fn load_persisted_ui_state(path: &std::path::Path) -> Option<UiState> {
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode().map_err(|error| {
-        CourierError::with_source(ErrorCode::Tui, "failed to enable raw mode", error)
+        CriewError::with_source(ErrorCode::Tui, "failed to enable raw mode", error)
     })?;
 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(|error| {
-        CourierError::with_source(ErrorCode::Tui, "failed to enter alternate screen", error)
+        CriewError::with_source(ErrorCode::Tui, "failed to enter alternate screen", error)
     })?;
 
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Tui,
             "failed to initialize terminal backend",
             error,
@@ -4091,24 +4093,24 @@ fn tui_loop(
 
         if state.take_terminal_refresh_needed() {
             terminal.clear().map_err(|error| {
-                CourierError::with_source(ErrorCode::Tui, "failed to clear terminal", error)
+                CriewError::with_source(ErrorCode::Tui, "failed to clear terminal", error)
             })?;
             terminal.hide_cursor().map_err(|error| {
-                CourierError::with_source(ErrorCode::Tui, "failed to hide terminal cursor", error)
+                CriewError::with_source(ErrorCode::Tui, "failed to hide terminal cursor", error)
             })?;
         }
 
         terminal
             .draw(|frame| draw(frame, state, config, bootstrap))
             .map_err(|error| {
-                CourierError::with_source(ErrorCode::Tui, "failed to render frame", error)
+                CriewError::with_source(ErrorCode::Tui, "failed to render frame", error)
             })?;
 
         if event::poll(Duration::from_millis(200)).map_err(|error| {
-            CourierError::with_source(ErrorCode::Tui, "failed to poll terminal events", error)
+            CriewError::with_source(ErrorCode::Tui, "failed to poll terminal events", error)
         })? {
             let event = event::read().map_err(|error| {
-                CourierError::with_source(ErrorCode::Tui, "failed to read terminal event", error)
+                CriewError::with_source(ErrorCode::Tui, "failed to read terminal event", error)
             })?;
 
             if let Event::Key(key) = event {

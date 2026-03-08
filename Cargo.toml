@@ -1,7 +1,36 @@
 [package]
-name = "courier"
+name = "criew"
+authors = ["Chen Miao"]
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.85"
+description = "Terminal-first Linux kernel patch mail workflow TUI"
+readme = "README.md"
+license-file = "LICENSE"
+homepage = "https://github.com/ChenMiaoi/CRIEW"
+repository = "https://github.com/ChenMiaoi/CRIEW"
+documentation = "https://docs.rs/criew"
+keywords = ["tui", "email", "patch", "kernel", "workflow"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/README-zh.md",
+    "/build.rs",
+    "/docs/**",
+    "/migrations/**",
+    "/src/**",
+    "/vendor/b4/b4.sh",
+    "/vendor/b4/COPYING",
+    "/vendor/b4/src/b4/*.py",
+    "/vendor/b4/src/b4/templates/*.example",
+    "/vendor/b4/src/b4/man/b4.5",
+    "/vendor/b4/src/b4/man/b4.5.rst",
+    "/vendor/b4/patatt/COPYING",
+    "/vendor/b4/patatt/patatt/*.py",
+]
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

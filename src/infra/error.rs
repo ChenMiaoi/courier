@@ -1,6 +1,6 @@
 //! Shared error types and stable error codes.
 //!
-//! Courier reports failures to humans through stderr, logs, and status lines.
+//! CRIEW reports failures to humans through stderr, logs, and status lines.
 //! Centralizing the envelope here keeps those surfaces aligned on one error
 //! taxonomy instead of each layer inventing its own wording and exit mapping.
 
@@ -9,7 +9,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, CourierError>;
+pub type Result<T> = std::result::Result<T, CriewError>;
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -66,7 +66,7 @@ impl fmt::Display for ErrorCode {
 }
 
 #[derive(Debug, Error)]
-pub enum CourierError {
+pub enum CriewError {
     #[error("{code}: {message}")]
     Message { code: ErrorCode, message: String },
     #[error("{code}: {message}: {source}")]
@@ -78,7 +78,7 @@ pub enum CourierError {
     },
 }
 
-impl CourierError {
+impl CriewError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self::Message {
             code,

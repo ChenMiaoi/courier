@@ -1,4 +1,4 @@
-//! Command-line surface for Courier.
+//! Command-line surface for CRIEW.
 //!
 //! The CLI stays intentionally compact: clap defines the public verbs here,
 //! while validation and side-effecting policy remain in the application layer
@@ -9,7 +9,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "courier", about = "Courier MVP CLI", version)]
+#[command(
+    name = "criew",
+    about = "Terminal-first Linux kernel patch mail workflow TUI",
+    version
+)]
 pub struct Cli {
     /// Override config file path.
     #[arg(long, global = true, value_name = "FILE")]
@@ -21,7 +25,7 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Command {
-    /// Start Courier TUI.
+    /// Start CRIEW TUI.
     Tui,
     /// Execute mailbox sync worker.
     Sync {
@@ -41,6 +45,6 @@ pub enum Command {
     },
     /// Run environment diagnostics.
     Doctor,
-    /// Print Courier version.
+    /// Print CRIEW version.
     Version,
 }

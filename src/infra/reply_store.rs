@@ -1,13 +1,13 @@
 //! Persistence for reply-send history.
 //!
 //! Send attempts are stored separately from the live reply composer state so
-//! Courier can retain an audit trail even after the TUI session exits.
+//! CRIEW can retain an audit trail even after the TUI session exits.
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplySendStatus {
@@ -125,7 +125,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?
             ],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!(
                     "failed to persist reply send record for mail {} thread {}",
@@ -183,7 +183,7 @@ LIMIT 1
         )
         .optional()
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to load latest reply send record for mail {mail_id}"),
                 error,
@@ -193,7 +193,7 @@ LIMIT 1
 
 fn open_connection(path: &Path) -> Result<Connection> {
     Connection::open(path).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             format!("failed to open sqlite database {}", path.display()),
             error,
@@ -224,7 +224,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-reply-store-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-reply-store-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn persists_and_loads_latest_reply_send_record() {
         let root = temp_dir("latest");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         db::initialize(&db_path).expect("initialize db");
         let connection = Connection::open(&db_path).expect("open db");
         connection

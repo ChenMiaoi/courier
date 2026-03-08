@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiState {
@@ -84,7 +84,7 @@ pub fn load(path: &Path) -> Result<Option<UiState>> {
     }
 
     let content = fs::read_to_string(path).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!("failed to read ui state {}", path.display()),
             error,
@@ -92,7 +92,7 @@ pub fn load(path: &Path) -> Result<Option<UiState>> {
     })?;
 
     let state = toml::from_str::<UiState>(&content).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::ConfigParse,
             format!("failed to parse ui state {}", path.display()),
             error,
@@ -105,7 +105,7 @@ pub fn load(path: &Path) -> Result<Option<UiState>> {
 pub fn save(path: &Path, state: &UiState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Io,
                 format!("failed to create ui state directory {}", parent.display()),
                 error,
@@ -114,7 +114,7 @@ pub fn save(path: &Path, state: &UiState) -> Result<()> {
     }
 
     let content = toml::to_string_pretty(state).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::ConfigParse,
             format!("failed to serialize ui state {}", path.display()),
             error,
@@ -122,7 +122,7 @@ pub fn save(path: &Path, state: &UiState) -> Result<()> {
     })?;
 
     fs::write(path, content).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!("failed to write ui state {}", path.display()),
             error,
@@ -145,7 +145,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-ui-state-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-ui-state-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }

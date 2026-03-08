@@ -1,6 +1,6 @@
 //! Minimal mail-header parsing used by sync and reply flows.
 //!
-//! Courier only needs a narrow subset of RFC mail parsing for threading and
+//! CRIEW only needs a narrow subset of RFC mail parsing for threading and
 //! reply generation, so this module deliberately extracts just the fields that
 //! affect visible behavior instead of pulling a heavier MIME model everywhere.
 

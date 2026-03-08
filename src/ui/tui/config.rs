@@ -1,6 +1,6 @@
 //! Config-editor interactions rendered inside the TUI.
 //!
-//! Editing config in-process lets Courier validate and apply changes against
+//! Editing config in-process lets CRIEW validate and apply changes against
 //! the same runtime normalization rules used at startup, instead of teaching
 //! the UI a second config model.
 

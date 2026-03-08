@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::mail_parser::{ParsedMailHeaders, normalize_subject};
 
 #[derive(Debug, Clone)]
@@ -108,7 +108,7 @@ pub fn load_mailbox_state(path: &Path, mailbox: &str) -> Result<Option<MailboxSt
         )
         .optional()
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to load mailbox checkpoint for '{mailbox}'"),
                 error,
@@ -125,7 +125,7 @@ pub fn mailbox_message_count(path: &Path, mailbox: &str) -> Result<usize> {
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to count mails for mailbox '{mailbox}'"),
                 error,
@@ -141,7 +141,7 @@ where
 {
     let mut connection = open_connection(path)?;
     let tx = connection.transaction().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             "failed to open mailbox prune transaction",
             error,
@@ -155,7 +155,7 @@ where
                 "SELECT id, subject, raw_path FROM mail WHERE imap_mailbox = ?1 AND is_expunged = 0",
             )
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     format!("failed to prepare mailbox prune query for '{mailbox}'"),
                     error,
@@ -171,7 +171,7 @@ where
                 ))
             })
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     format!("failed to query mailbox prune candidates for '{mailbox}'"),
                     error,
@@ -180,7 +180,7 @@ where
 
         for row in rows {
             let (mail_id, subject, raw_path) = row.map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     "failed to decode mailbox prune candidate row",
                     error,
@@ -194,7 +194,7 @@ where
 
     if pruned_mail_ids.is_empty() {
         tx.commit().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to commit no-op mailbox prune transaction",
                 error,
@@ -206,7 +206,7 @@ where
     for (mail_id, _) in &pruned_mail_ids {
         tx.execute("DELETE FROM mail WHERE id = ?1", params![mail_id])
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     format!("failed to delete pruned mail {}", mail_id),
                     error,
@@ -218,7 +218,7 @@ where
     let _ = rebuild_all_threads_tx(&tx, &build)?;
 
     tx.commit().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             format!("failed to commit mailbox prune for '{mailbox}'"),
             error,
@@ -251,7 +251,7 @@ where
 pub fn rebuild_all_threads(path: &Path) -> Result<usize> {
     let mut connection = open_connection(path)?;
     let tx = connection.transaction().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             "failed to open thread rebuild transaction",
             error,
@@ -262,7 +262,7 @@ pub fn rebuild_all_threads(path: &Path) -> Result<usize> {
     let rebuilt = rebuild_all_threads_tx(&tx, &build)?;
 
     tx.commit().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             "failed to commit thread rebuild transaction",
             error,
@@ -275,7 +275,7 @@ pub fn rebuild_all_threads(path: &Path) -> Result<usize> {
 pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult> {
     let mut connection = open_connection(path)?;
     let tx = connection.transaction().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             "failed to open sync transaction",
             error,
@@ -296,7 +296,7 @@ pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult
             params![batch.mailbox],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to clear mailbox rows after UIDVALIDITY change",
                 error,
@@ -350,7 +350,7 @@ pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult
     let state = persist_mailbox_state_tx(&tx, &batch, previous_state.as_ref())?;
 
     tx.commit().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             "failed to commit sync transaction",
             error,
@@ -400,7 +400,7 @@ LIMIT ?2
 ",
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to prepare mailbox-specific thread query",
                 error,
@@ -410,7 +410,7 @@ LIMIT ?2
     let rows = statement
         .query_map(params![mailbox, limit as i64], map_thread_row)
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to query thread rows for mailbox '{mailbox}'"),
                 error,
@@ -440,7 +440,7 @@ fn collect_thread_rows(
     let mut collected = Vec::new();
     for row in rows {
         collected.push(row.map_err(|error| {
-            CourierError::with_source(ErrorCode::Database, "failed to decode thread row", error)
+            CriewError::with_source(ErrorCode::Database, "failed to decode thread row", error)
         })?);
     }
 
@@ -449,7 +449,7 @@ fn collect_thread_rows(
 
 fn open_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             format!("failed to open sqlite database {}", path.display()),
             error,
@@ -459,7 +459,7 @@ fn open_connection(path: &Path) -> Result<Connection> {
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to enable sqlite foreign key support",
                 error,
@@ -485,7 +485,7 @@ fn load_mailbox_state_tx(tx: &Transaction<'_>, mailbox: &str) -> Result<Option<M
     )
     .optional()
     .map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             format!("failed to load mailbox checkpoint for '{mailbox}'"),
             error,
@@ -525,7 +525,7 @@ ON CONFLICT(mailbox) DO UPDATE SET
         ],
     )
     .map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Database,
             "failed to persist mailbox checkpoint",
             error,
@@ -533,7 +533,7 @@ ON CONFLICT(mailbox) DO UPDATE SET
     })?;
 
     load_mailbox_state_tx(tx, &batch.mailbox)?.ok_or_else(|| {
-        CourierError::new(
+        CriewError::new(
             ErrorCode::Database,
             format!(
                 "missing mailbox checkpoint after update for '{}'",
@@ -552,7 +552,7 @@ fn upsert_mail_tx(tx: &Transaction<'_>, mail: &IncomingMail) -> Result<(i64, boo
         )
         .optional()
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!(
                     "failed to lookup existing mail by message id '{}'",
@@ -601,7 +601,7 @@ WHERE id = ?11
             ],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!(
                     "failed to update mail row for message id '{}'",
@@ -646,7 +646,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
             ],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!(
                     "failed to insert mail row for message id '{}'",
@@ -661,7 +661,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
 
     tx.execute("DELETE FROM mail_ref WHERE mail_id = ?1", params![mail_id])
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to clear references for mail id {}", mail_id),
                 error,
@@ -674,7 +674,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)
             params![mail_id, reference, index as i64],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!(
                     "failed to insert reference '{}' for mail id {}",
@@ -707,7 +707,7 @@ WHERE m.in_reply_to = ?1 OR r.ref_message_id = ?1
 ",
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to prepare affected mail query",
                 error,
@@ -720,7 +720,7 @@ WHERE m.in_reply_to = ?1 OR r.ref_message_id = ?1
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     "failed to query affected mail rows",
                     error,
@@ -729,7 +729,7 @@ WHERE m.in_reply_to = ?1 OR r.ref_message_id = ?1
 
         for row in rows {
             let (mail_id, child_message_id) = row.map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     "failed to decode affected mail row",
                     error,
@@ -754,7 +754,7 @@ fn load_stale_roots_tx(
     let mut statement = tx
         .prepare("SELECT root_mail_id FROM thread_node WHERE mail_id = ?1")
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to prepare stale root query",
                 error,
@@ -766,7 +766,7 @@ fn load_stale_roots_tx(
             .query_row(params![mail_id], |row| row.get::<_, Option<i64>>(0))
             .optional()
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     format!("failed to query stale root for mail {}", mail_id),
                     error,
@@ -813,7 +813,7 @@ WHERE is_expunged = 0
 ",
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to prepare mail graph query",
                 error,
@@ -834,7 +834,7 @@ WHERE is_expunged = 0
             })
         })
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to query mail graph rows",
                 error,
@@ -843,7 +843,7 @@ WHERE is_expunged = 0
 
     for row in mail_rows {
         let node = row.map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to decode mail graph row",
                 error,
@@ -862,7 +862,7 @@ WHERE is_expunged = 0
     let mut ref_statement = tx
         .prepare("SELECT mail_id, ref_message_id FROM mail_ref ORDER BY mail_id, ord ASC")
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 "failed to prepare mail_ref graph query",
                 error,
@@ -874,12 +874,12 @@ WHERE is_expunged = 0
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(|error| {
-            CourierError::with_source(ErrorCode::Database, "failed to query mail_ref rows", error)
+            CriewError::with_source(ErrorCode::Database, "failed to query mail_ref rows", error)
         })?;
 
     for row in ref_rows {
         let (mail_id, ref_id) = row.map_err(|error| {
-            CourierError::with_source(ErrorCode::Database, "failed to decode mail_ref row", error)
+            CriewError::with_source(ErrorCode::Database, "failed to decode mail_ref row", error)
         })?;
         refs_map.entry(mail_id).or_default().push(ref_id);
     }
@@ -1025,10 +1025,10 @@ fn resolve_thread_assignment(
 
 fn rebuild_all_threads_tx(tx: &Transaction<'_>, build: &ThreadBuild) -> Result<usize> {
     tx.execute("DELETE FROM thread_node", []).map_err(|error| {
-        CourierError::with_source(ErrorCode::Database, "failed to clear thread_node", error)
+        CriewError::with_source(ErrorCode::Database, "failed to clear thread_node", error)
     })?;
     tx.execute("DELETE FROM thread", []).map_err(|error| {
-        CourierError::with_source(ErrorCode::Database, "failed to clear thread", error)
+        CriewError::with_source(ErrorCode::Database, "failed to clear thread", error)
     })?;
 
     let roots: HashSet<i64> = build.groups.keys().copied().collect();
@@ -1050,7 +1050,7 @@ fn rebuild_thread_roots_tx(
             params![root_mail_id],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to delete stale thread for root {}", root_mail_id),
                 error,
@@ -1092,7 +1092,7 @@ VALUES (?1, ?2, ?3, ?4)
             ],
         )
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Database,
                 format!("failed to insert thread for root {}", root_mail_id),
                 error,
@@ -1102,7 +1102,7 @@ VALUES (?1, ?2, ?3, ?4)
 
         for mail_id in group_mail_ids {
             let assignment = build.assignments.get(mail_id).copied().ok_or_else(|| {
-                CourierError::new(
+                CriewError::new(
                     ErrorCode::Database,
                     format!("missing thread assignment for mail {}", mail_id),
                 )
@@ -1129,7 +1129,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ],
             )
             .map_err(|error| {
-                CourierError::with_source(
+                CriewError::with_source(
                     ErrorCode::Database,
                     format!("failed to insert thread node for mail {}", mail_id),
                     error,
@@ -1154,7 +1154,7 @@ fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
 
 fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| {
-        CourierError::new(
+        CriewError::new(
             ErrorCode::Database,
             format!("u64 value {} overflows i64 sqlite field", value),
         )
@@ -1183,7 +1183,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-mail-store-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-mail-store-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -1203,7 +1203,7 @@ mod tests {
     #[test]
     fn repeated_sync_is_idempotent() {
         let root = temp_dir("idempotent");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         db::initialize(&db_path).expect("initialize db");
 
         let first_batch = SyncBatch {
@@ -1245,7 +1245,7 @@ mod tests {
     #[test]
     fn uidvalidity_change_rebuilds_mailbox() {
         let root = temp_dir("uidvalidity");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         db::initialize(&db_path).expect("initialize db");
 
         let batch_a = SyncBatch {
@@ -1299,7 +1299,7 @@ mod tests {
     #[test]
     fn checkpoint_advances_between_batches() {
         let root = temp_dir("checkpoint");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         db::initialize(&db_path).expect("initialize db");
 
         let batch_one = SyncBatch {
@@ -1347,7 +1347,7 @@ mod tests {
     #[test]
     fn prune_mailbox_subjects_removes_non_matching_rows() {
         let root = temp_dir("prune-mailbox");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         db::initialize(&db_path).expect("initialize db");
 
         let batch = SyncBatch {
@@ -1390,7 +1390,7 @@ mod tests {
     #[test]
     fn threading_prefers_references_then_in_reply_to() {
         let root = temp_dir("threading");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         db::initialize(&db_path).expect("initialize db");
 
         let batch = SyncBatch {
@@ -1456,7 +1456,7 @@ WHERE m.message_id = 'grand@example.com'
     #[test]
     fn mailbox_thread_rows_do_not_interleave_threads_when_activity_ties() {
         let root = temp_dir("thread-row-order");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         db::initialize(&db_path).expect("initialize db");
 
         let batch = SyncBatch {
@@ -1528,7 +1528,7 @@ WHERE m.message_id = 'grand@example.com'
     #[test]
     fn mailbox_thread_rows_order_threads_by_mail_date_not_insert_time() {
         let root = temp_dir("thread-date-order");
-        let db_path = root.join("courier.db");
+        let db_path = root.join("criew.db");
         db::initialize(&db_path).expect("initialize db");
 
         let newer_thread = SyncBatch {

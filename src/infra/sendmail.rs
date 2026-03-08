@@ -641,7 +641,7 @@ fn normalize_message_id(value: &str) -> String {
 
 fn render_message_file(request: &SendRequest, message_id: &str) -> String {
     // Emit a complete RFC822-style draft so `git send-email` handles transport
-    // and SMTP concerns while Courier keeps ownership of message content.
+    // and SMTP concerns while CRIEW keeps ownership of message content.
     let mut lines = vec![
         format!("From: {}", request.from),
         format!("To: {}", request.to.join(", ")),
@@ -709,7 +709,7 @@ fn generate_message_id(from: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("courier-{nonce}-{}@{domain}", std::process::id())
+    format!("criew-{nonce}-{}@{domain}", std::process::id())
 }
 
 fn resolve_working_dir(runtime: &RuntimeConfig) -> PathBuf {
@@ -808,7 +808,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-sendmail-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-sendmail-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -817,7 +817,7 @@ mod tests {
         RuntimeConfig {
             config_path: root.join("config.toml"),
             data_dir: root.join("data"),
-            database_path: root.join("data/courier.db"),
+            database_path: root.join("data/criew.db"),
             raw_mail_dir: root.join("data/raw"),
             patch_dir: root.join("data/patches"),
             log_dir: root.join("data/logs"),
@@ -846,7 +846,7 @@ mod tests {
         SendRequest {
             mail_id: 3,
             thread_id: 9,
-            from: "Courier Test <courier@example.com>".to_string(),
+            from: "CRIEW Test <criew@example.com>".to_string(),
             to: vec!["maintainer@example.com".to_string()],
             cc: vec!["list@example.com".to_string()],
             subject: "Re: [PATCH] demo".to_string(),
@@ -900,13 +900,13 @@ mod tests {
         let root = temp_dir("identity");
         let fake_git = write_fake_git(
             &root,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"sendemail.from\" ]; then\n  echo 'Courier Test <courier@example.com>'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.email\" ]; then\n  echo 'fallback@example.com'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.name\" ]; then\n  echo 'Fallback User'\n  exit 0\nfi\nexit 1\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"sendemail.from\" ]; then\n  echo 'CRIEW Test <criew@example.com>'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.email\" ]; then\n  echo 'fallback@example.com'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.name\" ]; then\n  echo 'Fallback User'\n  exit 0\nfi\nexit 1\n",
         );
 
         let identity = resolve_reply_identity_with_command_path(Some(&fake_git))
             .expect("resolve reply identity");
-        assert_eq!(identity.display, "Courier Test <courier@example.com>");
-        assert_eq!(identity.email, "courier@example.com");
+        assert_eq!(identity.display, "CRIEW Test <criew@example.com>");
+        assert_eq!(identity.email, "criew@example.com");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -932,7 +932,7 @@ mod tests {
         assert!(outcome.draft_path.is_none());
 
         let captured = fs::read_to_string(&capture).expect("read captured message");
-        assert!(captured.contains("From: Courier Test <courier@example.com>"));
+        assert!(captured.contains("From: CRIEW Test <criew@example.com>"));
         assert!(captured.contains("To: maintainer@example.com"));
         assert!(captured.contains("Cc: list@example.com"));
         assert!(captured.contains("Subject: Re: [PATCH] demo"));
@@ -942,7 +942,7 @@ mod tests {
         let captured_args = fs::read_to_string(&capture_args).expect("read captured args");
         assert!(captured_args.contains("--confirm=never"));
         assert!(captured_args.contains("--from"));
-        assert!(captured_args.contains("Courier Test <courier@example.com>"));
+        assert!(captured_args.contains("CRIEW Test <criew@example.com>"));
         assert!(captured_args.contains("--to"));
         assert!(captured_args.contains("maintainer@example.com"));
         assert!(captured_args.contains("--cc"));

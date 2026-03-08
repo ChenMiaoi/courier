@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 
 static INIT: Once = Once::new();
 static LOG_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
@@ -21,7 +21,7 @@ pub fn init(default_filter: &str, log_dir: &Path) -> Result<()> {
 
     INIT.call_once(|| {
         if let Err(err) = std::fs::create_dir_all(log_dir) {
-            result = Err(CourierError::with_source(
+            result = Err(CriewError::with_source(
                 ErrorCode::LoggingInit,
                 format!("failed to create log directory {}", log_dir.display()),
                 err,
@@ -33,7 +33,7 @@ pub fn init(default_filter: &str, log_dir: &Path) -> Result<()> {
             .or_else(|_| EnvFilter::try_new(default_filter))
             .unwrap_or_else(|_| EnvFilter::new("info"));
 
-        let appender = tracing_appender::rolling::daily(log_dir, "courier.log");
+        let appender = tracing_appender::rolling::daily(log_dir, "criew.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
         // Dropping the guard early can lose buffered log lines during shutdown,
         // so store it in a process-wide cell once initialization succeeds.
@@ -59,7 +59,7 @@ pub fn init(default_filter: &str, log_dir: &Path) -> Result<()> {
             .with(error_file_layer)
             .try_init()
         {
-            result = Err(CourierError::new(
+            result = Err(CriewError::new(
                 ErrorCode::LoggingInit,
                 format!("failed to initialize tracing subscriber: {err}"),
             ));

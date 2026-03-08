@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::app::patch as patch_worker;
 use crate::domain::subscriptions::uses_gnu_qemu_archive;
 use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::imap::{
     FixtureImapClient, GnuArchiveClient, ImapClient, LoreImapClient, RemoteImapClient, RemoteMail,
 };
@@ -86,7 +86,7 @@ impl SyncSource {
 pub fn run(config: &RuntimeConfig, request: SyncRequest) -> Result<SyncSummary> {
     let source = resolve_sync_source(config, &request)?;
     let attempts = request.reconnect_attempts.max(1);
-    let mut last_error: Option<CourierError> = None;
+    let mut last_error: Option<CriewError> = None;
 
     for attempt in 1..=attempts {
         match run_once(config, &request.mailbox, &source) {
@@ -109,7 +109,7 @@ pub fn run(config: &RuntimeConfig, request: SyncRequest) -> Result<SyncSummary> 
     }
 
     Err(last_error.unwrap_or_else(|| {
-        CourierError::new(
+        CriewError::new(
             ErrorCode::Imap,
             format!("sync failed after {} attempts", attempts),
         )
@@ -132,7 +132,7 @@ fn resolve_sync_source(config: &RuntimeConfig, request: &SyncRequest) -> Result<
             return Ok(SyncSource::Imap);
         }
 
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Imap,
             format!(
                 "IMAP config is incomplete for {}: missing {}",
@@ -514,7 +514,7 @@ fn persist_raw_mail(
 ) -> Result<PathBuf> {
     let mailbox_dir = config.raw_mail_dir.join(mailbox);
     fs::create_dir_all(&mailbox_dir).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!(
                 "failed to create raw mail directory {}",
@@ -528,7 +528,7 @@ fn persist_raw_mail(
     // makes fixture inspection and manual debugging much easier.
     let path = mailbox_dir.join(format!("{:010}.eml", uid));
     fs::write(&path, raw).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!("failed to write raw mail file {}", path.display()),
             error,
@@ -564,7 +564,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-sync-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-sync-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -575,7 +575,7 @@ mod tests {
         let fixture_dir = root.join("fixture");
         let data_dir = root.join("data");
         let raw_dir = data_dir.join("raw");
-        let db_path = data_dir.join("courier.db");
+        let db_path = data_dir.join("criew.db");
         fs::create_dir_all(&fixture_dir).expect("create fixture dir");
         fs::create_dir_all(&raw_dir).expect("create raw dir");
 
@@ -696,7 +696,7 @@ mod tests {
         let fixture_dir = root.join("fixture");
         let data_dir = root.join("data");
         let raw_dir = data_dir.join("raw");
-        let db_path = data_dir.join("courier.db");
+        let db_path = data_dir.join("criew.db");
         fs::create_dir_all(&fixture_dir).expect("create fixture dir");
         fs::create_dir_all(&raw_dir).expect("create raw dir");
 
@@ -764,7 +764,7 @@ mod tests {
         let fixture_dir = root.join("fixture");
         let data_dir = root.join("data");
         let raw_dir = data_dir.join("raw");
-        let db_path = data_dir.join("courier.db");
+        let db_path = data_dir.join("criew.db");
         fs::create_dir_all(&fixture_dir).expect("create fixture dir");
         fs::create_dir_all(&raw_dir).expect("create raw dir");
 
@@ -833,12 +833,12 @@ mod tests {
     #[test]
     fn my_inbox_routes_to_real_imap_when_config_is_complete() {
         let runtime = RuntimeConfig {
-            config_path: PathBuf::from("/tmp/courier-sync-route.toml"),
-            data_dir: PathBuf::from("/tmp/courier-sync-route-data"),
-            database_path: PathBuf::from("/tmp/courier-sync-route.db"),
-            raw_mail_dir: PathBuf::from("/tmp/courier-sync-route-raw"),
-            patch_dir: PathBuf::from("/tmp/courier-sync-route-patches"),
-            log_dir: PathBuf::from("/tmp/courier-sync-route-logs"),
+            config_path: PathBuf::from("/tmp/criew-sync-route.toml"),
+            data_dir: PathBuf::from("/tmp/criew-sync-route-data"),
+            database_path: PathBuf::from("/tmp/criew-sync-route.db"),
+            raw_mail_dir: PathBuf::from("/tmp/criew-sync-route-raw"),
+            patch_dir: PathBuf::from("/tmp/criew-sync-route-patches"),
+            log_dir: PathBuf::from("/tmp/criew-sync-route-logs"),
             b4_path: None,
             log_filter: "info".to_string(),
             source_mailbox: "io-uring".to_string(),
@@ -875,12 +875,12 @@ mod tests {
     #[test]
     fn lore_subscriptions_stay_on_lore_when_imap_is_configured() {
         let runtime = RuntimeConfig {
-            config_path: PathBuf::from("/tmp/courier-sync-route.toml"),
-            data_dir: PathBuf::from("/tmp/courier-sync-route-data"),
-            database_path: PathBuf::from("/tmp/courier-sync-route.db"),
-            raw_mail_dir: PathBuf::from("/tmp/courier-sync-route-raw"),
-            patch_dir: PathBuf::from("/tmp/courier-sync-route-patches"),
-            log_dir: PathBuf::from("/tmp/courier-sync-route-logs"),
+            config_path: PathBuf::from("/tmp/criew-sync-route.toml"),
+            data_dir: PathBuf::from("/tmp/criew-sync-route-data"),
+            database_path: PathBuf::from("/tmp/criew-sync-route.db"),
+            raw_mail_dir: PathBuf::from("/tmp/criew-sync-route-raw"),
+            patch_dir: PathBuf::from("/tmp/criew-sync-route-patches"),
+            log_dir: PathBuf::from("/tmp/criew-sync-route-logs"),
             b4_path: None,
             log_filter: "info".to_string(),
             source_mailbox: "io-uring".to_string(),
@@ -917,12 +917,12 @@ mod tests {
     #[test]
     fn qemu_subscriptions_route_to_gnu_archive() {
         let runtime = RuntimeConfig {
-            config_path: PathBuf::from("/tmp/courier-sync-route.toml"),
-            data_dir: PathBuf::from("/tmp/courier-sync-route-data"),
-            database_path: PathBuf::from("/tmp/courier-sync-route.db"),
-            raw_mail_dir: PathBuf::from("/tmp/courier-sync-route-raw"),
-            patch_dir: PathBuf::from("/tmp/courier-sync-route-patches"),
-            log_dir: PathBuf::from("/tmp/courier-sync-route-logs"),
+            config_path: PathBuf::from("/tmp/criew-sync-route.toml"),
+            data_dir: PathBuf::from("/tmp/criew-sync-route-data"),
+            database_path: PathBuf::from("/tmp/criew-sync-route.db"),
+            raw_mail_dir: PathBuf::from("/tmp/criew-sync-route-raw"),
+            patch_dir: PathBuf::from("/tmp/criew-sync-route-patches"),
+            log_dir: PathBuf::from("/tmp/criew-sync-route-logs"),
             b4_path: None,
             log_filter: "info".to_string(),
             source_mailbox: "qemu-rust".to_string(),

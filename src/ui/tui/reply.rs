@@ -641,8 +641,8 @@ mod tests {
 
     fn identity() -> ReplyIdentity {
         ReplyIdentity {
-            display: "Courier Test <courier@example.com>".to_string(),
-            email: "courier@example.com".to_string(),
+            display: "CRIEW Test <criew@example.com>".to_string(),
+            email: "criew@example.com".to_string(),
         }
     }
 
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn build_reply_seed_dedups_and_removes_self() {
-        let raw = b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Courier Test <courier@example.com>, Bob <bob@example.com>\r\nCc: Bob <bob@example.com>; Alice <alice@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n";
+        let raw = b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: CRIEW Test <criew@example.com>, Bob <bob@example.com>\r\nCc: Bob <bob@example.com>; Alice <alice@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n";
         let thread = sample_thread("[PATCH] demo", "patch@example.com");
 
         let seed = build_reply_seed(
@@ -674,7 +674,7 @@ mod tests {
             &[identity().email.clone(), "alias@example.com".to_string()],
         );
 
-        assert_eq!(seed.from, "Courier Test <courier@example.com>");
+        assert_eq!(seed.from, "CRIEW Test <criew@example.com>");
         assert_eq!(seed.to, "Bob <bob@example.com>");
         assert_eq!(seed.cc, "Alice <alice@example.com>");
         assert_eq!(seed.subject, "Re: [PATCH] demo");
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn build_reply_seed_preserves_single_self_to() {
-        let raw = b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Courier Test <courier@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n";
+        let raw = b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: CRIEW Test <criew@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n";
         let thread = sample_thread("[PATCH] demo", "patch@example.com");
 
         let seed = build_reply_seed(
@@ -699,16 +699,16 @@ mod tests {
             &[identity().email.clone(), "alias@example.com".to_string()],
         );
 
-        assert_eq!(seed.to, "Courier Test <courier@example.com>");
+        assert_eq!(seed.to, "CRIEW Test <criew@example.com>");
         assert!(seed.cc.is_empty());
     }
 
     #[test]
     fn preview_validation_reports_missing_recipients() {
         let preview = render_reply_preview(ReplyPreviewRequest {
-            from: "Courier Test <courier@example.com>",
+            from: "CRIEW Test <criew@example.com>",
             to: "",
-            cc: "courier@example.com",
+            cc: "criew@example.com",
             subject: "Re: [PATCH] demo",
             in_reply_to: "patch@example.com",
             references: &["patch@example.com".to_string()],
@@ -729,8 +729,8 @@ mod tests {
     #[test]
     fn preview_keeps_single_self_to_recipient() {
         let preview = render_reply_preview(ReplyPreviewRequest {
-            from: "Courier Test <courier@example.com>",
-            to: "Courier Test <courier@example.com>",
+            from: "CRIEW Test <criew@example.com>",
+            to: "CRIEW Test <criew@example.com>",
             cc: "",
             subject: "Re: [PATCH] demo",
             in_reply_to: "patch@example.com",
@@ -743,7 +743,7 @@ mod tests {
         assert!(
             preview
                 .content
-                .contains("To: Courier Test <courier@example.com>")
+                .contains("To: CRIEW Test <criew@example.com>")
         );
     }
 

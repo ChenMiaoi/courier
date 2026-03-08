@@ -10,7 +10,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use super::b4_vendor;
+use crate::infra::error::{CriewError, ErrorCode, Result};
 
 #[derive(Debug, Clone)]
 pub struct B4Check {
@@ -35,6 +36,7 @@ pub struct B4CommandResult {
 
 enum Candidate {
     Path(PathBuf),
+    EmbeddedVendor(PathBuf),
     Program(String),
 }
 
@@ -44,8 +46,8 @@ struct ResolvedCommand {
     display_path: PathBuf,
 }
 
-pub fn check(configured_path: Option<&Path>) -> B4Check {
-    let candidates = candidates(configured_path);
+pub fn check(configured_path: Option<&Path>, runtime_data_dir: Option<&Path>) -> B4Check {
+    let candidates = candidates(configured_path, runtime_data_dir);
     let mut last_failure: Option<(PathBuf, String)> = None;
 
     for candidate in candidates {
@@ -75,12 +77,13 @@ pub fn check(configured_path: Option<&Path>) -> B4Check {
 
 pub fn run(
     configured_path: Option<&Path>,
+    runtime_data_dir: Option<&Path>,
     subcommand: &str,
     args: &[String],
     timeout: Duration,
     working_dir: Option<&Path>,
 ) -> Result<B4CommandResult> {
-    let resolved = resolve_command(configured_path)?;
+    let resolved = resolve_command(configured_path, runtime_data_dir)?;
 
     let mut command = Command::new(&resolved.command);
     if let Some(working_dir) = working_dir {
@@ -94,7 +97,7 @@ pub fn run(
 
     let command_line = render_command_line(&resolved.command, subcommand, args);
     let mut child = command.spawn().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::B4,
             format!(
                 "failed to spawn b4 command '{}' ({})",
@@ -122,7 +125,7 @@ pub fn run(
                 thread::sleep(Duration::from_millis(30));
             }
             Err(error) => {
-                return Err(CourierError::with_source(
+                return Err(CriewError::with_source(
                     ErrorCode::B4,
                     format!("failed while waiting for b4 command '{}'", command_line),
                     error,
@@ -132,7 +135,7 @@ pub fn run(
     }
 
     let output = child.wait_with_output().map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::B4,
             format!("failed to collect output for b4 command '{}'", command_line),
             error,
@@ -148,7 +151,7 @@ pub fn run(
     })
 }
 
-fn candidates(configured_path: Option<&Path>) -> Vec<Candidate> {
+fn candidates(configured_path: Option<&Path>, runtime_data_dir: Option<&Path>) -> Vec<Candidate> {
     let mut values = Vec::new();
 
     // Discovery order is from most explicit to most implicit so user config
@@ -157,7 +160,7 @@ fn candidates(configured_path: Option<&Path>) -> Vec<Candidate> {
         values.push(Candidate::Path(path.to_path_buf()));
     }
 
-    if let Ok(env_path) = env::var("COURIER_B4_PATH") {
+    if let Ok(env_path) = env::var("CRIEW_B4_PATH") {
         let path = PathBuf::from(env_path);
         if !path.as_os_str().is_empty() {
             values.push(Candidate::Path(path));
@@ -166,6 +169,10 @@ fn candidates(configured_path: Option<&Path>) -> Vec<Candidate> {
 
     if let Ok(cwd) = env::current_dir() {
         values.push(Candidate::Path(cwd.join("vendor/b4/b4.sh")));
+    }
+
+    if let Some(data_dir) = runtime_data_dir {
+        values.push(Candidate::EmbeddedVendor(data_dir.to_path_buf()));
     }
 
     values.push(Candidate::Program("b4".to_string()));
@@ -193,6 +200,17 @@ fn probe(candidate: &Candidate) -> Probe {
                 return Probe::Missing;
             }
             run_probe(path, path, path.display().to_string())
+        }
+        Candidate::EmbeddedVendor(data_dir) => {
+            let script_path = b4_vendor::script_path(data_dir);
+            match b4_vendor::ensure_installed(data_dir) {
+                Ok(Some(path)) => run_probe(&path, &path, path.display().to_string()),
+                Ok(None) => Probe::Missing,
+                Err(error) => Probe::Broken {
+                    path: script_path,
+                    reason: error.to_string(),
+                },
+            }
         }
         Candidate::Program(program) => {
             let label = PathBuf::from(format!("{program} (PATH)"));
@@ -235,9 +253,12 @@ where
     }
 }
 
-fn resolve_command(configured_path: Option<&Path>) -> Result<ResolvedCommand> {
+fn resolve_command(
+    configured_path: Option<&Path>,
+    runtime_data_dir: Option<&Path>,
+) -> Result<ResolvedCommand> {
     let mut last_failure: Option<(PathBuf, String)> = None;
-    for candidate in candidates(configured_path) {
+    for candidate in candidates(configured_path, runtime_data_dir) {
         match probe(&candidate) {
             Probe::Available { command, path, .. } => {
                 return Ok(ResolvedCommand {
@@ -255,15 +276,15 @@ fn resolve_command(configured_path: Option<&Path>) -> Result<ResolvedCommand> {
     if let Some((path, reason)) = last_failure {
         // Report the last broken candidate explicitly because "not found" would
         // hide a misconfigured path that the user can actually fix.
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::B4,
             format!("b4 executable '{}' is broken: {}", path.display(), reason),
         ));
     }
 
-    Err(CourierError::new(
+    Err(CriewError::new(
         ErrorCode::B4,
-        "b4 executable not found (checked config path, COURIER_B4_PATH, vendor/b4/b4.sh and PATH)",
+        "b4 executable not found (checked config path, CRIEW_B4_PATH, ./vendor/b4/b4.sh, embedded runtime vendor, and PATH)",
     ))
 }
 

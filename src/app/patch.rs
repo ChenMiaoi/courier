@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::domain::models::PatchSeriesStatus;
 use crate::infra::b4;
 use crate::infra::config::RuntimeConfig;
-use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::mail_store::ThreadRow;
 use crate::infra::patch_store;
 
@@ -211,7 +211,7 @@ pub fn run_action(
         let reason = summary
             .integrity_reason()
             .unwrap_or_else(|| "series is not ready".to_string());
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Command,
             format!("cannot {} series: {}", action.name(), reason),
         ));
@@ -266,7 +266,7 @@ pub fn run_action(
     let working_dir = action_working_dir(runtime, action)?;
     let baseline_head = if matches!(action, PatchAction::Apply) {
         let Some(path) = working_dir.as_deref() else {
-            return Err(CourierError::new(
+            return Err(CriewError::new(
                 ErrorCode::Command,
                 "apply requires [kernel].tree to be configured",
             ));
@@ -292,6 +292,7 @@ pub fn run_action(
 
     let output = match b4::run(
         runtime.b4_path.as_deref(),
+        Some(&runtime.data_dir),
         subcommand,
         &args,
         B4_ACTION_TIMEOUT,
@@ -440,7 +441,7 @@ pub fn undo_last_apply(
     expected_current_head: &str,
 ) -> Result<String> {
     let working_dir = action_working_dir(runtime, PatchAction::Apply)?.ok_or_else(|| {
-        CourierError::new(
+        CriewError::new(
             ErrorCode::Command,
             "apply undo requires [kernel].tree to be configured",
         )
@@ -449,7 +450,7 @@ pub fn undo_last_apply(
     // Refuse to undo if HEAD no longer matches the previously applied commit,
     // otherwise we could silently discard unrelated user work.
     if current_head != expected_current_head {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Command,
             format!(
                 "cannot undo apply: expected HEAD {} but found {} in {}",
@@ -468,7 +469,7 @@ pub fn undo_last_apply(
         .arg(before_head)
         .output()
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Command,
                 format!(
                     "failed to execute git reset --hard in {}",
@@ -481,7 +482,7 @@ pub fn undo_last_apply(
         let reason = first_non_empty_line(&String::from_utf8_lossy(&output.stderr))
             .or_else(|| first_non_empty_line(&String::from_utf8_lossy(&output.stdout)))
             .unwrap_or_else(|| "git reset --hard returned non-zero exit code".to_string());
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Command,
             format!(
                 "failed to undo apply in {}: {}",
@@ -493,7 +494,7 @@ pub fn undo_last_apply(
 
     let head_after_reset = resolve_git_head(&working_dir)?;
     if head_after_reset != before_head {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Command,
             format!(
                 "undo apply verification failed: expected {} but got {}",
@@ -784,13 +785,13 @@ fn action_working_dir(runtime: &RuntimeConfig, action: PatchAction) -> Result<Op
     }
 
     let Some(path) = runtime.kernel_trees.first() else {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Command,
             "apply requires [kernel].tree to be configured",
         ));
     };
     if !path.exists() {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Command,
             format!(
                 "apply requires existing [kernel].tree, but '{}' does not exist",
@@ -799,7 +800,7 @@ fn action_working_dir(runtime: &RuntimeConfig, action: PatchAction) -> Result<Op
         ));
     }
     if !path.is_dir() {
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Command,
             format!(
                 "apply requires [kernel].tree to be a directory, but '{}' is not",
@@ -821,7 +822,7 @@ fn prepare_download_dir(root: &Path, summary: &SeriesSummary) -> Result<PathBuf>
     let name = download_series_name(summary);
     let dir = root.join(format!("{name}-{nonce}"));
     fs::create_dir_all(&dir).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!("failed to create patch export directory {}", dir.display()),
             error,
@@ -840,7 +841,7 @@ fn action_subcommand(action: PatchAction) -> &'static str {
 fn snapshot_apply_artifacts(root: &Path) -> Result<HashSet<String>> {
     let mut names = HashSet::new();
     let entries = fs::read_dir(root).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!("failed to inspect apply artifacts under {}", root.display()),
             error,
@@ -849,7 +850,7 @@ fn snapshot_apply_artifacts(root: &Path) -> Result<HashSet<String>> {
 
     for entry in entries {
         let entry = entry.map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Io,
                 format!(
                     "failed to inspect apply artifact entry under {}",
@@ -860,7 +861,7 @@ fn snapshot_apply_artifacts(root: &Path) -> Result<HashSet<String>> {
         })?;
         let name = entry.file_name().to_string_lossy().to_string();
         let file_type = entry.file_type().map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Io,
                 format!(
                     "failed to inspect apply artifact type for {}",
@@ -899,7 +900,7 @@ fn relocate_new_apply_artifacts(
     }
     created.sort();
 
-    // Move apply artifacts under Courier-managed storage so later cleanups and
+    // Move apply artifacts under CRIEW-managed storage so later cleanups and
     // previews do not depend on temporary files remaining in the kernel tree.
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -909,7 +910,7 @@ fn relocate_new_apply_artifacts(
         .join(APPLY_ARTIFACTS_DIR)
         .join(format!("{}-{nonce}", download_series_name(summary)));
     fs::create_dir_all(&destination).map_err(|error| {
-        CourierError::with_source(
+        CriewError::with_source(
             ErrorCode::Io,
             format!(
                 "failed to create apply artifact directory {}",
@@ -923,7 +924,7 @@ fn relocate_new_apply_artifacts(
         let source = root.join(&name);
         let target = destination.join(&name);
         fs::rename(&source, &target).map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Io,
                 format!(
                     "failed to move apply artifact from {} to {}",
@@ -947,7 +948,7 @@ fn resolve_git_head(path: &Path) -> Result<String> {
         .arg("HEAD")
         .output()
         .map_err(|error| {
-            CourierError::with_source(
+            CriewError::with_source(
                 ErrorCode::Command,
                 format!("failed to execute git rev-parse under {}", path.display()),
                 error,
@@ -958,7 +959,7 @@ fn resolve_git_head(path: &Path) -> Result<String> {
         let reason = first_non_empty_line(&String::from_utf8_lossy(&output.stderr))
             .or_else(|| first_non_empty_line(&String::from_utf8_lossy(&output.stdout)))
             .unwrap_or_else(|| "git rev-parse returned non-zero exit code".to_string());
-        return Err(CourierError::new(
+        return Err(CriewError::new(
             ErrorCode::Command,
             format!(
                 "apply requires a valid git repository at '{}': {}",
@@ -970,7 +971,7 @@ fn resolve_git_head(path: &Path) -> Result<String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     first_non_empty_line(&stdout).ok_or_else(|| {
-        CourierError::new(
+        CriewError::new(
             ErrorCode::Command,
             format!(
                 "failed to resolve git HEAD under '{}': empty output",
@@ -1146,17 +1147,17 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("courier-patch-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!("criew-patch-{label}-{nonce}"));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
 
     fn runtime_with_kernel_trees(kernel_trees: Vec<PathBuf>) -> RuntimeConfig {
-        let root = PathBuf::from("/tmp/courier-patch-runtime");
+        let root = PathBuf::from("/tmp/criew-patch-runtime");
         RuntimeConfig {
             config_path: root.join("config.toml"),
             data_dir: root.join("data"),
-            database_path: root.join("data/courier.db"),
+            database_path: root.join("data/criew.db"),
             raw_mail_dir: root.join("data/raw"),
             patch_dir: root.join("data/patches"),
             log_dir: root.join("data/logs"),
@@ -1389,8 +1390,8 @@ mod tests {
     fn undo_last_apply_resets_head_to_previous_commit() {
         let repo = temp_dir("undo-apply");
         run_git(&repo, &["init"]);
-        run_git(&repo, &["config", "user.name", "Courier Test"]);
-        run_git(&repo, &["config", "user.email", "courier@example.com"]);
+        run_git(&repo, &["config", "user.name", "CRIEW Test"]);
+        run_git(&repo, &["config", "user.email", "criew@example.com"]);
 
         fs::write(repo.join("demo.txt"), "v1\n").expect("write v1");
         run_git(&repo, &["add", "demo.txt"]);
@@ -1418,8 +1419,8 @@ mod tests {
     fn undo_last_apply_rejects_head_mismatch() {
         let repo = temp_dir("undo-apply-mismatch");
         run_git(&repo, &["init"]);
-        run_git(&repo, &["config", "user.name", "Courier Test"]);
-        run_git(&repo, &["config", "user.email", "courier@example.com"]);
+        run_git(&repo, &["config", "user.name", "CRIEW Test"]);
+        run_git(&repo, &["config", "user.email", "criew@example.com"]);
 
         fs::write(repo.join("demo.txt"), "v1\n").expect("write v1");
         run_git(&repo, &["add", "demo.txt"]);
