@@ -55,6 +55,7 @@ mkdir -p "$(dirname "${output_file}")"
 
 {
     printf '## %s %s\n\n' "${package_name}" "${tag_name}"
+    printf '[![codecov](https://codecov.io/github/ChenMiaoi/CRIEW/graph/badge.svg?token=AH99YLKKPD)](https://codecov.io/github/ChenMiaoi/CRIEW)\n\n'
     printf 'Source release for `%s`.\n\n' "$(git rev-list -n 1 "${tag_name}")"
     printf '### Release Assets\n\n'
     printf -- '- Source archive: `%s-%s-src.tar.gz`\n' "${package_name}" "${tag_name}"

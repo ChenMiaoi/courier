@@ -1,5 +1,7 @@
 # CRIEW
 
+[![codecov](https://codecov.io/github/ChenMiaoi/CRIEW/graph/badge.svg?token=AH99YLKKPD)](https://codecov.io/github/ChenMiaoi/CRIEW)
+
 CRIEW is a Rust TUI for Linux kernel patch mail workflows.
 `CRIEW` stands for `Code Review in Efficient Workflow`.
 The repository name stays uppercase as `CRIEW`, while the crate and CLI use lowercase `criew`.
