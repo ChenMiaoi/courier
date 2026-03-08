@@ -1,0 +1,3 @@
+-- Thread ordering now prefers the parsed mail Date header over local insert
+-- time. The actual rebuild runs in application code after this migration lands
+-- so existing databases are reindexed once with the new ordering.

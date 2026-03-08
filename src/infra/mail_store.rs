@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::infra::error::{CourierError, ErrorCode, Result};
@@ -69,7 +70,7 @@ struct MailGraphNode {
     id: i64,
     message_id: String,
     subject: String,
-    created_at: String,
+    sort_ts: String,
     in_reply_to: Option<String>,
     refs: Vec<String>,
 }
@@ -245,6 +246,30 @@ where
     }
 
     Ok(pruned_mail_ids.len())
+}
+
+pub fn rebuild_all_threads(path: &Path) -> Result<usize> {
+    let mut connection = open_connection(path)?;
+    let tx = connection.transaction().map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Database,
+            "failed to open thread rebuild transaction",
+            error,
+        )
+    })?;
+
+    let build = build_thread_index_tx(&tx)?;
+    let rebuilt = rebuild_all_threads_tx(&tx, &build)?;
+
+    tx.commit().map_err(|error| {
+        CourierError::with_source(
+            ErrorCode::Database,
+            "failed to commit thread rebuild transaction",
+            error,
+        )
+    })?;
+
+    Ok(rebuilt)
 }
 
 pub fn apply_sync_batch(path: &Path, batch: SyncBatch) -> Result<SyncWriteResult> {
@@ -756,13 +781,33 @@ fn load_stale_roots_tx(
     Ok(roots)
 }
 
+fn normalize_mail_sort_ts(date_header: Option<&str>, created_at: &str) -> String {
+    parse_mail_date_header(date_header).unwrap_or_else(|| created_at.to_string())
+}
+
+fn parse_mail_date_header(date_header: Option<&str>) -> Option<String> {
+    let value = date_header?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    DateTime::parse_from_rfc2822(value)
+        .or_else(|_| DateTime::parse_from_rfc3339(value))
+        .ok()
+        .map(|datetime| {
+            datetime
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+        })
+}
+
 fn build_thread_index_tx(tx: &Transaction<'_>) -> Result<ThreadBuild> {
     let mut build = ThreadBuild::default();
 
     let mut mail_statement = tx
         .prepare(
             "
-SELECT id, message_id, subject, in_reply_to, created_at
+SELECT id, message_id, subject, in_reply_to, date, created_at
 FROM mail
 WHERE is_expunged = 0
 ",
@@ -777,12 +822,14 @@ WHERE is_expunged = 0
 
     let mail_rows = mail_statement
         .query_map([], |row| {
+            let date = row.get::<_, Option<String>>(4)?;
+            let created_at = row.get::<_, String>(5)?;
             Ok(MailGraphNode {
                 id: row.get::<_, i64>(0)?,
                 message_id: row.get::<_, String>(1)?,
                 subject: row.get::<_, String>(2)?,
                 in_reply_to: row.get::<_, Option<String>>(3)?,
-                created_at: row.get::<_, String>(4)?,
+                sort_ts: normalize_mail_sort_ts(date.as_deref(), &created_at),
                 refs: Vec::new(),
             })
         })
@@ -932,8 +979,8 @@ WHERE is_expunged = 0
                 .cmp(&right_assignment.depth)
                 .then_with(|| {
                     left_node
-                        .map(|node| node.created_at.as_str())
-                        .cmp(&right_node.map(|node| node.created_at.as_str()))
+                        .map(|node| node.sort_ts.as_str())
+                        .cmp(&right_node.map(|node| node.sort_ts.as_str()))
                 })
                 .then_with(|| left.cmp(right))
         });
@@ -1029,7 +1076,7 @@ fn rebuild_thread_roots_tx(
         // ordering reflects conversation freshness, not only root age.
         let last_activity_at = group_mail_ids
             .iter()
-            .filter_map(|mail_id| build.nodes.get(mail_id).map(|node| node.created_at.clone()))
+            .filter_map(|mail_id| build.nodes.get(mail_id).map(|node| node.sort_ts.clone()))
             .max();
 
         tx.execute(
@@ -1064,7 +1111,7 @@ VALUES (?1, ?2, ?3, ?4)
             let sort_ts = build
                 .nodes
                 .get(mail_id)
-                .map(|node| node.created_at.clone())
+                .map(|node| node.sort_ts.clone())
                 .unwrap_or_default();
 
             tx.execute(
@@ -1474,6 +1521,48 @@ WHERE m.message_id = 'grand@example.com'
             previous_thread_id = Some(row.thread_id);
         }
         assert_eq!(seen.len(), 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mailbox_thread_rows_order_threads_by_mail_date_not_insert_time() {
+        let root = temp_dir("thread-date-order");
+        let db_path = root.join("courier.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let newer_thread = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 1,
+            highest_modseq: Some(1),
+            mails: vec![incoming(
+                "inbox",
+                1,
+                "Message-ID: <thread-a@example.com>\nSubject: thread a\nFrom: alice@example.com\nDate: Sun, 08 Mar 2026 12:00:00 +0000\n\nbody\n",
+            )],
+        };
+        apply_sync_batch(&db_path, newer_thread).expect("sync newer thread");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let older_thread = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 2,
+            highest_modseq: Some(2),
+            mails: vec![incoming(
+                "inbox",
+                2,
+                "Message-ID: <thread-b@example.com>\nSubject: thread b\nFrom: bob@example.com\nDate: Sun, 08 Mar 2026 11:00:00 +0000\n\nbody\n",
+            )],
+        };
+        apply_sync_batch(&db_path, older_thread).expect("sync older thread");
+
+        let rows = load_thread_rows_by_mailbox(&db_path, "inbox", 20).expect("load thread rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].message_id, "thread-a@example.com");
+        assert_eq!(rows[1].message_id, "thread-b@example.com");
 
         let _ = fs::remove_dir_all(root);
     }

@@ -10,7 +10,7 @@ use rusqlite::{Connection, params};
 
 use crate::infra::error::{CourierError, ErrorCode, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 const CREATE_SCHEMA_VERSION_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -41,6 +41,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 3,
         description: "reply send workflow schema",
         sql: include_str!("../../migrations/0003_reply_send_workflow.sql"),
+    },
+    Migration {
+        version: 4,
+        description: "thread ordering uses mail date",
+        sql: include_str!("../../migrations/0004_thread_sort_by_mail_date.sql"),
     },
 ];
 
@@ -180,7 +185,10 @@ mod tests {
         let state = initialize(&db_path).expect("initialize db");
         assert!(state.created);
         assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(state.applied_migrations, vec![1, 2, CURRENT_SCHEMA_VERSION]);
+        assert_eq!(
+            state.applied_migrations,
+            vec![1, 2, 3, CURRENT_SCHEMA_VERSION]
+        );
 
         let connection = Connection::open(&db_path).expect("open sqlite");
         let version = connection

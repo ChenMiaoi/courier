@@ -9,6 +9,9 @@ use std::fs;
 use crate::infra::config::RuntimeConfig;
 use crate::infra::db::{self, DatabaseState};
 use crate::infra::error::{CourierError, ErrorCode, Result};
+use crate::infra::mail_store;
+
+const THREAD_DATE_ORDER_MIGRATION_VERSION: i64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct BootstrapState {
@@ -21,6 +24,17 @@ pub fn prepare(config: &RuntimeConfig) -> Result<BootstrapState> {
     // stack.
     ensure_runtime_dirs(config)?;
     let db_state = db::initialize(&config.database_path)?;
+    if db_state
+        .applied_migrations
+        .contains(&THREAD_DATE_ORDER_MIGRATION_VERSION)
+    {
+        let rebuilt = mail_store::rebuild_all_threads(&config.database_path)?;
+        tracing::info!(
+            database = %config.database_path.display(),
+            rebuilt_threads = rebuilt,
+            "rebuilt thread ordering after schema upgrade"
+        );
+    }
 
     Ok(BootstrapState { db: db_state })
 }
