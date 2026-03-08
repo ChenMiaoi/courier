@@ -67,10 +67,16 @@ Must:
 - `test-visible-behavior`: test user-visible behavior instead of coupling tests to implementation details.
 - `use-assertions`: use assertion macros instead of manual print-and-compare flows.
 - `test-cleanup`: clean up files, directories, and child processes created by tests.
+- `coverage-check`: modified code must keep the project coverage command runnable.
 
 Project notes:
 - Consistency tests should use user-visible disassembly output as the source of truth.
 - Decoder fixes should usually add both Rust unit tests and matching consistency cases when applicable.
+- Required validation commands before merge:
+  `cargo fmt --all -- --check`
+  `cargo clippy --all-targets --all-features -- -D warnings`
+  `cargo test --all-targets --all-features`
+  `./scripts/check-coverage.sh`
 
 ## Git And Pull Request Rules
 
@@ -97,6 +103,7 @@ Commit message policy
 - [ ] If `unsafe` is used, the safety explanation is complete (`justify-unsafe-use`, `document-safety-conds`).
 - [ ] Bug fixes include regression tests (`add-regression-tests`).
 - [ ] Tests validate observable behavior and clean up resources (`test-visible-behavior`, `test-cleanup`).
+- [ ] `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`, and `./scripts/check-coverage.sh` pass.
 - [ ] Commits and pull requests stay atomic and focused (`atomic-commits`, `focused-prs`).
 
 ## Gradual Adoption

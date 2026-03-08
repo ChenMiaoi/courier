@@ -67,10 +67,16 @@
 - `test-visible-behavior`：测试用户可观察行为，避免耦合内部实现。
 - `use-assertions`：使用断言宏，不做手工打印比对。
 - `test-cleanup`：测试结束后清理创建的资源与子进程。
+- `coverage-check`：被修改代码必须保持项目覆盖率命令可运行。
 
 项目落地：
 - 一致性测试以用户可见反汇编输出为准。
 - 解码器修复建议同时补 Rust 单测与对应一致性用例（如适用）。
+- 合并前必须通过以下验证命令：
+  `cargo fmt --all -- --check`
+  `cargo clippy --all-targets --all-features -- -D warnings`
+  `cargo test --all-targets --all-features`
+  `./scripts/check-coverage.sh`
 
 ## Git 与 Pull Request 规则
 
@@ -96,6 +102,7 @@
 - [ ] 若使用 `unsafe`，安全说明完整（`justify-unsafe-use`, `document-safety-conds`）。
 - [ ] bug 修复包含回归测试（`add-regression-tests`）。
 - [ ] 测试验证可观察行为并完成资源清理（`test-visible-behavior`, `test-cleanup`）。
+- [ ] `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features` 和 `./scripts/check-coverage.sh` 通过。
 - [ ] commit 与 PR 规模原子、主题聚焦（`atomic-commits`, `focused-prs`）。
 
 ## 渐进式采用

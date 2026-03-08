@@ -220,6 +220,7 @@ CRIEW 的 Reply Panel 会自动填充：
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
+./scripts/check-coverage.sh
 ```
 
 ## License

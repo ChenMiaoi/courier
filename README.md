@@ -208,6 +208,7 @@ Common development commands:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
+./scripts/check-coverage.sh
 ```
 
 The repository includes GitHub Actions CI for `push` and `pull_request` with the same formatting, lint, and test checks.
