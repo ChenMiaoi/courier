@@ -78,6 +78,13 @@ For larger commits, add a body with bullet points that summarize the main change
 
 Run the full repository validation set after non-trivial changes when the environment allows it.
 
+- Keep overall repository coverage at or above 70%.
+- Keep newly added code at or above 80% coverage.
+- Keep critical-component coverage at or above 85% for critical workflow code that the current change directly touches or materially expands. Treat sync, reply, patch, and other core user-facing workflow paths in scope as critical unless the task clearly falls outside those paths.
+- Do not add tests only to tick uncovered lines. Coverage work must defend a real behavior, regression, failure mode, or workflow contract that matters to users or operators.
+- Prefer behavior-driven regression tests over line-chasing. If a remaining gap is not worth a brittle or artificial test, leave it uncovered and report the tradeoff clearly.
+- Use `./scripts/check-coverage.sh` plus the generated summary report to verify the thresholds above, and review file-level or workflow-level reports for the in-scope critical components. Treat threshold regressions as incomplete work.
+
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test --all-targets --all-features`

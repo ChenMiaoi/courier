@@ -454,6 +454,15 @@ fn mailbox_sync_spawner_stub(
     receiver
 }
 
+fn type_text(state: &mut AppState, text: &str) {
+    for character in text.chars() {
+        let _ = handle_key_event(
+            state,
+            KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+        );
+    }
+}
+
 #[test]
 fn empty_query_returns_all_palette_commands() {
     let all = matching_commands("");
@@ -1107,6 +1116,140 @@ inbox_auto_sync_interval_secs = 30
     assert!(persisted.contains("inbox_auto_sync_interval_secs = 30"));
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_editor_reports_unsupported_key_hint_and_allows_keyboard_navigation() {
+    let mut state = AppState::new(vec![], test_runtime());
+
+    state.open_config_editor(Some("unsupported.key"));
+
+    assert!(state.config_editor.open);
+    assert!(
+        state
+            .status
+            .contains("config editor does not support unsupported.key")
+    );
+    assert_eq!(state.selected_config_editor_field().key, "source.mailbox");
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_ne!(state.selected_config_editor_field().key, "source.mailbox");
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(state.selected_config_editor_field().key, "source.mailbox");
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!state.config_editor.open);
+    assert_eq!(state.status, "config editor closed");
+}
+
+#[test]
+fn config_editor_edit_mode_handles_char_backspace_tab_and_escape() {
+    let root = temp_dir("config-editor-keyboard");
+    let config_path = root.join("criew-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+startup_sync = true
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path;
+    let mut state = AppState::new(vec![], runtime);
+
+    state.open_config_editor(Some("ui.startup_sync"));
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(
+        state.config_editor.mode,
+        super::ConfigEditorMode::Edit
+    ));
+    assert_eq!(state.config_editor.input, "true");
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    assert_eq!(state.config_editor.input, "truex");
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    );
+    assert_eq!(state.config_editor.input, "true");
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(state.config_editor.input, "false");
+    assert_eq!(state.status, "preset value selected for ui.startup_sync");
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(matches!(
+        state.config_editor.mode,
+        super::ConfigEditorMode::Browse
+    ));
+    assert!(state.config_editor.input.is_empty());
+    assert_eq!(state.status, "config edit cancelled");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn config_palette_help_and_usage_are_reported() {
+    let mut state = AppState::new(vec![], test_runtime());
+
+    state.palette.open = true;
+    state.palette.input = "config help".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.status.contains("config usage:"));
+
+    state.palette.open = true;
+    state.palette.input = "config get".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(state.status, "usage: config get <key>");
+
+    state.palette.open = true;
+    state.palette.input = "config set".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(state.status, "usage: config set <key> <value>");
+}
+
+#[test]
+fn config_palette_reports_effective_and_missing_values() {
+    let mut state = AppState::new(vec![], test_runtime());
+
+    state.palette.open = true;
+    state.palette.input = "config get source.mailbox".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .status
+            .contains("config effective source.mailbox = inbox (default/runtime)")
+    );
+
+    state.palette.open = true;
+    state.palette.input = "config get no.such.key".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(state.status, "config key not found: no.such.key");
 }
 
 #[test]
@@ -2630,6 +2773,183 @@ fn slash_opens_search_and_filters_threads() {
 }
 
 #[test]
+fn search_on_code_browser_reports_mail_only_scope() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.ui_page = UiPage::CodeBrowser;
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(!state.search.active);
+    assert_eq!(state.status, "search is only available on mail page");
+}
+
+#[test]
+fn search_backspace_and_escape_clear_pending_query() {
+    let mut state = AppState::new(vec![], test_runtime());
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+    );
+    type_text(&mut state, "ab");
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    );
+    assert_eq!(state.search.input, "a");
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(!state.search.active);
+    assert!(state.search.input.is_empty());
+    assert_eq!(state.status, "search cancelled");
+}
+
+#[test]
+fn ctrl_backtick_closes_open_palette() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "help".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('`'), KeyModifiers::CONTROL),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(!state.palette.open);
+    assert!(state.palette.input.is_empty());
+    assert_eq!(state.status, "command palette closed");
+}
+
+#[test]
+fn palette_reports_empty_and_unknown_commands() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "   ".to_string();
+
+    let empty_action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(empty_action, LoopAction::Continue));
+    assert_eq!(state.status, "empty command");
+
+    state.palette.open = true;
+    state.palette.input = "wat".to_string();
+    let unknown_action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(unknown_action, LoopAction::Continue));
+    assert_eq!(state.status, "unknown command: wat");
+}
+
+#[test]
+fn palette_escape_backspace_and_char_input_update_buffer() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "he".to_string();
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    );
+    assert_eq!(state.palette.input, "h");
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert_eq!(state.palette.input, "hi");
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(!state.palette.open);
+    assert!(state.palette.input.is_empty());
+}
+
+#[test]
+fn palette_sync_command_runs_via_handle_key_event() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.sync_request_executor = sync_request_mock_success;
+    state.palette.open = true;
+    state.palette.input = "sync io-uring".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(state.status.contains("sync ok"));
+}
+
+#[test]
+fn palette_bang_reports_empty_local_command() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "!   ".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert_eq!(state.status, "empty local command after !");
+}
+
+#[test]
+fn enter_on_thread_sets_selected_status_message() {
+    let mut state = AppState::new(
+        vec![sample_thread("normal mail", "plain@example.com", 0)],
+        test_runtime(),
+    );
+    state.focus = Pane::Threads;
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert_eq!(state.status, "selected plain@example.com");
+}
+
+#[test]
+fn escape_quit_and_ctrl_c_show_exit_guidance() {
+    let mut state = AppState::new(vec![], test_runtime());
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        state.status,
+        "open command palette with : (preferred) or Ctrl+`"
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    );
+    assert_eq!(
+        state.status,
+        "q emergency exit disabled; use command palette quit/exit"
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(
+        state.status,
+        "Ctrl+C is disabled, use command palette quit/exit"
+    );
+}
+
+#[test]
 fn jl_focus_and_ik_move_selection() {
     let mut state = AppState::new(
         vec![
@@ -3316,6 +3636,554 @@ fn reply_send_preview_uses_edited_header_values() {
         panel
             .preview_rendered
             .contains("Cc: List <list@example.com>")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn mail_page_r_opens_reply_panel_from_threads_focus() {
+    let root = temp_dir("reply-open-r");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Threads;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    );
+
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(state.reply_panel.is_some());
+    assert!(
+        state
+            .status
+            .contains("reply panel opened for <patch@example.com>")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_notice_escape_closes_blocked_notice() {
+    let root = temp_dir("reply-notice-esc");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .and_then(|panel| panel.reply_notice.as_ref())
+            .is_some()
+    );
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.reply_notice.is_none())
+    );
+    assert_eq!(state.status, "reply notice closed");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_send_preview_scrolls_with_j_and_k() {
+    let root = temp_dir("reply-preview-scroll");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.preview_open)
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert_eq!(
+        state
+            .reply_panel
+            .as_ref()
+            .expect("reply panel")
+            .preview_scroll,
+        1
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    assert_eq!(
+        state
+            .reply_panel
+            .as_ref()
+            .expect("reply panel")
+            .preview_scroll,
+        0
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_send_preview_escape_closes_preview() {
+    let root = temp_dir("reply-preview-esc");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| !panel.preview_open)
+    );
+    assert_eq!(state.status, "send preview closed");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_notice_enter_closes_blocked_notice() {
+    let root = temp_dir("reply-notice-enter");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.reply_notice.is_none())
+    );
+    assert_eq!(state.status, "reply notice closed");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_command_mode_handles_empty_unsupported_and_discard_commands() {
+    let root = temp_dir("reply-command-mode");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(state.status, "empty command");
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+    );
+    type_text(&mut state, "zzz");
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert_eq!(state.status, "unsupported command: :zzz");
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+    );
+    type_text(&mut state, "q!");
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.reply_panel.is_none());
+    assert_eq!(state.status, "discarded reply draft");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_command_mode_escape_and_backspace_restore_normal_mode() {
+    let root = temp_dir("reply-command-cancel");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+    );
+    type_text(&mut state, "ab");
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    );
+    assert_eq!(
+        state
+            .reply_panel
+            .as_ref()
+            .expect("reply panel")
+            .command_input,
+        "a"
+    );
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    let panel = state.reply_panel.as_ref().expect("reply panel");
+    assert!(matches!(panel.mode, ReplyEditMode::Normal));
+    assert!(panel.command_input.is_empty());
+    assert_eq!(state.status, "reply command cancelled");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_command_q_closes_clean_panel_but_blocks_dirty_draft() {
+    let root = temp_dir("reply-command-q");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut clean_state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    clean_state.focus = Pane::Preview;
+    clean_state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut clean_state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut clean_state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+    );
+    type_text(&mut clean_state, "q");
+    let _ = handle_key_event(
+        &mut clean_state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(clean_state.reply_panel.is_none());
+    assert_eq!(clean_state.status, "closed reply panel");
+
+    let mut dirty_state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    dirty_state.focus = Pane::Preview;
+    dirty_state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut dirty_state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    if let Some(panel) = dirty_state.reply_panel.as_mut() {
+        panel.mark_dirty();
+    }
+    let _ = handle_key_event(
+        &mut dirty_state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+    );
+    type_text(&mut dirty_state, "q");
+    let _ = handle_key_event(
+        &mut dirty_state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(dirty_state.reply_panel.is_some());
+    assert_eq!(
+        dirty_state.status,
+        "unsaved reply draft, run :q! to discard"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_command_preview_and_preview_enter_cover_remaining_preview_shortcuts() {
+    let root = temp_dir("reply-command-preview");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+    );
+    type_text(&mut state, "preview");
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.preview_open)
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.preview_confirmed)
+    );
+    assert_eq!(state.status, "send preview confirmed; ready to send");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_insert_mode_tab_and_backspace_modify_body() {
+    let root = temp_dir("reply-insert-tab");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        test_runtime(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    if let Some(panel) = state.reply_panel.as_mut() {
+        panel.section = ReplySection::Body;
+        panel.body = vec![String::new()];
+        panel.body_row = 0;
+        panel.cursor_col = 0;
+        panel.adjust_scroll();
+    }
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        state.reply_panel.as_ref().expect("reply panel").body[0],
+        "    "
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+    );
+    assert_eq!(
+        state.reply_panel.as_ref().expect("reply panel").body[0],
+        "   "
     );
 
     let _ = fs::remove_dir_all(root);

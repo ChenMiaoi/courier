@@ -165,6 +165,8 @@ mod tests {
 
     use rusqlite::Connection;
 
+    use crate::infra::error::ErrorCode;
+
     use super::{CURRENT_SCHEMA_VERSION, initialize};
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -197,6 +199,123 @@ mod tests {
             })
             .expect("query version");
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initialize_is_idempotent_for_existing_database() {
+        let root = temp_dir("db-reinitialize");
+        let db_path = root.join("criew.db");
+
+        let first = initialize(&db_path).expect("initialize db");
+        let second = initialize(&db_path).expect("reinitialize db");
+
+        assert!(first.created);
+        assert_eq!(second.path, db_path);
+        assert!(!second.created);
+        assert_eq!(second.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(second.applied_migrations.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initialize_reports_missing_parent_directory() {
+        let root = temp_dir("db-missing-parent");
+        let db_path = root.join("missing").join("criew.db");
+
+        let error = initialize(&db_path).expect_err("missing parent directory should fail");
+
+        assert_eq!(error.code(), ErrorCode::Database);
+        assert!(error.to_string().contains("failed to open sqlite database"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initialize_reports_schema_version_table_creation_conflicts() {
+        let root = temp_dir("db-schema-version-conflict");
+        let db_path = root.join("criew.db");
+        let connection = Connection::open(&db_path).expect("open sqlite");
+        connection
+            .execute("CREATE VIEW schema_version AS SELECT 1 AS version", [])
+            .expect("create conflicting view");
+        drop(connection);
+
+        let error = initialize(&db_path).expect_err("schema_version conflict should fail");
+
+        assert_eq!(error.code(), ErrorCode::Database);
+        assert!(error.to_string().contains("schema") || error.to_string().contains("migration"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initialize_reports_schema_version_query_failure_for_invalid_table_shape() {
+        let root = temp_dir("db-schema-version-shape");
+        let db_path = root.join("criew.db");
+        let connection = Connection::open(&db_path).expect("open sqlite");
+        connection
+            .execute(
+                "CREATE TABLE schema_version (description TEXT NOT NULL)",
+                [],
+            )
+            .expect("create malformed schema_version");
+        drop(connection);
+
+        let error = initialize(&db_path).expect_err("invalid schema_version shape should fail");
+
+        assert_eq!(error.code(), ErrorCode::Database);
+        assert!(error.to_string().contains("failed to query schema version"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn initialize_reports_migration_and_registration_failures() {
+        let root = temp_dir("db-migration-failures");
+
+        let conflicting_db_path = root.join("migration-sql.db");
+        let connection = Connection::open(&conflicting_db_path).expect("open conflicting sqlite");
+        connection
+            .execute(
+                "CREATE TABLE schema_version (version INTEGER PRIMARY KEY, description TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT '')",
+                [],
+            )
+            .expect("create schema_version");
+        connection
+            .execute("CREATE VIEW mail AS SELECT 1 AS id", [])
+            .expect("create conflicting mail view");
+        drop(connection);
+
+        let migration_error =
+            initialize(&conflicting_db_path).expect_err("migration SQL conflict should fail");
+        assert_eq!(migration_error.code(), ErrorCode::Database);
+        assert!(
+            migration_error
+                .to_string()
+                .contains("failed to run migration 1")
+        );
+
+        let missing_column_db_path = root.join("migration-register.db");
+        let connection = Connection::open(&missing_column_db_path).expect("open sqlite");
+        connection
+            .execute(
+                "CREATE TABLE schema_version (version INTEGER PRIMARY KEY)",
+                [],
+            )
+            .expect("create truncated schema_version");
+        drop(connection);
+
+        let register_error =
+            initialize(&missing_column_db_path).expect_err("migration registration should fail");
+        assert_eq!(register_error.code(), ErrorCode::Database);
+        assert!(
+            register_error
+                .to_string()
+                .contains("failed to register migration 1")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

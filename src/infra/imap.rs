@@ -31,6 +31,12 @@ const IMAP_FETCH_BATCH_SIZE: usize = 100;
 const GNU_ARCHIVE_INITIAL_MONTH_LIMIT: usize = 2;
 const GNU_ARCHIVE_UID_STRIDE: u32 = 1_000_000;
 
+#[cfg(test)]
+trait TestTransportIo: Read + Write + Send {}
+
+#[cfg(test)]
+impl<T> TestTransportIo for T where T: Read + Write + Send {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ImapErrorKind {
@@ -371,7 +377,7 @@ impl LoreImapClient {
             )
         })?;
 
-        let status = response.status();
+        let status_code = response.status().as_u16();
         let body = response.text().map_err(|error| {
             CriewError::with_source(
                 ErrorCode::Imap,
@@ -380,43 +386,19 @@ impl LoreImapClient {
             )
         })?;
 
-        if !status.is_success() {
-            return Err(imap_error(
-                ImapErrorKind::MailboxSelection,
-                format!("failed to fetch lore feed {url}: HTTP {status}"),
-            ));
-        }
-
-        parse_lore_atom_entries(&body)
+        parse_lore_feed_response(&url, status_code, &body)
     }
 
     fn fetch_raw_mail(&self, message_url: &str) -> Result<Vec<u8>> {
-        let mut last_error: Option<CriewError> = None;
-
-        for raw_url in lore_raw_url_candidates(message_url) {
-            let response = match self.client.get(&raw_url).send() {
-                Ok(response) => response,
-                Err(error) => {
-                    last_error = Some(CriewError::with_source(
-                        ErrorCode::Imap,
-                        format!("failed to fetch lore raw message {raw_url}"),
-                        error,
-                    ));
-                    continue;
-                }
-            };
-
-            if !response.status().is_success() {
-                last_error = Some(imap_error(
-                    ImapErrorKind::Protocol,
-                    format!(
-                        "failed to fetch lore raw message {raw_url}: HTTP {}",
-                        response.status()
-                    ),
-                ));
-                continue;
-            }
-
+        fetch_lore_raw_with(message_url, |raw_url| {
+            let response = self.client.get(raw_url).send().map_err(|error| {
+                CriewError::with_source(
+                    ErrorCode::Imap,
+                    format!("failed to fetch lore raw message {raw_url}"),
+                    error,
+                )
+            })?;
+            let status_code = response.status().as_u16();
             let bytes = response.bytes().map_err(|error| {
                 CriewError::with_source(
                     ErrorCode::Imap,
@@ -424,24 +406,88 @@ impl LoreImapClient {
                     error,
                 )
             })?;
+            Ok((status_code, bytes.to_vec()))
+        })
+    }
+}
 
-            if !bytes.is_empty() {
-                return Ok(bytes.to_vec());
+fn parse_lore_feed_response(url: &str, status_code: u16, body: &str) -> Result<Vec<LoreFeedEntry>> {
+    if !(200..300).contains(&status_code) {
+        return Err(imap_error(
+            ImapErrorKind::MailboxSelection,
+            format!("failed to fetch lore feed {url}: HTTP {status_code}"),
+        ));
+    }
+
+    parse_lore_atom_entries(body)
+}
+
+fn fetch_lore_raw_with<F>(message_url: &str, mut fetch_response: F) -> Result<Vec<u8>>
+where
+    F: FnMut(&str) -> Result<(u16, Vec<u8>)>,
+{
+    let mut last_error: Option<CriewError> = None;
+
+    for raw_url in lore_raw_url_candidates(message_url) {
+        let (status_code, bytes) = match fetch_response(&raw_url) {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
             }
+        };
 
+        if !(200..300).contains(&status_code) {
             last_error = Some(imap_error(
                 ImapErrorKind::Protocol,
-                format!("lore raw message is empty: {raw_url}"),
+                format!("failed to fetch lore raw message {raw_url}: HTTP {status_code}"),
             ));
+            continue;
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            imap_error(
-                ImapErrorKind::Protocol,
-                format!("failed to resolve raw message URL for {message_url}"),
-            )
-        }))
+        if !bytes.is_empty() {
+            return Ok(bytes);
+        }
+
+        last_error = Some(imap_error(
+            ImapErrorKind::Protocol,
+            format!("lore raw message is empty: {raw_url}"),
+        ));
     }
+
+    Err(last_error.unwrap_or_else(|| {
+        imap_error(
+            ImapErrorKind::Protocol,
+            format!("failed to resolve raw message URL for {message_url}"),
+        )
+    }))
+}
+
+fn build_lore_incremental_mails<F>(
+    entries: Vec<LoreFeedEntry>,
+    since_modseq: Option<u64>,
+    mut fetch_raw_mail: F,
+) -> Result<Vec<RemoteMail>>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    let mut fetched = Vec::new();
+    for entry in entries {
+        if since_modseq.is_some_and(|checkpoint| entry.modseq <= checkpoint) {
+            continue;
+        }
+
+        let raw = fetch_raw_mail(&entry.message_url)?;
+        fetched.push(RemoteMail {
+            uid: 0,
+            modseq: Some(entry.modseq),
+            flags: Vec::new(),
+            raw,
+        });
+    }
+
+    fetched.sort_by_key(|mail| mail.modseq.unwrap_or(0));
+    Ok(fetched)
 }
 
 impl ImapClient for LoreImapClient {
@@ -470,24 +516,9 @@ impl ImapClient for LoreImapClient {
     ) -> Result<Vec<RemoteMail>> {
         self.ensure_connected()?;
         let entries = self.fetch_feed_entries(mailbox)?;
-
-        let mut fetched = Vec::new();
-        for entry in entries {
-            if since_modseq.is_some_and(|checkpoint| entry.modseq <= checkpoint) {
-                continue;
-            }
-
-            let raw = self.fetch_raw_mail(&entry.message_url)?;
-            fetched.push(RemoteMail {
-                uid: 0,
-                modseq: Some(entry.modseq),
-                flags: Vec::new(),
-                raw,
-            });
-        }
-
-        fetched.sort_by_key(|mail| mail.modseq.unwrap_or(0));
-        Ok(fetched)
+        build_lore_incremental_mails(entries, since_modseq, |message_url| {
+            self.fetch_raw_mail(message_url)
+        })
     }
 }
 
@@ -553,7 +584,7 @@ impl GnuArchiveClient {
             )
         })?;
 
-        let status = response.status();
+        let status_code = response.status().as_u16();
         let body = response.text().map_err(|error| {
             CriewError::with_source(
                 ErrorCode::Imap,
@@ -562,14 +593,7 @@ impl GnuArchiveClient {
             )
         })?;
 
-        if !status.is_success() {
-            return Err(imap_error(
-                ImapErrorKind::MailboxSelection,
-                format!("failed to fetch GNU archive index {url}: HTTP {status}"),
-            ));
-        }
-
-        parse_gnu_archive_month_entries(&body)
+        parse_gnu_archive_index_response(&url, status_code, &body)
     }
 
     fn fetch_month_mbox(&self, mailbox: &str, month_key: &str) -> Result<Vec<u8>> {
@@ -582,15 +606,8 @@ impl GnuArchiveClient {
             )
         })?;
 
-        let status = response.status();
-        if !status.is_success() {
-            return Err(imap_error(
-                ImapErrorKind::Protocol,
-                format!("failed to fetch GNU archive mbox {url}: HTTP {status}"),
-            ));
-        }
-
-        response
+        let status_code = response.status().as_u16();
+        let bytes = response
             .bytes()
             .map(|bytes| bytes.to_vec())
             .map_err(|error| {
@@ -599,8 +616,74 @@ impl GnuArchiveClient {
                     format!("failed to read GNU archive mbox body {url}"),
                     error,
                 )
-            })
+            })?;
+
+        validate_gnu_archive_mbox_response(&url, status_code, bytes)
     }
+}
+
+fn parse_gnu_archive_index_response(
+    url: &str,
+    status_code: u16,
+    body: &str,
+) -> Result<Vec<GnuArchiveMonthEntry>> {
+    if !(200..300).contains(&status_code) {
+        return Err(imap_error(
+            ImapErrorKind::MailboxSelection,
+            format!("failed to fetch GNU archive index {url}: HTTP {status_code}"),
+        ));
+    }
+
+    parse_gnu_archive_month_entries(body)
+}
+
+fn validate_gnu_archive_mbox_response(
+    url: &str,
+    status_code: u16,
+    body: Vec<u8>,
+) -> Result<Vec<u8>> {
+    if !(200..300).contains(&status_code) {
+        return Err(imap_error(
+            ImapErrorKind::Protocol,
+            format!("failed to fetch GNU archive mbox {url}: HTTP {status_code}"),
+        ));
+    }
+
+    Ok(body)
+}
+
+fn build_gnu_archive_incremental_mails<F>(
+    months: &[GnuArchiveMonthEntry],
+    since_modseq: Option<u64>,
+    mut fetch_month_mbox: F,
+) -> Result<Vec<RemoteMail>>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    let selected_months = select_gnu_archive_months(months, since_modseq);
+
+    let mut fetched = Vec::new();
+    for month in selected_months {
+        let raw_mbox = fetch_month_mbox(&month.month_key)?;
+        for (index, raw) in parse_gnu_archive_mbox_messages(&raw_mbox)
+            .into_iter()
+            .enumerate()
+        {
+            fetched.push(RemoteMail {
+                uid: gnu_archive_message_uid(&month.month_key, index),
+                modseq: Some(month.modseq),
+                flags: Vec::new(),
+                raw,
+            });
+        }
+    }
+
+    fetched.sort_by(|left, right| {
+        left.modseq
+            .cmp(&right.modseq)
+            .then_with(|| left.uid.cmp(&right.uid))
+    });
+    Ok(fetched)
 }
 
 impl ImapClient for GnuArchiveClient {
@@ -629,30 +712,9 @@ impl ImapClient for GnuArchiveClient {
     ) -> Result<Vec<RemoteMail>> {
         self.ensure_connected()?;
         let months = self.fetch_month_entries(mailbox)?;
-        let selected_months = select_gnu_archive_months(&months, since_modseq);
-
-        let mut fetched = Vec::new();
-        for month in selected_months {
-            let raw_mbox = self.fetch_month_mbox(mailbox, &month.month_key)?;
-            for (index, raw) in parse_gnu_archive_mbox_messages(&raw_mbox)
-                .into_iter()
-                .enumerate()
-            {
-                fetched.push(RemoteMail {
-                    uid: gnu_archive_message_uid(&month.month_key, index),
-                    modseq: Some(month.modseq),
-                    flags: Vec::new(),
-                    raw,
-                });
-            }
-        }
-
-        fetched.sort_by(|left, right| {
-            left.modseq
-                .cmp(&right.modseq)
-                .then_with(|| left.uid.cmp(&right.uid))
-        });
-        Ok(fetched)
+        build_gnu_archive_incremental_mails(&months, since_modseq, |month_key| {
+            self.fetch_month_mbox(mailbox, month_key)
+        })
     }
 }
 
@@ -760,6 +822,8 @@ fn collect_incremental_uids(
 enum ImapTransport {
     Plain(TcpStream),
     Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+    #[cfg(test)]
+    Mock(Box<dyn TestTransportIo>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -795,6 +859,8 @@ impl Read for ImapTransport {
         match self {
             Self::Plain(stream) => stream.read(buf),
             Self::Tls(stream) => stream.read(buf),
+            #[cfg(test)]
+            Self::Mock(stream) => stream.read(buf),
         }
     }
 }
@@ -804,6 +870,8 @@ impl Write for ImapTransport {
         match self {
             Self::Plain(stream) => stream.write(buf),
             Self::Tls(stream) => stream.write(buf),
+            #[cfg(test)]
+            Self::Mock(stream) => stream.write(buf),
         }
     }
 
@@ -811,6 +879,8 @@ impl Write for ImapTransport {
         match self {
             Self::Plain(stream) => stream.flush(),
             Self::Tls(stream) => stream.flush(),
+            #[cfg(test)]
+            Self::Mock(stream) => stream.flush(),
         }
     }
 }
@@ -829,6 +899,16 @@ enum GreetingKind {
 }
 
 impl ImapSession {
+    #[cfg(test)]
+    fn with_mock_stream(stream: impl TestTransportIo + 'static) -> Self {
+        Self {
+            transport: ImapTransport::Mock(Box::new(stream)),
+            read_buffer: Vec::new(),
+            next_tag: 1,
+            capabilities: HashSet::new(),
+        }
+    }
+
     fn connect(config: &ImapConfig) -> Result<Self> {
         let server = config.server.as_deref().ok_or_else(|| {
             imap_error(
@@ -873,6 +953,13 @@ impl ImapSession {
                     return Err(imap_error(
                         ImapErrorKind::Connection,
                         "STARTTLS attempted on TLS transport",
+                    ));
+                }
+                #[cfg(test)]
+                ImapTransport::Mock(_) => {
+                    return Err(imap_error(
+                        ImapErrorKind::Connection,
+                        "STARTTLS attempted on mock transport",
                     ));
                 }
             };
@@ -2157,8 +2244,10 @@ fn classify(kind: ImapErrorKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
     use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -2166,13 +2255,18 @@ mod tests {
     use crate::infra::config::{ImapConfig, ImapEncryption};
 
     use super::{
-        FixtureImapClient, GnuArchiveMonthEntry, ImapClient, ImapErrorKind, RemoteImapClient,
-        ensure_tagged_ok, establish_http_connect_tunnel, establish_socks5_tunnel,
-        format_uid_sequence_set, gnu_archive_message_uid, lore_raw_url_candidates,
-        parse_atom_timestamp, parse_fetch_flags, parse_fetch_modseq, parse_fetch_uid,
+        FixtureImapClient, GnuArchiveClient, GnuArchiveMonthEntry, GreetingKind, ImapClient,
+        ImapErrorKind, ImapSession, LoreImapClient, MailboxSnapshot, RemoteImapClient,
+        build_gnu_archive_incremental_mails, build_lore_incremental_mails,
+        collect_incremental_uids, ensure_tagged_ok, establish_http_connect_tunnel,
+        establish_socks5_tunnel, fetch_lore_raw_with, format_uid_sequence_set,
+        gnu_archive_message_uid, lore_raw_url_candidates, normalize_lore_message_url,
+        parse_atom_timestamp, parse_fetch_flags, parse_fetch_modseq, parse_fetch_uid, parse_flags,
+        parse_gnu_archive_index_response, parse_gnu_archive_listing_timestamp,
         parse_gnu_archive_mbox_messages, parse_gnu_archive_month_entries, parse_imap_proxy,
-        parse_literal_len, parse_lore_atom_entries, parse_status_code_u64,
-        select_gnu_archive_months,
+        parse_literal_len, parse_lore_atom_entries, parse_lore_feed_response,
+        parse_status_code_u64, parse_year_month_key, quote_imap_string, read_http_proxy_response,
+        select_gnu_archive_months, validate_gnu_archive_mbox_response,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -2223,6 +2317,165 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct WriteFailsStream;
+
+    impl Read for WriteFailsStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for WriteFailsStream {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "write failed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FlushFailsStream;
+
+    impl Read for FlushFailsStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for FlushFailsStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "flush failed",
+            ))
+        }
+    }
+
+    struct ReadFailsStream;
+
+    impl Read for ReadFailsStream {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "read failed",
+            ))
+        }
+    }
+
+    impl Write for ReadFailsStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct StubHttpResponse {
+        status_code: u16,
+        content_type: &'static str,
+        body: Vec<u8>,
+    }
+
+    impl StubHttpResponse {
+        fn text(status_code: u16, body: impl Into<String>) -> Self {
+            Self {
+                status_code,
+                content_type: "text/plain; charset=utf-8",
+                body: body.into().into_bytes(),
+            }
+        }
+
+        fn bytes(status_code: u16, body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                status_code,
+                content_type: "application/octet-stream",
+                body: body.into(),
+            }
+        }
+    }
+
+    fn start_http_server<F>(
+        expected_requests: usize,
+        build_routes: F,
+    ) -> (String, thread::JoinHandle<()>)
+    where
+        F: FnOnce(&str) -> HashMap<String, StubHttpResponse>,
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind http listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        let routes = build_routes(&base_url);
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept http request");
+                let path = read_http_request_path(&mut stream);
+                let response = routes
+                    .get(&path)
+                    .unwrap_or_else(|| panic!("unexpected HTTP path {path}"));
+                let reason = match response.status_code {
+                    200 => "OK",
+                    404 => "Not Found",
+                    _ => "Response",
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
+                    response.status_code,
+                    reason,
+                    response.body.len(),
+                    response.content_type,
+                )
+                .expect("write HTTP headers");
+                stream.write_all(&response.body).expect("write HTTP body");
+                stream.flush().expect("flush HTTP response");
+            }
+        });
+
+        (base_url, handle)
+    }
+
+    fn read_http_request_path(stream: &mut impl Read) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            let read = stream.read(&mut buf).expect("read HTTP request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+        }
+
+        let request_line = String::from_utf8_lossy(&request);
+        request_line
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string()
+    }
+
+    fn complete_imap_config(encryption: ImapEncryption) -> ImapConfig {
+        ImapConfig {
+            email: Some("me@example.com".to_string()),
+            user: Some("imap-user".to_string()),
+            pass: Some("imap-pass".to_string()),
+            server: Some("imap.example.com".to_string()),
+            server_port: Some(993),
+            encryption: Some(encryption),
+            proxy: None,
         }
     }
 
@@ -2280,16 +2533,139 @@ mod tests {
     }
 
     #[test]
+    fn fixture_client_requires_connect_and_reports_invalid_sources() {
+        let missing_root = temp_dir("fixture-missing-root");
+        fs::remove_dir_all(&missing_root).expect("remove root");
+        let mut client = FixtureImapClient::new(missing_root.clone(), 1);
+        let error = client.connect().expect_err("missing root should fail");
+        assert!(error.to_string().contains("does not exist"));
+
+        let file_root = temp_dir("fixture-file-root");
+        let file_path = file_root.join("fixture.eml");
+        fs::write(&file_path, "mail").expect("write fixture file");
+        let mut file_client = FixtureImapClient::new(file_path.clone(), 1);
+        let error = file_client.connect().expect_err("file root should fail");
+        assert!(error.to_string().contains("is not a directory"));
+
+        let valid_root = temp_dir("fixture-disconnected");
+        fs::write(
+            valid_root.join("1.eml"),
+            "Message-ID: <disconnected@example.com>\nSubject: disconnected\n\nbody\n",
+        )
+        .expect("write fixture mail");
+        let mut disconnected = FixtureImapClient::new(valid_root.clone(), 1);
+        let error = disconnected
+            .select_mailbox("inbox")
+            .expect_err("select without connect should fail");
+        assert!(error.to_string().contains("client is not connected"));
+
+        disconnected.connect().expect("connect fixture");
+        fs::remove_dir_all(&valid_root).expect("remove fixture root after connect");
+        let error = disconnected
+            .select_mailbox("inbox")
+            .expect_err("missing mailbox directory should fail");
+        assert!(error.to_string().contains("mailbox directory"));
+
+        let _ = fs::remove_dir_all(file_root);
+    }
+
+    #[test]
+    fn fixture_client_scans_subdirectories_deduplicates_uids_and_parses_flags() {
+        let root = temp_dir("fixture-subdir");
+        let mailbox_dir = root.join("inbox");
+        fs::create_dir_all(&mailbox_dir).expect("create mailbox dir");
+        fs::write(
+            mailbox_dir.join("1-a.eml"),
+            "Message-ID: <a@example.com>\nSubject: a\nX-Flags: Seen, Flagged\n\nbody\n",
+        )
+        .expect("write first mail");
+        thread::sleep(Duration::from_millis(5));
+        fs::write(
+            mailbox_dir.join("1-b.eml"),
+            "Message-ID: <b@example.com>\nSubject: b\nX-Flags: Answered,\n Flagged\n\nbody\n",
+        )
+        .expect("write second mail");
+        fs::write(
+            mailbox_dir.join("note.eml"),
+            "Message-ID: <c@example.com>\nSubject: c\n\nbody\n",
+        )
+        .expect("write third mail");
+
+        let mut client = FixtureImapClient::new(root.clone(), 77);
+        client.connect().expect("connect");
+        let snapshot = client.select_mailbox("inbox").expect("select mailbox");
+        assert_eq!(snapshot.uidvalidity, 77);
+        assert_eq!(snapshot.highest_uid, 3);
+        assert!(snapshot.highest_modseq.is_some());
+
+        let fetched = client
+            .fetch_incremental("inbox", 0, None)
+            .expect("fetch fixture mail");
+        assert_eq!(
+            fetched.iter().map(|mail| mail.uid).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            fetched[0].flags,
+            vec!["Seen".to_string(), "Flagged".to_string()]
+        );
+        assert_eq!(
+            fetched[1].flags,
+            vec!["Answered".to_string(), "Flagged".to_string()]
+        );
+
+        let incremental = client
+            .fetch_incremental("inbox", 1, None)
+            .expect("fetch after uid");
+        assert_eq!(
+            incremental.iter().map(|mail| mail.uid).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fixture_client_reports_invalid_uidvalidity_marker() {
+        let root = temp_dir("uidvalidity-invalid");
+        fs::write(root.join(".uidvalidity"), "not-a-number\n").expect("write marker");
+        fs::write(
+            root.join("1.eml"),
+            "Message-ID: <x@example.com>\nSubject: x\n\nbody\n",
+        )
+        .expect("write message");
+
+        let mut client = FixtureImapClient::new(root.clone(), 1);
+        client.connect().expect("connect");
+        let error = client
+            .select_mailbox("inbox")
+            .expect_err("invalid UIDVALIDITY should fail");
+        assert!(error.to_string().contains("invalid UIDVALIDITY value"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blank_uidvalidity_marker_falls_back_to_default() {
+        let root = temp_dir("uidvalidity-blank");
+        fs::write(root.join(".uidvalidity"), " \n").expect("write marker");
+        fs::write(
+            root.join("1.eml"),
+            "Message-ID: <x@example.com>\nSubject: x\n\nbody\n",
+        )
+        .expect("write message");
+
+        let mut client = FixtureImapClient::new(root.clone(), 55);
+        client.connect().expect("connect");
+        let snapshot = client.select_mailbox("inbox").expect("select mailbox");
+        assert_eq!(snapshot.uidvalidity, 55);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn remote_client_accepts_complete_config() {
-        let client = RemoteImapClient::new(ImapConfig {
-            email: Some("me@example.com".to_string()),
-            user: Some("imap-user".to_string()),
-            pass: Some("imap-pass".to_string()),
-            server: Some("imap.example.com".to_string()),
-            server_port: Some(993),
-            encryption: Some(ImapEncryption::Tls),
-            proxy: None,
-        });
+        let client = RemoteImapClient::new(complete_imap_config(ImapEncryption::Tls));
 
         assert!(client.is_ok());
     }
@@ -2309,6 +2685,292 @@ mod tests {
         .expect("incomplete config should fail");
 
         assert!(error.to_string().contains("imap.pass"));
+    }
+
+    #[test]
+    fn lore_client_selects_and_fetches_incremental_from_local_server() {
+        let first_modseq = parse_atom_timestamp("2026-03-03T09:00:00+00:00").expect("first ts");
+        let second_modseq = parse_atom_timestamp("2026-03-03T10:00:00+00:00").expect("second ts");
+        let feed = r#"
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>https://lore.kernel.org/io-uring/msg-a/</id>
+    <updated>2026-03-03T09:00:00+00:00</updated>
+    <link rel="alternate" href="https://lore.kernel.org/io-uring/msg-a/" />
+  </entry>
+  <entry>
+    <id>https://lore.kernel.org/io-uring/msg-b/</id>
+    <updated>2026-03-03T10:00:00+00:00</updated>
+    <link rel="alternate" href="https://lore.kernel.org/io-uring/msg-b/" />
+  </entry>
+</feed>
+"#;
+        let base_url = "https://lore.test";
+        let mut client = LoreImapClient::new(Some(base_url)).expect("create lore client");
+        let error = client
+            .select_mailbox("io-uring")
+            .expect_err("select before connect should fail");
+        assert!(error.to_string().contains("client is not connected"));
+
+        client.connect().expect("connect lore");
+        assert_eq!(
+            client.feed_url("io-uring"),
+            "https://lore.test/io-uring/new.atom"
+        );
+        let entries = parse_lore_feed_response(&client.feed_url("io-uring"), 200, feed)
+            .expect("parse lore feed response");
+        let snapshot = MailboxSnapshot {
+            uidvalidity: 1,
+            highest_uid: 0,
+            highest_modseq: entries.iter().map(|entry| entry.modseq).max(),
+        };
+        assert_eq!(snapshot.uidvalidity, 1);
+        assert_eq!(snapshot.highest_uid, 0);
+        assert_eq!(snapshot.highest_modseq, Some(second_modseq));
+
+        let raw_by_url = HashMap::from([(
+            "https://lore.kernel.org/io-uring/msg-b/raw".to_string(),
+            b"Message-ID: <msg-b@example.com>\n\nbody\n".to_vec(),
+        )]);
+        let fetched = build_lore_incremental_mails(entries, Some(first_modseq), |message_url| {
+            fetch_lore_raw_with(message_url, |raw_url| {
+                Ok((200, raw_by_url.get(raw_url).cloned().unwrap_or_default()))
+            })
+        })
+        .expect("fetch incremental lore");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].modseq, Some(second_modseq));
+        assert!(String::from_utf8_lossy(&fetched[0].raw).contains("msg-b@example.com"));
+    }
+
+    #[test]
+    fn lore_client_fetches_feed_and_raw_over_http() {
+        let first_modseq = parse_atom_timestamp("2026-03-03T09:00:00+00:00").expect("first ts");
+        let second_modseq = parse_atom_timestamp("2026-03-03T10:00:00+00:00").expect("second ts");
+        let (base_url, handle) = start_http_server(4, |base_url| {
+            let feed = format!(
+                r#"
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>{base_url}/io-uring/msg-a/</id>
+    <updated>2026-03-03T09:00:00+00:00</updated>
+    <link rel="alternate" href="{base_url}/io-uring/msg-a/" />
+  </entry>
+  <entry>
+    <id>{base_url}/io-uring/msg-b/</id>
+    <updated>2026-03-03T10:00:00+00:00</updated>
+    <link rel="alternate" href="{base_url}/io-uring/msg-b/" />
+  </entry>
+</feed>
+"#
+            );
+            HashMap::from([
+                (
+                    "/io-uring/new.atom".to_string(),
+                    StubHttpResponse::text(200, feed),
+                ),
+                (
+                    "/io-uring/msg-b/raw".to_string(),
+                    StubHttpResponse::text(404, ""),
+                ),
+                (
+                    "/io-uring/msg-b/raw/".to_string(),
+                    StubHttpResponse::bytes(
+                        200,
+                        b"Message-ID: <msg-b@example.com>\nSubject: message b\n\nbody\n".to_vec(),
+                    ),
+                ),
+            ])
+        });
+
+        let mut client = LoreImapClient::new(Some(&base_url)).expect("create lore client");
+        client.connect().expect("connect lore");
+
+        let snapshot = client
+            .select_mailbox("/io-uring/")
+            .expect("select lore mailbox");
+        assert_eq!(snapshot.uidvalidity, 1);
+        assert_eq!(snapshot.highest_uid, 0);
+        assert_eq!(snapshot.highest_modseq, Some(second_modseq));
+
+        let fetched = client
+            .fetch_incremental("io-uring", 0, Some(first_modseq))
+            .expect("fetch lore mails");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].modseq, Some(second_modseq));
+        assert!(String::from_utf8_lossy(&fetched[0].raw).contains("msg-b@example.com"));
+
+        handle.join().expect("join HTTP server");
+    }
+
+    #[test]
+    fn lore_client_reports_feed_http_errors_from_server() {
+        let (base_url, handle) = start_http_server(1, |_| {
+            HashMap::from([(
+                "/broken/new.atom".to_string(),
+                StubHttpResponse::text(404, "missing mailbox"),
+            )])
+        });
+
+        let mut client = LoreImapClient::new(Some(&base_url)).expect("create lore client");
+        client.connect().expect("connect lore");
+
+        let error = client
+            .select_mailbox("broken")
+            .expect_err("HTTP errors should fail mailbox selection");
+        assert!(error.to_string().contains("HTTP 404"));
+
+        handle.join().expect("join HTTP server");
+    }
+
+    #[test]
+    fn lore_client_reports_empty_raw_message_after_trying_candidates() {
+        let error = fetch_lore_raw_with("https://lore.kernel.org/io-uring/msg-empty/", |_| {
+            Ok((200, Vec::new()))
+        })
+        .expect_err("empty raw should fail");
+        assert!(error.to_string().contains("lore raw message is empty"));
+    }
+
+    #[test]
+    fn gnu_archive_client_selects_and_fetches_incremental_from_local_server() {
+        let feb_modseq =
+            parse_gnu_archive_listing_timestamp("2026-02-26", "09:12").expect("feb timestamp");
+        let html = r#"
+<pre>
+<a href="2026-02">2026-02</a> 2026-02-26 09:12  855K
+<a href="2026-03">2026-03</a> 2026-03-07 06:37  341K
+</pre>
+"#;
+        let mbox = b"From MAILER-DAEMON Tue Mar 03 04:39:31 2026\nMessage-ID: <msg-a@example.com>\nSubject: one\n\nbody\nFrom MAILER-DAEMON Tue Mar 03 04:40:31 2026\nMessage-ID: <msg-b@example.com>\nSubject: two\n\nbody two\n";
+        let mut client =
+            GnuArchiveClient::new(Some("https://archive.test")).expect("create archive client");
+        let error = client
+            .select_mailbox("mailbox")
+            .expect_err("select before connect should fail");
+        assert!(error.to_string().contains("client is not connected"));
+
+        client.connect().expect("connect archive");
+        assert_eq!(client.index_url("mailbox"), "https://archive.test/mailbox/");
+        assert_eq!(
+            client.month_url("mailbox", "2026-03"),
+            "https://archive.test/mailbox/2026-03"
+        );
+        let months = parse_gnu_archive_index_response(&client.index_url("mailbox"), 200, html)
+            .expect("parse archive index");
+        let snapshot = MailboxSnapshot {
+            uidvalidity: 1,
+            highest_uid: 0,
+            highest_modseq: months.iter().map(|entry| entry.modseq).max(),
+        };
+        assert_eq!(snapshot.uidvalidity, 1);
+        assert_eq!(snapshot.highest_uid, 0);
+        assert!(snapshot.highest_modseq.is_some());
+
+        let fetched = build_gnu_archive_incremental_mails(&months, Some(feb_modseq), |month_key| {
+            let url = client.month_url("mailbox", month_key);
+            validate_gnu_archive_mbox_response(&url, 200, mbox.to_vec())
+        })
+        .expect("fetch gnu archive");
+        assert_eq!(fetched.len(), 2);
+        assert_eq!(fetched[0].uid, 314_000_001);
+        assert_eq!(fetched[1].uid, 314_000_002);
+    }
+
+    #[test]
+    fn gnu_archive_client_fetches_index_and_mbox_over_http() {
+        let feb_modseq =
+            parse_gnu_archive_listing_timestamp("2026-02-26", "09:12").expect("feb timestamp");
+        let (base_url, handle) = start_http_server(3, |_| {
+            let html = r#"
+<pre>
+<a href="2026-02">2026-02</a> 2026-02-26 09:12  855K
+<a href="2026-03">2026-03</a> 2026-03-07 06:37  341K
+</pre>
+"#;
+            let mbox = b"From MAILER-DAEMON Tue Mar 03 04:39:31 2026\nMessage-ID: <msg-a@example.com>\nSubject: one\n\nbody\nFrom MAILER-DAEMON Tue Mar 03 04:40:31 2026\nMessage-ID: <msg-b@example.com>\nSubject: two\n\nbody two\n";
+            HashMap::from([
+                ("/mailbox/".to_string(), StubHttpResponse::text(200, html)),
+                (
+                    "/mailbox/2026-03".to_string(),
+                    StubHttpResponse::bytes(200, mbox.to_vec()),
+                ),
+            ])
+        });
+
+        let mut client = GnuArchiveClient::new(Some(&base_url)).expect("create archive client");
+        client.connect().expect("connect archive");
+
+        let snapshot = client
+            .select_mailbox("/mailbox/")
+            .expect("select archive mailbox");
+        assert_eq!(snapshot.uidvalidity, 1);
+        assert_eq!(snapshot.highest_uid, 0);
+        assert!(snapshot.highest_modseq.is_some());
+
+        let fetched = client
+            .fetch_incremental("mailbox", 0, Some(feb_modseq))
+            .expect("fetch archive month");
+        assert_eq!(
+            fetched.iter().map(|mail| mail.uid).collect::<Vec<_>>(),
+            vec![314_000_001, 314_000_002]
+        );
+
+        handle.join().expect("join HTTP server");
+    }
+
+    #[test]
+    fn gnu_archive_client_reports_mbox_http_errors_from_server() {
+        let feb_modseq =
+            parse_gnu_archive_listing_timestamp("2026-02-26", "09:12").expect("feb timestamp");
+        let (base_url, handle) = start_http_server(2, |_| {
+            let html = r#"
+<pre>
+<a href="2026-02">2026-02</a> 2026-02-26 09:12  855K
+<a href="2026-03">2026-03</a> 2026-03-07 06:37  341K
+</pre>
+"#;
+            HashMap::from([
+                ("/mailbox/".to_string(), StubHttpResponse::text(200, html)),
+                (
+                    "/mailbox/2026-03".to_string(),
+                    StubHttpResponse::text(404, "month not found"),
+                ),
+            ])
+        });
+
+        let mut client = GnuArchiveClient::new(Some(&base_url)).expect("create archive client");
+        client.connect().expect("connect archive");
+
+        let error = client
+            .fetch_incremental("mailbox", 0, Some(feb_modseq))
+            .expect_err("HTTP errors should fail archive fetch");
+        assert!(error.to_string().contains("HTTP 404"));
+
+        handle.join().expect("join HTTP server");
+    }
+
+    #[test]
+    fn http_clients_surface_transport_errors_before_receiving_responses() {
+        let mut lore_client =
+            LoreImapClient::new(Some("http://127.0.0.1:1")).expect("create lore client");
+        lore_client.connect().expect("connect lore");
+        let lore_error = lore_client
+            .select_mailbox("io-uring")
+            .expect_err("missing listener should fail feed fetch");
+        assert!(lore_error.to_string().contains("failed to fetch lore feed"));
+
+        let mut archive_client =
+            GnuArchiveClient::new(Some("http://127.0.0.1:1")).expect("create archive client");
+        archive_client.connect().expect("connect archive");
+        let archive_error = archive_client
+            .select_mailbox("mailbox")
+            .expect_err("missing listener should fail archive fetch");
+        assert!(
+            archive_error
+                .to_string()
+                .contains("failed to fetch GNU archive index")
+        );
     }
 
     #[test]
@@ -2371,6 +3033,38 @@ mod tests {
     }
 
     #[test]
+    fn imap_proxy_parser_rejects_invalid_proxy_urls() {
+        let proxy = parse_imap_proxy("http://127.0.0.1").expect("default http port");
+        assert_eq!(proxy.redacted_url(), "http://127.0.0.1:80");
+        let socks_proxy = parse_imap_proxy("socks5h://127.0.0.1").expect("default socks5 port");
+        assert_eq!(socks_proxy.redacted_url(), "socks5://127.0.0.1:1080");
+
+        let unsupported =
+            parse_imap_proxy("https://127.0.0.1:443").expect_err("unsupported scheme should fail");
+        assert!(
+            unsupported
+                .to_string()
+                .contains("unsupported IMAP proxy scheme")
+        );
+
+        let auth = parse_imap_proxy("http://user:pass@127.0.0.1:8080")
+            .expect_err("proxy auth should fail");
+        assert!(auth.to_string().contains("authentication is not supported"));
+
+        let path_error =
+            parse_imap_proxy("http://127.0.0.1:8080/proxy").expect_err("path should fail");
+        assert!(
+            path_error
+                .to_string()
+                .contains("remove path, query, and fragment")
+        );
+
+        let missing_host =
+            parse_imap_proxy("http:///").expect_err("missing host should fail proxy parsing");
+        assert!(missing_host.to_string().contains("invalid IMAP proxy URL"));
+    }
+
+    #[test]
     fn http_proxy_connect_tunnels_imap_socket() {
         let proxy = parse_imap_proxy("http://127.0.0.1:7890").expect("parse proxy");
         let mut stream = MockStream::with_reads(b"HTTP/1.1 200 Connection established\r\n\r\n");
@@ -2381,6 +3075,64 @@ mod tests {
         let request_text = String::from_utf8(stream.writes).expect("request utf8");
         assert!(request_text.starts_with("CONNECT imap.gmail.com:993 HTTP/1.1\r\n"));
         assert!(request_text.contains("\r\nHost: imap.gmail.com:993\r\n"));
+    }
+
+    #[test]
+    fn http_proxy_helpers_report_truncated_and_rejected_responses() {
+        let proxy = parse_imap_proxy("http://127.0.0.1:7890").expect("parse proxy");
+
+        let mut truncated = MockStream::default();
+        let error = read_http_proxy_response(&mut truncated, &proxy, "imap.gmail.com:993")
+            .expect_err("truncated response should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("closed the connection before CONNECT")
+        );
+
+        let mut rejected = MockStream::with_reads(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+        let error = establish_http_connect_tunnel(&mut rejected, &proxy, "imap.gmail.com", 993)
+            .expect_err("non-2xx connect should fail");
+        assert!(error.to_string().contains("rejected CONNECT"));
+
+        let oversized = vec![b'a'; super::HTTP_PROXY_RESPONSE_MAX_BYTES + 1];
+        let mut oversized_stream = MockStream::with_reads(&oversized);
+        let error = read_http_proxy_response(&mut oversized_stream, &proxy, "imap.gmail.com:993")
+            .expect_err("oversized responses should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("sent too much HTTP response data")
+        );
+
+        let mut read_error_stream = ReadFailsStream;
+        let error = read_http_proxy_response(&mut read_error_stream, &proxy, "imap.gmail.com:993")
+            .expect_err("proxy read failures should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("failed while reading IMAP proxy")
+        );
+
+        let mut write_error_stream = WriteFailsStream;
+        let error =
+            establish_http_connect_tunnel(&mut write_error_stream, &proxy, "imap.gmail.com", 993)
+                .expect_err("write failures should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to send IMAP CONNECT request")
+        );
+
+        let mut flush_error_stream = FlushFailsStream;
+        let error =
+            establish_http_connect_tunnel(&mut flush_error_stream, &proxy, "imap.gmail.com", 993)
+                .expect_err("flush failures should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to flush IMAP CONNECT request")
+        );
     }
 
     #[test]
@@ -2403,6 +3155,498 @@ mod tests {
                 0x05, 0x01, 0x00, 0x03, 14, b'i', b'm', b'a', b'p', b'.', b'g', b'm', b'a', b'i',
                 b'l', b'.', b'c', b'o', b'm', 0x03, 0xe1
             ]
+        );
+    }
+
+    #[test]
+    fn socks5_proxy_reports_handshake_and_connect_failures() {
+        let proxy = parse_imap_proxy("socks5://127.0.0.1:7890").expect("parse proxy");
+
+        let mut invalid_version = MockStream::with_reads(&[0x04, 0x00]);
+        let error = establish_socks5_tunnel(&mut invalid_version, &proxy, "imap.gmail.com", 993)
+            .expect_err("invalid version should fail");
+        assert!(error.to_string().contains("invalid SOCKS5 version"));
+
+        let mut unauthenticated = MockStream::with_reads(&[0x05, 0x02]);
+        let error = establish_socks5_tunnel(&mut unauthenticated, &proxy, "imap.gmail.com", 993)
+            .expect_err("auth required should fail");
+        assert!(error.to_string().contains("does not allow unauthenticated"));
+
+        let mut connect_failed = MockStream::with_reads(&[0x05, 0x00, 0x05, 0x05, 0x00]);
+        let error = establish_socks5_tunnel(&mut connect_failed, &proxy, "imap.gmail.com", 993)
+            .expect_err("connect reply should fail");
+        assert!(error.to_string().contains("connection refused"));
+
+        let mut greeting_read_error = ReadFailsStream;
+        let error =
+            establish_socks5_tunnel(&mut greeting_read_error, &proxy, "imap.gmail.com", 993)
+                .expect_err("greeting read failures should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read SOCKS5 greeting reply")
+        );
+
+        let mut greeting_write_error = WriteFailsStream;
+        let error =
+            establish_socks5_tunnel(&mut greeting_write_error, &proxy, "imap.gmail.com", 993)
+                .expect_err("greeting write failures should surface");
+        assert!(error.to_string().contains("failed to send SOCKS5 greeting"));
+
+        let too_long_host = "a".repeat(256);
+        let mut host_length_stream = MockStream::with_reads(&[0x05, 0x00]);
+        let error = establish_socks5_tunnel(&mut host_length_stream, &proxy, &too_long_host, 993)
+            .expect_err("long hostnames should fail");
+        assert!(error.to_string().contains("too long for SOCKS5 proxying"));
+    }
+
+    #[test]
+    fn socks5_reply_address_reports_decode_failures() {
+        let proxy = parse_imap_proxy("socks5://127.0.0.1:7890").expect("parse proxy");
+
+        let mut atyp_error = ReadFailsStream;
+        let error = super::read_socks5_reply_address(&mut atyp_error, &proxy)
+            .expect_err("ATYP read failures should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read SOCKS5 reply type")
+        );
+
+        let mut domain_length_error = MockStream::with_reads(&[0x03]);
+        let error = super::read_socks5_reply_address(&mut domain_length_error, &proxy)
+            .expect_err("domain length failures should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read SOCKS5 domain length")
+        );
+
+        let mut bind_address_error = MockStream::with_reads(&[0x01]);
+        let error = super::read_socks5_reply_address(&mut bind_address_error, &proxy)
+            .expect_err("bind address failures should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read SOCKS5 bind address")
+        );
+    }
+
+    #[test]
+    fn imap_session_executes_command_flow_over_mock_transport() {
+        let responses = concat!(
+            "* OK hello\r\n",
+            "* CAPABILITY IMAP4rev1 CONDSTORE\r\n",
+            "A0001 OK capability\r\n",
+            "A0002 OK login\r\n",
+            "* OK [UIDVALIDITY 77] valid\r\n",
+            "* OK [UIDNEXT 42] next\r\n",
+            "* OK [HIGHESTMODSEQ 9001] modseq\r\n",
+            "A0003 OK select\r\n",
+            "* SEARCH 4 5 5 9\r\n",
+            "A0004 OK search\r\n",
+            "* 1 FETCH (UID 4 FLAGS (\\Seen \\Answered) MODSEQ (20) BODY.PEEK[] {5}\r\n",
+            "hello\r\n",
+            ")\r\n",
+            "A0005 OK fetch\r\n"
+        );
+        let mut session =
+            ImapSession::with_mock_stream(MockStream::with_reads(responses.as_bytes()));
+
+        assert_eq!(
+            session.read_greeting().expect("read greeting"),
+            GreetingKind::Ok
+        );
+        let capabilities = session.fetch_capabilities().expect("fetch capabilities");
+        assert!(capabilities.contains("IMAP4REV1"));
+        assert!(capabilities.contains("CONDSTORE"));
+        session.capabilities = capabilities;
+
+        let config = ImapConfig {
+            email: Some("me@example.com".to_string()),
+            user: Some("imap-user".to_string()),
+            pass: Some("imap-pass".to_string()),
+            server: Some("imap.example.com".to_string()),
+            server_port: Some(993),
+            encryption: Some(ImapEncryption::Tls),
+            proxy: None,
+        };
+        session.login(&config).expect("login");
+
+        let snapshot = session.select_mailbox("INBOX").expect("select");
+        assert_eq!(snapshot.uidvalidity, 77);
+        assert_eq!(snapshot.highest_uid, 41);
+        assert_eq!(snapshot.highest_modseq, Some(9001));
+
+        let uids = session.search_uid_range(4).expect("search uids");
+        assert_eq!(uids, vec![4, 5, 9]);
+
+        let fetched = session.fetch_uids(&[4], "BODY.PEEK[]").expect("fetch uids");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].uid, 4);
+        assert_eq!(fetched[0].modseq, Some(20));
+        assert_eq!(
+            fetched[0].flags,
+            vec!["\\Seen".to_string(), "\\Answered".to_string()]
+        );
+        assert_eq!(fetched[0].raw, b"hello".to_vec());
+    }
+
+    #[test]
+    fn imap_session_handles_greeting_login_and_fetch_failures() {
+        let mut bye_session =
+            ImapSession::with_mock_stream(MockStream::with_reads(b"* BYE go away\r\n"));
+        let error = bye_session
+            .read_greeting()
+            .expect_err("BYE greeting should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("server closed connection during greeting")
+        );
+
+        let mut plaintext_session = ImapSession::with_mock_stream(MockStream::default());
+        plaintext_session
+            .capabilities
+            .insert("LOGINDISABLED".to_string());
+        let config = ImapConfig {
+            email: Some("me@example.com".to_string()),
+            user: Some("imap-user".to_string()),
+            pass: Some("imap-pass".to_string()),
+            server: Some("imap.example.com".to_string()),
+            server_port: Some(143),
+            encryption: Some(ImapEncryption::None),
+            proxy: None,
+        };
+        let error = plaintext_session
+            .login(&config)
+            .expect_err("plaintext login should be rejected");
+        assert!(error.to_string().contains("disallows LOGIN over plaintext"));
+
+        let mut fetch_session = ImapSession::with_mock_stream(MockStream::with_reads(
+            b"* 1 FETCH (FLAGS (\\Seen) BODY.PEEK[] {5}\r\nhello\r\n)\r\nA0001 OK fetch\r\n",
+        ));
+        let error = fetch_session
+            .fetch_uid_chunk(&[4], "BODY.PEEK[]")
+            .expect_err("missing UID should fail");
+        assert!(error.to_string().contains("missing UID in FETCH response"));
+
+        let mut eof_session = ImapSession::with_mock_stream(MockStream::default());
+        let error = eof_session
+            .read_line_string()
+            .expect_err("EOF while reading line should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected EOF while reading IMAP response")
+        );
+    }
+
+    #[test]
+    fn imap_session_covers_misc_defaults_and_protocol_edges() {
+        let mut preauth_session =
+            ImapSession::with_mock_stream(MockStream::with_reads(b"* PREAUTH welcome\r\n"));
+        assert_eq!(
+            preauth_session.read_greeting().expect("PREAUTH greeting"),
+            GreetingKind::Preauth
+        );
+
+        let mut unexpected_session =
+            ImapSession::with_mock_stream(MockStream::with_reads(b"* WHAT welcome\r\n"));
+        let error = unexpected_session
+            .read_greeting()
+            .expect_err("unexpected greeting should fail");
+        assert!(error.to_string().contains("unexpected IMAP greeting"));
+
+        let mut missing_user_session = ImapSession::with_mock_stream(MockStream::default());
+        let error = missing_user_session
+            .login(&ImapConfig {
+                email: None,
+                user: None,
+                pass: Some("imap-pass".to_string()),
+                server: Some("imap.example.com".to_string()),
+                server_port: Some(993),
+                encryption: Some(ImapEncryption::Tls),
+                proxy: None,
+            })
+            .expect_err("missing user should fail");
+        assert!(error.to_string().contains("missing imap.user"));
+
+        let mut missing_pass_session = ImapSession::with_mock_stream(MockStream::default());
+        let error = missing_pass_session
+            .login(&ImapConfig {
+                email: Some("me@example.com".to_string()),
+                user: Some("imap-user".to_string()),
+                pass: None,
+                server: Some("imap.example.com".to_string()),
+                server_port: Some(993),
+                encryption: Some(ImapEncryption::Tls),
+                proxy: None,
+            })
+            .expect_err("missing pass should fail");
+        assert!(error.to_string().contains("missing imap.pass"));
+
+        let mut default_select = ImapSession::with_mock_stream(MockStream::with_reads(
+            b"* FLAGS (\\Seen)\r\nA0001 OK [READ-WRITE] select\r\n",
+        ));
+        let snapshot = default_select
+            .select_mailbox("INBOX")
+            .expect("select mailbox with defaults");
+        assert_eq!(snapshot.uidvalidity, 1);
+        assert_eq!(snapshot.highest_uid, 0);
+        assert_eq!(snapshot.highest_modseq, None);
+
+        let mut noisy_search = ImapSession::with_mock_stream(MockStream::with_reads(
+            b"* OK noop\r\n* SEARCH 7 nope 9\r\nA0001 OK search\r\n",
+        ));
+        let uids = noisy_search.search_uid_range(7).expect("search with noise");
+        assert_eq!(uids, vec![7, 9]);
+
+        let mut empty_fetches = ImapSession::with_mock_stream(MockStream::default());
+        assert!(
+            empty_fetches
+                .fetch_uids(&[], "BODY.PEEK[]")
+                .expect("empty uid list")
+                .is_empty()
+        );
+        assert!(
+            empty_fetches
+                .fetch_uid_chunk(&[], "BODY.PEEK[]")
+                .expect("empty uid chunk")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn imap_session_reports_fetch_trailer_and_io_failures() {
+        let mut missing_literal = ImapSession::with_mock_stream(MockStream::with_reads(
+            b"* 1 FETCH (UID 4 FLAGS (\\Seen) BODY.PEEK[]\r\nA0001 OK fetch\r\n",
+        ));
+        let error = missing_literal
+            .fetch_uid_chunk(&[4], "BODY.PEEK[]")
+            .expect_err("missing literal should fail");
+        assert!(error.to_string().contains("missing literal size"));
+
+        let mut truncated_trailer = ImapSession::with_mock_stream(MockStream::with_reads(
+            b"* 1 FETCH (UID 4 FLAGS (\\Seen) MODSEQ (20) BODY.PEEK[] {5}\r\nhello\r\nA0001 OK fetch\r\n",
+        ));
+        let error = truncated_trailer
+            .fetch_uid_chunk(&[4], "BODY.PEEK[]")
+            .expect_err("truncated trailer should fail");
+        assert!(error.to_string().contains("truncated FETCH trailer"));
+
+        let mut write_error_session = ImapSession::with_mock_stream(WriteFailsStream);
+        let error = write_error_session
+            .write_command("A0001", "NOOP")
+            .expect_err("write failures should surface");
+        assert!(error.to_string().contains("failed to write IMAP command"));
+
+        let mut flush_error_session = ImapSession::with_mock_stream(FlushFailsStream);
+        let error = flush_error_session
+            .write_command("A0001", "NOOP")
+            .expect_err("flush failures should surface");
+        assert!(error.to_string().contains("failed to flush IMAP command"));
+
+        let mut read_line_error_session = ImapSession::with_mock_stream(ReadFailsStream);
+        let error = read_line_error_session
+            .read_line_bytes()
+            .expect_err("socket read failures should surface");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read from IMAP socket")
+        );
+
+        let mut read_literal_error_session = ImapSession::with_mock_stream(ReadFailsStream);
+        let error = read_literal_error_session
+            .read_exact_bytes(4)
+            .expect_err("literal read failures should surface");
+        assert!(error.to_string().contains("failed to read IMAP literal"));
+    }
+
+    #[test]
+    fn collect_incremental_uids_merges_uid_and_modseq_search_results() {
+        let responses = concat!(
+            "* SEARCH 7 8\r\n",
+            "A0001 OK search\r\n",
+            "* SEARCH 8 9\r\n",
+            "A0002 OK search\r\n"
+        );
+        let mut session =
+            ImapSession::with_mock_stream(MockStream::with_reads(responses.as_bytes()));
+        let snapshot = MailboxSnapshot {
+            uidvalidity: 1,
+            highest_uid: 9,
+            highest_modseq: Some(30),
+        };
+
+        let uids = collect_incremental_uids(&mut session, snapshot, 6, Some(20))
+            .expect("collect incremental uids");
+        assert_eq!(uids, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn imap_session_connect_rejects_missing_runtime_fields() {
+        let missing_server = ImapSession::connect(&ImapConfig {
+            email: Some("me@example.com".to_string()),
+            user: Some("imap-user".to_string()),
+            pass: Some("imap-pass".to_string()),
+            server: None,
+            server_port: Some(993),
+            encryption: Some(ImapEncryption::Tls),
+            proxy: None,
+        })
+        .err()
+        .expect("missing server should fail");
+        assert!(missing_server.to_string().contains("missing imap.server"));
+
+        let missing_port = ImapSession::connect(&ImapConfig {
+            email: Some("me@example.com".to_string()),
+            user: Some("imap-user".to_string()),
+            pass: Some("imap-pass".to_string()),
+            server: Some("imap.example.com".to_string()),
+            server_port: None,
+            encryption: Some(ImapEncryption::Tls),
+            proxy: None,
+        })
+        .err()
+        .expect("missing port should fail");
+        assert!(missing_port.to_string().contains("missing imap.serverport"));
+
+        let missing_encryption = ImapSession::connect(&ImapConfig {
+            email: Some("me@example.com".to_string()),
+            user: Some("imap-user".to_string()),
+            pass: Some("imap-pass".to_string()),
+            server: Some("imap.example.com".to_string()),
+            server_port: Some(993),
+            encryption: None,
+            proxy: None,
+        })
+        .err()
+        .expect("missing encryption should fail");
+        assert!(
+            missing_encryption
+                .to_string()
+                .contains("missing imap.encryption")
+        );
+    }
+
+    #[test]
+    fn remote_client_requires_connected_session_and_delegates_requests() {
+        let config = complete_imap_config(ImapEncryption::Tls);
+
+        let mut disconnected =
+            RemoteImapClient::new(config.clone()).expect("create disconnected remote client");
+        let error = disconnected
+            .select_mailbox("INBOX")
+            .expect_err("missing session should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("remote IMAP session is not connected")
+        );
+
+        let mut select_client = RemoteImapClient {
+            config: config.clone(),
+            session: Some(ImapSession::with_mock_stream(MockStream::with_reads(
+                concat!(
+                    "* OK [UIDVALIDITY 11] valid\r\n",
+                    "* OK [UIDNEXT 4] next\r\n",
+                    "* OK [HIGHESTMODSEQ 22] modseq\r\n",
+                    "A0001 OK select\r\n"
+                )
+                .as_bytes(),
+            ))),
+        };
+        let snapshot = select_client
+            .select_mailbox("INBOX")
+            .expect("delegate mailbox selection");
+        assert_eq!(snapshot.uidvalidity, 11);
+        assert_eq!(snapshot.highest_uid, 3);
+        assert_eq!(snapshot.highest_modseq, Some(22));
+
+        let mut incremental_client = RemoteImapClient {
+            config: config.clone(),
+            session: Some(ImapSession::with_mock_stream(MockStream::with_reads(
+                concat!(
+                    "* OK [UIDVALIDITY 11] valid\r\n",
+                    "* OK [UIDNEXT 4] next\r\n",
+                    "* OK [HIGHESTMODSEQ 22] modseq\r\n",
+                    "A0001 OK select\r\n",
+                    "* SEARCH 2 3\r\n",
+                    "A0002 OK search\r\n",
+                    "* SEARCH 3\r\n",
+                    "A0003 OK search\r\n",
+                    "* 1 FETCH (UID 2 FLAGS (\\Seen) MODSEQ (21) BODY.PEEK[] {5}\r\n",
+                    "hello\r\n",
+                    ")\r\n",
+                    "* 2 FETCH (UID 3 FLAGS (\\Seen) MODSEQ (22) BODY.PEEK[] {5}\r\n",
+                    "world\r\n",
+                    ")\r\n",
+                    "A0004 OK fetch\r\n"
+                )
+                .as_bytes(),
+            ))),
+        };
+        let fetched = incremental_client
+            .fetch_incremental("INBOX", 1, Some(20))
+            .expect("delegate incremental fetch");
+        assert_eq!(
+            fetched.iter().map(|mail| mail.uid).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let mut header_client = RemoteImapClient {
+            config: config.clone(),
+            session: Some(ImapSession::with_mock_stream(MockStream::with_reads(
+                concat!(
+                    "* OK [UIDVALIDITY 11] valid\r\n",
+                    "* OK [UIDNEXT 8] next\r\n",
+                    "* OK [HIGHESTMODSEQ 22] modseq\r\n",
+                    "A0001 OK select\r\n",
+                    "* SEARCH 7\r\n",
+                    "A0002 OK search\r\n",
+                    "* 1 FETCH (UID 7 FLAGS (\\Seen) MODSEQ (22) BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT FROM DATE IN-REPLY-TO REFERENCES LIST-ID)] {5}\r\n",
+                    "headr\r\n",
+                    ")\r\n",
+                    "A0003 OK fetch\r\n"
+                )
+                .as_bytes(),
+            ))),
+        };
+        let header_candidates = header_client
+            .fetch_header_candidates("INBOX", 6, None)
+            .expect("delegate header fetch");
+        assert_eq!(
+            header_candidates
+                .iter()
+                .map(|mail| mail.uid)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+
+        let mut full_uid_client = RemoteImapClient {
+            config,
+            session: Some(ImapSession::with_mock_stream(MockStream::with_reads(
+                concat!(
+                    "* OK [UIDVALIDITY 11] valid\r\n",
+                    "* OK [UIDNEXT 10] next\r\n",
+                    "* OK [HIGHESTMODSEQ 22] modseq\r\n",
+                    "A0001 OK select\r\n",
+                    "* 1 FETCH (UID 9 FLAGS (\\Seen) MODSEQ (22) BODY.PEEK[] {4}\r\n",
+                    "full\r\n",
+                    ")\r\n",
+                    "A0002 OK fetch\r\n"
+                )
+                .as_bytes(),
+            ))),
+        };
+        let full = full_uid_client
+            .fetch_full_uids("INBOX", &[9])
+            .expect("delegate full UID fetch");
+        assert_eq!(
+            full.iter().map(|mail| mail.uid).collect::<Vec<_>>(),
+            vec![9]
         );
     }
 
@@ -2446,6 +3690,32 @@ mod tests {
     fn parses_atom_timestamps() {
         let ts = parse_atom_timestamp("2026-03-03T10:00:00+00:00").expect("timestamp");
         assert!(ts > 0);
+    }
+
+    #[test]
+    fn parsing_helpers_cover_url_normalization_dates_and_flags() {
+        assert_eq!(quote_imap_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(
+            normalize_lore_message_url("https://lore.kernel.org/io-uring/msg/#fragment?query=1")
+                .as_deref(),
+            Some("https://lore.kernel.org/io-uring/msg/")
+        );
+        assert_eq!(normalize_lore_message_url("not-a-url"), None);
+
+        assert_eq!(parse_year_month_key("2026-03"), Some((2026, 3)));
+        assert_eq!(parse_year_month_key("2026-13"), None);
+        assert!(parse_gnu_archive_listing_timestamp("2026-03-07", "06:37").is_some());
+
+        assert_eq!(
+            parse_flags(
+                b"Message-ID: <x@example.com>\r\nX-Flags: Seen,\r\n Flagged Answered\r\n\r\nbody\r\n"
+            ),
+            vec![
+                "Seen".to_string(),
+                "Flagged".to_string(),
+                "Answered".to_string()
+            ]
+        );
     }
 
     #[test]

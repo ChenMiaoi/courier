@@ -131,4 +131,51 @@ mod tests {
 
         let _ = fs::remove_dir_all(&temp_root);
     }
+
+    #[test]
+    fn ensure_installed_is_idempotent_for_existing_runtime_tree() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!(
+            "criew-b4-vendor-repeat-test-{}-{nonce}",
+            std::process::id()
+        ));
+
+        let first = ensure_installed(&temp_root).expect("first embedded b4 install");
+        let second = ensure_installed(&temp_root).expect("second embedded b4 install");
+
+        assert_eq!(first, second);
+        if let Some(script) = second {
+            assert_eq!(script, script_path(&temp_root));
+            assert!(script.exists(), "embedded b4 script should still exist");
+        }
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn ensure_installed_reports_directory_conflicts() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let temp_root = std::env::temp_dir().join(format!(
+            "criew-b4-vendor-conflict-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_root).expect("create temp root");
+        fs::write(temp_root.join("vendor"), "not a directory").expect("write blocking vendor file");
+
+        let error = ensure_installed(&temp_root).expect_err("conflicting vendor path should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create embedded b4 directory")
+        );
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
 }

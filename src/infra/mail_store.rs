@@ -1175,7 +1175,7 @@ mod tests {
 
     use super::{
         IncomingMail, SyncBatch, apply_sync_batch, load_mailbox_state, load_thread_rows_by_mailbox,
-        prune_mailbox_subjects,
+        mailbox_message_count, prune_mailbox_subjects, rebuild_all_threads,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1198,6 +1198,275 @@ mod tests {
             raw_path: PathBuf::from(format!("/tmp/{mailbox}-{uid}.eml")),
             parsed: mail_parser::parse_headers(raw.as_bytes(), fallback_id),
         }
+    }
+
+    fn incoming_at_path(mailbox: &str, uid: u32, raw_path: PathBuf, raw: &str) -> IncomingMail {
+        let fallback_id = format!("synthetic-{mailbox}-{uid}@local");
+        IncomingMail {
+            mailbox: mailbox.to_string(),
+            uid,
+            modseq: Some(uid as u64),
+            flags: vec!["Seen".to_string()],
+            raw_path,
+            parsed: mail_parser::parse_headers(raw.as_bytes(), fallback_id),
+        }
+    }
+
+    fn empty_batch(mailbox: &str) -> SyncBatch {
+        SyncBatch {
+            mailbox: mailbox.to_string(),
+            uidvalidity: 1,
+            highest_uid: 0,
+            highest_modseq: None,
+            mails: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mailbox_state_starts_empty_and_message_count_skips_expunged_rows() {
+        let root = temp_dir("mailbox-state");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let state = load_mailbox_state(&db_path, "inbox").expect("load initial state");
+        assert!(state.is_none());
+
+        let batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 2,
+            highest_modseq: Some(2),
+            mails: vec![
+                incoming(
+                    "inbox",
+                    1,
+                    "Message-ID: <keep@example.com>\nSubject: keep\nFrom: keep@example.com\n\nbody\n",
+                ),
+                incoming(
+                    "inbox",
+                    2,
+                    "Message-ID: <drop@example.com>\nSubject: drop\nFrom: drop@example.com\n\nbody\n",
+                ),
+            ],
+        };
+        apply_sync_batch(&db_path, batch).expect("seed mailbox");
+
+        let connection = Connection::open(&db_path).expect("open db");
+        connection
+            .execute(
+                "UPDATE mail SET is_expunged = 1 WHERE message_id = 'drop@example.com'",
+                [],
+            )
+            .expect("mark expunged");
+        drop(connection);
+
+        let count = mailbox_message_count(&db_path, "inbox").expect("count active mail");
+        assert_eq!(count, 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_sync_batch_preserves_checkpoint_and_skips_thread_rebuild() {
+        let root = temp_dir("empty-batch");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let first_batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 5,
+            highest_modseq: Some(10),
+            mails: vec![incoming(
+                "inbox",
+                5,
+                "Message-ID: <seed@example.com>\nSubject: seed\nFrom: seed@example.com\n\nbody\n",
+            )],
+        };
+        apply_sync_batch(&db_path, first_batch).expect("first sync");
+
+        let second_batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 3,
+            highest_modseq: Some(8),
+            mails: Vec::new(),
+        };
+        let result = apply_sync_batch(&db_path, second_batch).expect("empty sync");
+
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.rebuilt_roots, 0);
+        assert!(!result.mailbox_rebuilt);
+        assert_eq!(result.state.last_seen_uid, 5);
+        assert_eq!(result.state.highest_modseq, Some(10));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn storage_functions_report_clear_errors_for_uninitialized_database() {
+        let root = temp_dir("uninitialized");
+        let db_path = root.join("criew.db");
+        Connection::open(&db_path).expect("create raw sqlite database");
+
+        let load_state_error = load_mailbox_state(&db_path, "inbox")
+            .expect_err("raw database should reject state lookup");
+        assert!(
+            load_state_error
+                .to_string()
+                .contains("failed to load mailbox checkpoint")
+        );
+
+        let count_error = mailbox_message_count(&db_path, "inbox")
+            .expect_err("raw database should reject message counts");
+        assert!(count_error.to_string().contains("failed to count mails"));
+
+        let prune_error = prune_mailbox_subjects(&db_path, "inbox", |_| true)
+            .expect_err("raw database should reject prune queries");
+        assert!(
+            prune_error
+                .to_string()
+                .contains("failed to prepare mailbox prune query")
+        );
+
+        let sync_error = apply_sync_batch(&db_path, empty_batch("inbox"))
+            .expect_err("raw database should reject sync writes");
+        assert!(
+            sync_error
+                .to_string()
+                .contains("failed to load mailbox checkpoint")
+        );
+
+        let rows_error = load_thread_rows_by_mailbox(&db_path, "inbox", 10)
+            .expect_err("raw database should reject thread row loads");
+        assert!(
+            rows_error
+                .to_string()
+                .contains("mailbox-specific thread query")
+        );
+
+        let rebuild_error =
+            rebuild_all_threads(&db_path).expect_err("raw database should reject thread rebuilds");
+        assert!(
+            rebuild_error
+                .to_string()
+                .contains("failed to prepare mail graph query")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_handles_missing_modseq_and_rejects_uidvalidity_overflow() {
+        let root = temp_dir("checkpoint-modseq");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let mut first_mail = incoming(
+            "inbox",
+            1,
+            "Message-ID: <root@example.com>\nSubject: root\nFrom: root@example.com\n\nbody\n",
+        );
+        first_mail.modseq = None;
+        let first = apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: None,
+                mails: vec![first_mail],
+            },
+        )
+        .expect("persist checkpoint without modseq");
+        assert_eq!(first.state.highest_modseq, None);
+
+        let second = apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: Some(7),
+                mails: Vec::new(),
+            },
+        )
+        .expect("adopt first modseq checkpoint");
+        assert_eq!(second.state.highest_modseq, Some(7));
+
+        let third = apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: None,
+                mails: Vec::new(),
+            },
+        )
+        .expect("preserve previous modseq checkpoint");
+        assert_eq!(third.state.highest_modseq, Some(7));
+
+        let overflow = apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: u64::MAX,
+                highest_uid: 1,
+                highest_modseq: Some(8),
+                mails: Vec::new(),
+            },
+        )
+        .expect_err("overflowing uidvalidity should fail");
+        assert!(overflow.to_string().contains("overflows i64 sqlite field"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn apply_sync_batch_reports_missing_checkpoint_after_trigger_removes_it() {
+        let root = temp_dir("checkpoint-trigger");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let connection = Connection::open(&db_path).expect("open db");
+        connection
+            .execute(
+                "
+CREATE TRIGGER delete_mailbox_checkpoint
+AFTER INSERT ON imap_mailbox_state
+BEGIN
+    DELETE FROM imap_mailbox_state WHERE mailbox = NEW.mailbox;
+END
+",
+                [],
+            )
+            .expect("create checkpoint trigger");
+        drop(connection);
+
+        let error = apply_sync_batch(
+            &db_path,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: Some(1),
+                mails: vec![incoming(
+                    "inbox",
+                    1,
+                    "Message-ID: <root@example.com>\nSubject: root\nFrom: root@example.com\n\nbody\n",
+                )],
+            },
+        )
+        .expect_err("missing checkpoint row should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("missing mailbox checkpoint after update")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1388,6 +1657,106 @@ mod tests {
     }
 
     #[test]
+    fn prune_mailbox_subjects_noop_keeps_rows_unchanged() {
+        let root = temp_dir("prune-noop");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 1,
+            highest_modseq: Some(1),
+            mails: vec![incoming(
+                "inbox",
+                1,
+                "Message-ID: <keep@example.com>\nSubject: [PATCH] keep\nFrom: keep@example.com\n\nbody\n",
+            )],
+        };
+        apply_sync_batch(&db_path, batch).expect("seed mailbox");
+
+        let pruned = prune_mailbox_subjects(&db_path, "inbox", |_| true).expect("noop prune");
+        assert_eq!(pruned, 0);
+        assert_eq!(
+            mailbox_message_count(&db_path, "inbox").expect("count mails"),
+            1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_mailbox_subjects_tolerates_missing_raw_files() {
+        let root = temp_dir("prune-missing-raw");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let raw_path = root.join("status.eml");
+        fs::write(&raw_path, "raw mail").expect("write raw mail");
+        let batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 1,
+            highest_modseq: Some(1),
+            mails: vec![incoming_at_path(
+                "inbox",
+                1,
+                raw_path.clone(),
+                "Message-ID: <status@example.com>\nSubject: status\nFrom: status@example.com\n\nbody\n",
+            )],
+        };
+        apply_sync_batch(&db_path, batch).expect("seed mailbox");
+        fs::remove_file(&raw_path).expect("remove raw mail before prune");
+
+        let pruned =
+            prune_mailbox_subjects(&db_path, "inbox", |_| false).expect("prune missing raw file");
+        assert_eq!(pruned, 1);
+        assert_eq!(
+            mailbox_message_count(&db_path, "inbox").expect("count remaining mail"),
+            0
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prune_mailbox_subjects_keeps_database_progress_when_raw_cleanup_fails() {
+        let root = temp_dir("prune-raw-error");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let raw_dir = root.join("raw-dir");
+        fs::create_dir_all(&raw_dir).expect("create raw directory");
+        let batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 1,
+            highest_modseq: Some(1),
+            mails: vec![incoming_at_path(
+                "inbox",
+                1,
+                raw_dir.clone(),
+                "Message-ID: <status@example.com>\nSubject: status\nFrom: status@example.com\n\nbody\n",
+            )],
+        };
+        apply_sync_batch(&db_path, batch).expect("seed mailbox");
+
+        let pruned = prune_mailbox_subjects(&db_path, "inbox", |_| false)
+            .expect("cleanup failures should not roll back prune");
+        assert_eq!(pruned, 1);
+        assert_eq!(
+            mailbox_message_count(&db_path, "inbox").expect("count remaining mail"),
+            0
+        );
+        assert!(
+            raw_dir.exists(),
+            "raw cleanup failure should leave directory intact"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn threading_prefers_references_then_in_reply_to() {
         let root = temp_dir("threading");
         let db_path = root.join("criew.db");
@@ -1563,6 +1932,249 @@ WHERE m.message_id = 'grand@example.com'
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].message_id, "thread-a@example.com");
         assert_eq!(rows[1].message_id, "thread-b@example.com");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rebuild_all_threads_restores_materialized_rows_after_manual_deletion() {
+        let root = temp_dir("rebuild-all");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 2,
+            highest_modseq: Some(2),
+            mails: vec![
+                incoming(
+                    "inbox",
+                    1,
+                    "Message-ID: <root@example.com>\nSubject: root\nFrom: root@example.com\n\nbody\n",
+                ),
+                incoming(
+                    "inbox",
+                    2,
+                    "Message-ID: <reply@example.com>\nSubject: Re: root\nFrom: reply@example.com\nIn-Reply-To: <root@example.com>\nReferences: <root@example.com>\n\nbody\n",
+                ),
+            ],
+        };
+        apply_sync_batch(&db_path, batch).expect("seed mailbox");
+
+        let connection = Connection::open(&db_path).expect("open db");
+        connection
+            .execute("DELETE FROM thread_node", [])
+            .expect("clear thread nodes");
+        connection
+            .execute("DELETE FROM thread", [])
+            .expect("clear threads");
+        drop(connection);
+
+        let rebuilt = rebuild_all_threads(&db_path).expect("rebuild threads");
+        assert_eq!(rebuilt, 1);
+
+        let rows = load_thread_rows_by_mailbox(&db_path, "inbox", 20).expect("load rebuilt rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].message_id, "root@example.com");
+        assert_eq!(rows[1].message_id, "reply@example.com");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cyclic_references_degrade_to_a_stable_thread_shape() {
+        let root = temp_dir("cycle");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 2,
+            highest_modseq: Some(2),
+            mails: vec![
+                incoming(
+                    "inbox",
+                    1,
+                    "Message-ID: <a@example.com>\nSubject: loop a\nFrom: a@example.com\nIn-Reply-To: <b@example.com>\nReferences: <b@example.com>\n\nbody\n",
+                ),
+                incoming(
+                    "inbox",
+                    2,
+                    "Message-ID: <b@example.com>\nSubject: loop b\nFrom: b@example.com\nIn-Reply-To: <a@example.com>\nReferences: <a@example.com>\n\nbody\n",
+                ),
+            ],
+        };
+        apply_sync_batch(&db_path, batch).expect("sync cyclic thread");
+
+        let rows = load_thread_rows_by_mailbox(&db_path, "inbox", 20).expect("load thread rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].depth, 0);
+        assert_eq!(rows[1].depth, 1);
+        assert_eq!(rows[0].thread_id, rows[1].thread_id);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rebuild_all_threads_is_noop_for_an_empty_store() {
+        let root = temp_dir("rebuild-empty");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let rebuilt = rebuild_all_threads(&db_path).expect("rebuild empty store");
+        assert_eq!(rebuilt, 0);
+        assert!(
+            load_thread_rows_by_mailbox(&db_path, "inbox", 10)
+                .expect("load empty thread rows")
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rebuild_all_threads_reports_corrupted_mail_ref_and_thread_node_tables() {
+        let root = temp_dir("rebuild-corruption");
+
+        let missing_ref_db = root.join("missing-ref.db");
+        db::initialize(&missing_ref_db).expect("initialize missing-ref db");
+        apply_sync_batch(
+            &missing_ref_db,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: Some(1),
+                mails: vec![incoming(
+                    "inbox",
+                    1,
+                    "Message-ID: <root@example.com>\nSubject: root\nFrom: root@example.com\n\nbody\n",
+                )],
+            },
+        )
+        .expect("seed missing-ref db");
+        let connection = Connection::open(&missing_ref_db).expect("open missing-ref db");
+        connection
+            .execute("DROP TABLE mail_ref", [])
+            .expect("drop mail_ref");
+        drop(connection);
+
+        let ref_error = rebuild_all_threads(&missing_ref_db)
+            .expect_err("missing mail_ref table should fail rebuild");
+        assert!(
+            ref_error
+                .to_string()
+                .contains("failed to prepare mail_ref graph query")
+        );
+
+        let missing_thread_node_db = root.join("missing-thread-node.db");
+        db::initialize(&missing_thread_node_db).expect("initialize missing-thread-node db");
+        apply_sync_batch(
+            &missing_thread_node_db,
+            SyncBatch {
+                mailbox: "inbox".to_string(),
+                uidvalidity: 1,
+                highest_uid: 1,
+                highest_modseq: Some(1),
+                mails: vec![incoming(
+                    "inbox",
+                    1,
+                    "Message-ID: <root2@example.com>\nSubject: root2\nFrom: root2@example.com\n\nbody\n",
+                )],
+            },
+        )
+        .expect("seed missing-thread-node db");
+        let connection =
+            Connection::open(&missing_thread_node_db).expect("open missing-thread-node db");
+        connection
+            .execute("DROP TABLE thread_node", [])
+            .expect("drop thread_node");
+        drop(connection);
+
+        let thread_node_error = rebuild_all_threads(&missing_thread_node_db)
+            .expect_err("missing thread_node table should fail rebuild");
+        assert!(
+            thread_node_error
+                .to_string()
+                .contains("failed to clear thread_node")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn late_arriving_parent_rethreads_existing_descendants() {
+        let root = temp_dir("late-parent");
+        let db_path = root.join("criew.db");
+        db::initialize(&db_path).expect("initialize db");
+
+        let orphan_batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 2,
+            highest_modseq: Some(2),
+            mails: vec![
+                incoming(
+                    "inbox",
+                    1,
+                    "Message-ID: <child@example.com>\nSubject: Re: root\nFrom: child@example.com\nIn-Reply-To: <root@example.com>\nReferences: <root@example.com>\n\nbody\n",
+                ),
+                incoming(
+                    "inbox",
+                    2,
+                    "Message-ID: <grand@example.com>\nSubject: Re: root\nFrom: grand@example.com\nIn-Reply-To: <child@example.com>\nReferences: <root@example.com> <child@example.com>\n\nbody\n",
+                ),
+            ],
+        };
+        apply_sync_batch(&db_path, orphan_batch).expect("sync orphaned descendants");
+
+        let orphan_rows =
+            load_thread_rows_by_mailbox(&db_path, "inbox", 20).expect("load orphaned rows");
+        assert_eq!(
+            orphan_rows
+                .iter()
+                .map(|row| (row.message_id.as_str(), row.depth))
+                .collect::<Vec<_>>(),
+            vec![("child@example.com", 0), ("grand@example.com", 1)]
+        );
+
+        let parent_batch = SyncBatch {
+            mailbox: "inbox".to_string(),
+            uidvalidity: 1,
+            highest_uid: 3,
+            highest_modseq: Some(3),
+            mails: vec![incoming(
+                "inbox",
+                3,
+                "Message-ID: <root@example.com>\nSubject: root\nFrom: root@example.com\n\nbody\n",
+            )],
+        };
+        let result = apply_sync_batch(&db_path, parent_batch).expect("sync late parent");
+        assert_eq!(result.inserted, 1);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.rebuilt_roots, 1);
+        assert!(!result.mailbox_rebuilt);
+
+        let rethreaded_rows =
+            load_thread_rows_by_mailbox(&db_path, "inbox", 20).expect("load rethreaded rows");
+        assert_eq!(
+            rethreaded_rows
+                .iter()
+                .map(|row| (row.message_id.as_str(), row.depth))
+                .collect::<Vec<_>>(),
+            vec![
+                ("root@example.com", 0),
+                ("child@example.com", 1),
+                ("grand@example.com", 2),
+            ]
+        );
+        assert!(
+            rethreaded_rows
+                .windows(2)
+                .all(|rows| rows[0].thread_id == rows[1].thread_id)
+        );
 
         let _ = fs::remove_dir_all(root);
     }

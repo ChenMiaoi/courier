@@ -469,10 +469,7 @@ where
 fn normalize_message_id(value: &str) -> String {
     value
         .trim()
-        .trim_matches('<')
-        .trim_matches('>')
-        .trim_matches('"')
-        .trim_matches(',')
+        .trim_matches(|character| matches!(character, '<' | '>' | '"' | ','))
         .trim()
         .to_string()
 }
@@ -622,7 +619,7 @@ mod tests {
 
     use super::{
         ReplyIdentity, ReplyPreviewRequest, build_reply_seed, extract_email_address,
-        normalize_reply_subject, render_reply_preview,
+        normalize_reply_subject, prepare_reply_message, render_reply_preview,
     };
 
     fn sample_thread(subject: &str, message_id: &str) -> ThreadRow {
@@ -704,6 +701,100 @@ mod tests {
     }
 
     #[test]
+    fn build_reply_seed_falls_back_to_thread_metadata_and_empty_body() {
+        let raw = b"Message-ID: <patch@example.com>\r\n\r\n";
+        let mut thread = sample_thread("[PATCH] fallback", "thread@example.com");
+        thread.from_addr = "Thread Author <author@example.com>".to_string();
+        thread.date = Some("Sat, 7 Mar 2026 12:00:00 +0000".to_string());
+
+        let seed = build_reply_seed(raw, &thread, &identity(), &[identity().email.clone()]);
+
+        assert_eq!(seed.to, "Thread Author <author@example.com>");
+        assert!(seed.cc.is_empty());
+        assert_eq!(seed.subject, "Re: [PATCH] fallback");
+        assert_eq!(seed.in_reply_to, "patch@example.com");
+        assert_eq!(seed.references, vec!["patch@example.com"]);
+        assert_eq!(
+            seed.body[1],
+            "On Sat, 7 Mar 2026 12:00:00 +0000, Thread Author <author@example.com> wrote:"
+        );
+        assert_eq!(seed.body[2], "> <empty mail body>");
+    }
+
+    #[test]
+    fn build_reply_seed_handles_folded_headers_and_blank_body_lines() {
+        let raw = b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] folded\r\nFrom: Alice <alice@example.com>\r\nTo: \"Doe, Jane\" <jane@example.com>,\r\n Bob <bob@example.com>\r\nCc: Carol <carol@example.com>;\r\n\tCRIEW Test <criew@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nline one\r\n\r\nline two\r\n";
+        let thread = sample_thread("[PATCH] folded", "patch@example.com");
+
+        let seed = build_reply_seed(raw, &thread, &identity(), &[identity().email.clone()]);
+
+        assert_eq!(
+            seed.to,
+            "\"Doe, Jane\" <jane@example.com>, Bob <bob@example.com>"
+        );
+        assert_eq!(seed.cc, "Carol <carol@example.com>");
+        assert_eq!(seed.body[2], "> line one");
+        assert_eq!(seed.body[3], ">");
+        assert_eq!(seed.body[4], "> line two");
+    }
+
+    #[test]
+    fn prepare_reply_message_uses_parent_when_references_missing() {
+        let (message, errors) = prepare_reply_message(ReplyPreviewRequest {
+            from: "CRIEW Test <criew@example.com>",
+            to: "Bob <bob@example.com>",
+            cc: "",
+            subject: "[PATCH] demo",
+            in_reply_to: " <parent@example.com>, ",
+            references: &[],
+            body: &[
+                "line one   ".to_string(),
+                String::new(),
+                "line two".to_string(),
+            ],
+            self_addresses: &[identity().email.clone()],
+        });
+
+        assert!(errors.is_empty());
+        assert_eq!(message.subject, "Re: [PATCH] demo");
+        assert_eq!(message.in_reply_to, "parent@example.com");
+        assert_eq!(message.references, vec!["parent@example.com"]);
+        assert_eq!(message.body, "line one\n\nline two");
+    }
+
+    #[test]
+    fn prepare_reply_message_adds_parent_to_existing_references_and_filters_self() {
+        let (message, errors) = prepare_reply_message(ReplyPreviewRequest {
+            from: " CRIEW Test <criew@example.com> ",
+            to: "Bob <bob@example.com>; \"Doe, Jane\" <jane@example.com>; CRIEW Test <criew@example.com>",
+            cc: "Carol <carol@example.com>, criew@example.com",
+            subject: "fwd: [PATCH] demo",
+            in_reply_to: " <parent@example.com>, ",
+            references: &["<older@example.com>".to_string()],
+            body: &["body".to_string()],
+            self_addresses: &[identity().email.clone(), "alias@example.com".to_string()],
+        });
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            message.to,
+            vec![
+                "Bob <bob@example.com>".to_string(),
+                "\"Doe, Jane\" <jane@example.com>".to_string()
+            ]
+        );
+        assert_eq!(message.cc, vec!["Carol <carol@example.com>".to_string()]);
+        assert_eq!(message.subject, "Re: [PATCH] demo");
+        assert_eq!(
+            message.references,
+            vec![
+                "older@example.com".to_string(),
+                "parent@example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn preview_validation_reports_missing_recipients() {
         let preview = render_reply_preview(ReplyPreviewRequest {
             from: "CRIEW Test <criew@example.com>",
@@ -748,6 +839,51 @@ mod tests {
     }
 
     #[test]
+    fn render_reply_preview_reports_missing_headers_and_renders_placeholders() {
+        let preview = render_reply_preview(ReplyPreviewRequest {
+            from: "CRIEW Test",
+            to: "",
+            cc: "",
+            subject: "   ",
+            in_reply_to: "   ",
+            references: &[],
+            body: &["   ".to_string(), String::new()],
+            self_addresses: &[],
+        });
+
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|value| value == "From is missing a valid email address")
+        );
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|value| value == "reply preview has no recipients after removing self")
+        );
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|value| value == "Subject is empty")
+        );
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|value| value == "In-Reply-To is missing")
+        );
+        assert!(preview.content.contains("To: <none>"));
+        assert!(preview.content.contains("Cc: <none>"));
+        assert!(preview.content.contains("Subject: Re:"));
+        assert!(preview.content.contains("In-Reply-To: <none>"));
+        assert!(preview.content.contains("References: <none>"));
+        assert!(preview.content.ends_with("<empty body>"));
+    }
+
+    #[test]
     fn extracts_email_from_display_or_bare_value() {
         assert_eq!(
             extract_email_address("Alice <alice@example.com>"),
@@ -757,5 +893,7 @@ mod tests {
             extract_email_address("alice@example.com"),
             Some("alice@example.com".to_string())
         );
+        assert_eq!(extract_email_address("Alice Example"), None);
+        assert_eq!(extract_email_address("<>"), None);
     }
 }
