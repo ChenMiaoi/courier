@@ -3559,10 +3559,27 @@ fn header_shows_criew_brand_and_default_footer_hides_empty_status() {
     assert!(rendered.contains("CRIEW"));
     assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
     assert!(rendered.contains("Mail / inbox"));
+    assert!(rendered.contains("keymap default"));
     assert!(!rendered.contains("db schema"));
     assert!(!rendered.contains("db:"));
     assert!(!rendered.contains("status:"));
     assert!(!rendered.contains(" ready "));
+}
+
+#[test]
+fn header_shows_custom_keymap_scheme_when_configured() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Custom;
+    let bootstrap = test_bootstrap(&runtime);
+    let state = AppState::new(vec![], runtime.clone());
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 35)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw custom keymap header");
+    let rendered = format!("{}", terminal.backend());
+
+    assert!(rendered.contains("keymap custom"));
 }
 
 #[test]

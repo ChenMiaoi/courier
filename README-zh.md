@@ -197,6 +197,7 @@ criew tui
 #### 键位
 
 - `:` 打开命令栏
+- 顶部状态栏会显示当前 keymap 方案：`default`、`vim` 或 `custom`
 - `y` / `n` 启用或禁用当前订阅
 - `Enter` 打开当前 mailbox 或 thread
 - `a` apply 当前 patch series

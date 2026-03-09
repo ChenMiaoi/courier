@@ -91,6 +91,14 @@ pub(super) fn draw(
         ),
         Span::styled(" | ", Style::default().fg(Color::White).bg(HEADER_BG)),
         Span::styled(
+            format!("keymap {}", state.runtime.ui_keymap.as_str()),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(" | ", Style::default().fg(Color::White).bg(HEADER_BG)),
+        Span::styled(
             format!("up {}s", uptime),
             Style::default()
                 .fg(Color::White)

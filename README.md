@@ -210,6 +210,7 @@ criew tui
 Inside the TUI:
 
 - `:` opens the command palette
+- the header shows the active keymap scheme (`default`, `vim`, or `custom`)
 - `y` / `n` enable or disable the selected subscription
 - `Enter` opens the selected mailbox or thread
 - `a` applies the current patch series

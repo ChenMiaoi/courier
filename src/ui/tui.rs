@@ -230,7 +230,7 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
     },
     ConfigEditorField {
         key: "ui.keymap",
-        description: "Main-page navigation scheme. default=j/l focus+i/k move, vim=h/l focus+j/k move.",
+        description: "Main-page navigation scheme. default=j/l+i/k, vim=h/l+j/k, custom=default fallback with custom label.",
     },
     ConfigEditorField {
         key: "ui.inbox_auto_sync_interval_secs",
@@ -306,14 +306,14 @@ const EXTERNAL_EDITOR_ENTRY_HINT: &str = "select a source file in Source pane, t
 
 fn main_page_focus_shortcuts(keymap: UiKeymap) -> &'static str {
     match keymap {
-        UiKeymap::Default => "j/l",
+        UiKeymap::Default | UiKeymap::Custom => "j/l",
         UiKeymap::Vim => "h/l",
     }
 }
 
 fn main_page_move_shortcuts(keymap: UiKeymap) -> &'static str {
     match keymap {
-        UiKeymap::Default => "i/k",
+        UiKeymap::Default | UiKeymap::Custom => "i/k",
         UiKeymap::Vim => "j/k",
     }
 }

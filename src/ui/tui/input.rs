@@ -21,7 +21,7 @@ pub(super) enum LoopAction {
 
 fn handle_main_page_navigation_key(state: &mut AppState, key: KeyEvent) -> bool {
     match state.runtime.ui_keymap {
-        UiKeymap::Default => match key.code {
+        UiKeymap::Default | UiKeymap::Custom => match key.code {
             KeyCode::Char('j') => {
                 state.move_focus_previous();
                 true

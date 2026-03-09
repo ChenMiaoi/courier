@@ -830,6 +830,7 @@ fn config_value_suggestions(state: &AppState, key: Option<&String>) -> Vec<Palet
         "ui.keymap" => [
             ("default", "j/l focus, i/k move"),
             ("vim", "h/l focus, j/k move"),
+            ("custom", "custom label with default navigation fallback"),
         ]
         .iter()
         .map(|(value, description)| PaletteSuggestion {
