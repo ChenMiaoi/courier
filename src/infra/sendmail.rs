@@ -245,6 +245,7 @@ fn send_with_options(
         );
     }
 
+    let draft_path = stabilize_child_path(&draft_path);
     let command_line = render_command_line(
         &resolved.display_name,
         &build_send_email_args(request, &draft_path),
@@ -740,6 +741,16 @@ fn build_send_email_args(request: &SendRequest, draft_path: &Path) -> Vec<String
     args
 }
 
+fn stabilize_child_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn generate_message_id(from: &str) -> String {
     // Reuse the sender domain when possible so generated ids look like normal
     // outbound mail and are easier to correlate in archives and mail clients.
@@ -844,7 +855,8 @@ mod tests {
         GitSendEmailStatus, ReplyIdentitySource, SendRequest, SendStatus, check_with_command_path,
         extract_email_address, generate_message_id, normalize_message_id, normalize_output,
         render_command_line, render_message_file, resolve_reply_identity_with_command_path,
-        resolve_working_dir, send_with_command_path, send_with_options, summarize_failure,
+        resolve_working_dir, send_with_command_path, send_with_options, stabilize_child_path,
+        summarize_failure,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1229,6 +1241,45 @@ mod tests {
     }
 
     #[test]
+    fn send_passes_absolute_draft_path_when_runtime_data_dir_is_relative() {
+        let root = temp_dir("send-relative-data-dir");
+        let kernel_tree = root.join("linux");
+        fs::create_dir_all(&kernel_tree).expect("create kernel tree");
+        let capture_arg = root.join("captured-draft-arg.txt");
+        let fake_git = write_fake_git(
+            &root,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  last=''\n  for arg in \"$@\"; do\n    last=\"$arg\"\n  done\n  printf '%s' \"$last\" > '{}'\n  if [ -f \"$last\" ]; then\n    echo 'sent'\n    exit 0\n  fi\n  echo \"missing draft: $last\" >&2\n  exit 1\nfi\nexit 1\n",
+                capture_arg.display()
+            ),
+        );
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let relative_data_dir = PathBuf::from(format!(
+            "target/test-relative-reply-outbox-{}-{nonce}",
+            std::process::id()
+        ));
+        let relative_data_dir_absolute = std::env::current_dir()
+            .expect("current dir")
+            .join(&relative_data_dir);
+        let mut runtime = test_runtime_in(&root);
+        runtime.data_dir = relative_data_dir;
+        runtime.kernel_trees = vec![kernel_tree];
+
+        let outcome = send_with_command_path(&runtime, &sample_request(), Some(&fake_git));
+
+        assert_eq!(outcome.status, SendStatus::Sent);
+        let captured_arg = fs::read_to_string(&capture_arg).expect("read captured draft arg");
+        assert!(Path::new(&captured_arg).is_absolute());
+        assert!(captured_arg.starts_with(relative_data_dir_absolute.to_string_lossy().as_ref()));
+
+        let _ = fs::remove_dir_all(relative_data_dir_absolute);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn message_rendering_and_helper_outputs_follow_reply_contract() {
         let mut request = sample_request();
         request.cc.clear();
@@ -1275,6 +1326,7 @@ mod tests {
         );
         assert_eq!(extract_email_address("invalid identity"), None);
         assert!(generate_message_id("No Email").ends_with("@localhost"));
+        assert!(stabilize_child_path(Path::new("relative/file.eml")).is_absolute());
     }
 
     #[test]
