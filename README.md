@@ -218,6 +218,7 @@ Inside the TUI:
 - `u` undoes the most recent successful apply from the current session
 - `r` or `e` opens the reply panel
 - `Tab` switches between the mail page and the code browser
+- with `ui.keymap = "vim"`, `gg` jumps to the first line in the active pane, `G` jumps to the last line, and `qq` exits quickly
 
 ##### Background sync
 

@@ -58,7 +58,7 @@ filter = "info"
 # Optional. Main-page navigation scheme.
 # Supported:
 #   "default" (j/l focus, i/k move)
-#   "vim" (h/l focus, j/k move)
+#   "vim" (h/l focus, j/k move, gg/G jump, qq quit)
 #   "custom" (header shows custom; navigation currently falls back to default bindings)
 # Default: "default"
 # keymap = "default"

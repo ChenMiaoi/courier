@@ -62,6 +62,58 @@ fn handle_main_page_navigation_key(state: &mut AppState, key: KeyEvent) -> bool 
     }
 }
 
+fn handle_vim_main_page_chord(state: &mut AppState, key: KeyEvent) -> Option<LoopAction> {
+    if !matches!(state.runtime.ui_keymap, UiKeymap::Vim) {
+        state.pending_main_page_chord = None;
+        return None;
+    }
+
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        state.pending_main_page_chord = None;
+        return None;
+    }
+
+    if let Some(pending_state) = state.pending_main_page_chord.take() {
+        let same_scope = pending_state.ui_page == state.ui_page
+            && pending_state.focus == state.focus
+            && pending_state.code_focus == state.code_focus;
+        if same_scope {
+            match (pending_state.chord, key.code) {
+                (PendingMainPageChord::VimGoToFirstLine, KeyCode::Char('g')) => {
+                    state.jump_current_pane_to_start();
+                    return Some(LoopAction::Continue);
+                }
+                (PendingMainPageChord::VimQuit, KeyCode::Char('q')) => {
+                    return Some(LoopAction::Exit);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    match key.code {
+        KeyCode::Char('g') => {
+            state.pending_main_page_chord =
+                Some(state.pending_main_page_chord_state(PendingMainPageChord::VimGoToFirstLine));
+            Some(LoopAction::Continue)
+        }
+        KeyCode::Char('G') => {
+            state.jump_current_pane_to_end();
+            Some(LoopAction::Continue)
+        }
+        KeyCode::Char('q') => {
+            state.pending_main_page_chord =
+                Some(state.pending_main_page_chord_state(PendingMainPageChord::VimQuit));
+            state.status = "press qq to quit or use command palette quit/exit".to_string();
+            Some(LoopAction::Continue)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
     tracing::debug!(
         key = ?key,
@@ -78,10 +130,12 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     // Modal UI surfaces take precedence over the base page shortcuts so keys
     // keep local meaning while a dialog, editor, or search interaction is open.
     if state.config_editor.open {
+        state.pending_main_page_chord = None;
         return handle_config_editor_key_event(state, key);
     }
 
     if state.palette.open {
+        state.pending_main_page_chord = None;
         if is_palette_toggle(key) {
             state.close_palette();
             return LoopAction::Continue;
@@ -90,15 +144,22 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     }
 
     if state.search.active {
+        state.pending_main_page_chord = None;
         return handle_search_key_event(state, key);
     }
 
     if state.reply_panel.is_some() {
+        state.pending_main_page_chord = None;
         return handle_reply_key_event(state, key);
     }
 
     if state.is_code_edit_active() {
+        state.pending_main_page_chord = None;
         return handle_code_edit_key_event(state, key);
+    }
+
+    if let Some(action) = handle_vim_main_page_chord(state, key) {
+        return action;
     }
 
     if is_palette_open_shortcut(key) {

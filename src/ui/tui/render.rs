@@ -22,6 +22,12 @@ use super::*;
 const REPLY_BODY_GUIDE_COLUMN: usize = 80;
 const HEADER_BG: Color = Color::Blue;
 
+#[derive(Clone, Copy)]
+enum VerticalScrollWrapMode {
+    Disabled,
+    Enabled,
+}
+
 pub(super) fn draw(
     frame: &mut Frame<'_>,
     state: &AppState,
@@ -355,8 +361,24 @@ fn draw_code_source_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     frame.render_widget(block, area);
     frame.render_widget(Clear, inner_area);
 
-    let paragraph =
-        Paragraph::new(load_code_source_preview(state)).scroll((state.code_preview_scroll, 0));
+    let preview = load_code_source_preview(state);
+    let code_preview_scroll_limit = max_vertical_scroll(
+        &preview,
+        inner_area.width,
+        inner_area.height,
+        VerticalScrollWrapMode::Disabled,
+    );
+    state
+        .code_preview_scroll_limit
+        .set(code_preview_scroll_limit);
+    let scroll = clamp_vertical_scroll(
+        &preview,
+        inner_area.width,
+        inner_area.height,
+        state.code_preview_scroll,
+        VerticalScrollWrapMode::Disabled,
+    );
+    let paragraph = Paragraph::new(preview).scroll((scroll, 0));
     frame.render_widget(paragraph, inner_area);
 
     if let Some(cursor_position) = code_edit_cursor_position(state, inner_area) {
@@ -566,11 +588,83 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         inner_area
     };
 
+    let preview_scroll_limit = max_vertical_scroll(
+        preview.as_ref(),
+        content_area.width,
+        content_area.height,
+        VerticalScrollWrapMode::Enabled,
+    );
+    state.preview_scroll_limit.set(preview_scroll_limit);
+    let scroll = clamp_vertical_scroll(
+        preview.as_ref(),
+        content_area.width,
+        content_area.height,
+        state.preview_scroll,
+        VerticalScrollWrapMode::Enabled,
+    );
     let paragraph = Paragraph::new(preview.as_ref())
-        .scroll((state.preview_scroll, 0))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, content_area);
+}
+
+fn clamp_vertical_scroll(
+    text: &str,
+    area_width: u16,
+    area_height: u16,
+    requested_scroll: u16,
+    wrap_mode: VerticalScrollWrapMode,
+) -> u16 {
+    requested_scroll.min(max_vertical_scroll(
+        text,
+        area_width,
+        area_height,
+        wrap_mode,
+    ))
+}
+
+fn max_vertical_scroll(
+    text: &str,
+    area_width: u16,
+    area_height: u16,
+    wrap_mode: VerticalScrollWrapMode,
+) -> u16 {
+    if area_height == 0 {
+        return 0;
+    }
+
+    let visible_lines = area_height as usize;
+    let total_lines = visual_line_count(text, area_width, wrap_mode);
+    total_lines
+        .saturating_sub(visible_lines)
+        .min(u16::MAX as usize) as u16
+}
+
+fn visual_line_count(text: &str, area_width: u16, wrap_mode: VerticalScrollWrapMode) -> usize {
+    match wrap_mode {
+        VerticalScrollWrapMode::Disabled => text.split('\n').count().max(1),
+        VerticalScrollWrapMode::Enabled => {
+            if area_width == 0 {
+                return 0;
+            }
+
+            text.split('\n')
+                .map(|line| wrapped_visual_line_count(line, area_width))
+                .sum::<usize>()
+                .max(1)
+        }
+    }
+}
+
+fn wrapped_visual_line_count(line: &str, area_width: u16) -> usize {
+    if area_width == 0 {
+        return 0;
+    }
+
+    let width = area_width as usize;
+    let display_width = display_column(line, line.chars().count()).max(1);
+    display_width.saturating_add(width - 1) / width
 }
 
 fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64) -> Option<String> {

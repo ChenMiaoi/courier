@@ -829,7 +829,7 @@ fn config_value_suggestions(state: &AppState, key: Option<&String>) -> Vec<Palet
             .collect(),
         "ui.keymap" => [
             ("default", "j/l focus, i/k move"),
-            ("vim", "h/l focus, j/k move"),
+            ("vim", "h/l focus, j/k move, gg/G jump, qq quit"),
             ("custom", "custom label with default navigation fallback"),
         ]
         .iter()

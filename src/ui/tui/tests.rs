@@ -949,6 +949,8 @@ keymap = "default"
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("h/l focus | j/k move"));
     assert!(!rendered.contains("j/l focus | i/k move"));
+    assert!(!rendered.contains("gg/G jump"));
+    assert!(!rendered.contains("qq quit"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1031,6 +1033,423 @@ fn loaded_vim_keymap_drives_navigation_keys() {
         matches!(state.focus, Pane::Subscriptions),
         "h should move focus left in vim keymap"
     );
+}
+
+#[test]
+fn vim_keymap_supports_gg_and_capital_g_jumps_on_mail_panes() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let mut state = AppState::new(
+        vec![
+            sample_thread("t0", "a@example.com", 0),
+            sample_thread("t1", "b@example.com", 1),
+            sample_thread("t2", "c@example.com", 2),
+        ],
+        runtime,
+    );
+
+    let subscription_rows = state.subscription_rows();
+    assert!(!subscription_rows.is_empty());
+
+    let action_bottom = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(action_bottom, LoopAction::Continue));
+    assert_eq!(
+        state.subscription_row_index,
+        subscription_rows.len().saturating_sub(1)
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    let action_top = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_top, LoopAction::Continue));
+    assert_eq!(state.subscription_row_index, 0);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    let action_thread_bottom = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(action_thread_bottom, LoopAction::Continue));
+    assert_eq!(state.thread_index, 2);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    let action_thread_top = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_thread_top, LoopAction::Continue));
+    assert_eq!(state.thread_index, 0);
+
+    state.focus = Pane::Preview;
+    state.preview_scroll = 7;
+    let action_preview_bottom = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(action_preview_bottom, LoopAction::Continue));
+    assert_eq!(state.preview_scroll, u16::MAX);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    let action_preview_top = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_preview_top, LoopAction::Continue));
+    assert_eq!(state.preview_scroll, 0);
+}
+
+#[test]
+fn vim_keymap_supports_gg_and_capital_g_jumps_in_code_browser() {
+    let tree_root = temp_dir("vim-jump-code-browser");
+    let file_path = tree_root.join("demo.c");
+    let source = (1..=40)
+        .map(|line| format!("int line_{line} = {line};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&file_path, format!("{source}\n")).expect("write file");
+
+    let mut runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    runtime.ui_keymap = UiKeymap::Vim;
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+
+    let action_tree_bottom = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(action_tree_bottom, LoopAction::Continue));
+    assert_eq!(
+        state.kernel_tree_row_index,
+        state.kernel_tree_rows.len().saturating_sub(1)
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    let action_tree_top = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_tree_top, LoopAction::Continue));
+    assert_eq!(state.kernel_tree_row_index, 0);
+
+    state.code_focus = CodePaneFocus::Source;
+    state.kernel_tree_row_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("file row exists");
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 18)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw source preview before vim jumps");
+
+    state.code_preview_scroll = 9;
+    let action_source_bottom = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(action_source_bottom, LoopAction::Continue));
+    let code_preview_scroll_limit = state.code_preview_scroll_limit.get();
+    assert!(code_preview_scroll_limit > 0);
+    assert_eq!(state.code_preview_scroll, code_preview_scroll_limit);
+
+    let action_source_up = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_source_up, LoopAction::Continue));
+    assert_eq!(
+        state.code_preview_scroll,
+        code_preview_scroll_limit.saturating_sub(1)
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    let action_source_top = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_source_top, LoopAction::Continue));
+    assert_eq!(state.code_preview_scroll, 0);
+
+    let _ = fs::remove_dir_all(tree_root);
+}
+
+#[test]
+fn vim_keymap_supports_qq_quit_chord() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let mut state = AppState::new(vec![], runtime);
+
+    let first = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    );
+    assert!(matches!(first, LoopAction::Continue));
+    assert_eq!(
+        state.status,
+        "press qq to quit or use command palette quit/exit"
+    );
+
+    let second = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    );
+    assert!(matches!(second, LoopAction::Exit));
+}
+
+#[test]
+fn vim_chords_do_not_leak_into_right_preview_pane() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let mut state = AppState::new(
+        vec![
+            sample_thread("t0", "a@example.com", 0),
+            sample_thread("t1", "b@example.com", 1),
+        ],
+        runtime,
+    );
+
+    let arm_quit = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    );
+    assert!(matches!(arm_quit, LoopAction::Continue));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Preview));
+
+    state.preview_scroll = 11;
+    let first_g = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(matches!(first_g, LoopAction::Continue));
+    assert_eq!(state.preview_scroll, 11);
+
+    let second_g = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+    );
+    assert!(matches!(second_g, LoopAction::Continue));
+    assert_eq!(state.preview_scroll, 0);
+}
+
+#[test]
+fn preview_pane_shift_g_keeps_tui_renderable() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread("preview thread", "preview@example.com", 0)],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(action, LoopAction::Continue));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 35)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw after preview shift-g");
+    let rendered = format!("{}", terminal.backend());
+
+    assert!(rendered.contains("Preview"));
+}
+
+#[test]
+fn preview_pane_can_move_up_after_reaching_bottom() {
+    let root = temp_dir("preview-scroll-bottom");
+    let raw_path = root.join("preview.eml");
+    let body = (1..=40)
+        .map(|line| format!("preview line {line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        &raw_path,
+        format!(
+            "Message-ID: <preview-scroll@example.com>\r\nSubject: preview scroll\r\nFrom: preview@example.com\r\n\r\n{body}\n"
+        ),
+    )
+    .expect("write raw mail");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "preview scroll",
+            "preview-scroll@example.com",
+            0,
+            raw_path.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 16)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw initial preview frame");
+
+    let preview_scroll_limit = state.preview_scroll_limit.get();
+    assert!(preview_scroll_limit > 0);
+
+    for _ in 0..(preview_scroll_limit as usize + 10) {
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+    }
+    assert_eq!(state.preview_scroll, preview_scroll_limit);
+
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw bottom preview frame");
+    let bottom_frame = format!("{}", terminal.backend());
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert_eq!(state.preview_scroll, preview_scroll_limit.saturating_sub(1));
+
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw preview frame after moving up");
+    let after_up_frame = format!("{}", terminal.backend());
+
+    assert_ne!(after_up_frame, bottom_frame);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn preview_scroll_limit_accounts_for_wrapped_long_lines() {
+    let root = temp_dir("preview-wrap-scroll");
+    let raw_path = root.join("wrapped-preview.eml");
+    let wrapped_body = format!("{} WRAP_TAIL_TOKEN\n", "x".repeat(380));
+    fs::write(
+        &raw_path,
+        format!(
+            "Message-ID: <wrapped-preview@example.com>\r\nSubject: wrapped preview\r\nFrom: preview@example.com\r\n\r\n{wrapped_body}"
+        ),
+    )
+    .expect("write wrapped preview mail");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "wrapped preview",
+            "wrapped-preview@example.com",
+            0,
+            raw_path.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+
+    let mut terminal = Terminal::new(TestBackend::new(40, 10)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw wrapped preview");
+    let top_frame = format!("{}", terminal.backend());
+    let preview_scroll_limit = state.preview_scroll_limit.get();
+    assert!(preview_scroll_limit > 0);
+    assert!(!top_frame.contains("WRAP_TAIL_TOKEN"));
+
+    for _ in 0..(preview_scroll_limit as usize + 5) {
+        let _ = handle_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        );
+    }
+
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw wrapped preview after scrolling");
+    let bottom_frame = format!("{}", terminal.backend());
+
+    assert!(bottom_frame.contains("WRAP_TAIL_TOKEN"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn source_pane_shift_g_keeps_tui_renderable() {
+    let tree_root = temp_dir("source-pane-shift-g");
+    let file_path = tree_root.join("demo.c");
+    fs::write(
+        &file_path,
+        "int line_1;\nint line_2;\nint line_3;\nint line_4;\nint line_5;\n",
+    )
+    .expect("write source file");
+
+    let mut runtime = test_runtime_with_kernel_tree(tree_root.clone());
+    runtime.ui_keymap = UiKeymap::Vim;
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(matches!(state.ui_page, UiPage::CodeBrowser));
+    state.code_focus = CodePaneFocus::Source;
+    state.kernel_tree_row_index = state
+        .kernel_tree_rows
+        .iter()
+        .position(|row| row.path == file_path)
+        .expect("file row exists");
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(action, LoopAction::Continue));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 35)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw after source shift-g");
+    let rendered = format!("{}", terminal.backend());
+
+    assert!(rendered.contains("Source Preview"));
+
+    let _ = fs::remove_dir_all(tree_root);
 }
 
 #[test]

@@ -205,6 +205,7 @@ criew tui
 - `u` 撤销本次会话中最近一次成功 apply
 - `r` 或 `e` 打开回信面板
 - `Tab` 在 Mail 页面和 Code Browser 页面之间切换
+- 当 `ui.keymap = "vim"` 时，`gg` 跳到当前 pane 行首，`G` 跳到行尾，`qq` 快速退出
 
 #### 命令栏命令
 
