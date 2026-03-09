@@ -812,6 +812,86 @@ keymap = "default"
 }
 
 #[test]
+fn config_get_ui_keymap_returns_current_value() {
+    let root = temp_dir("get-keymap");
+    let config_path = root.join("criew-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+keymap = "vim"
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let mut state = AppState::new(vec![], runtime);
+
+    state.palette.open = true;
+    state.palette.input = "config get ui.keymap".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(
+        state.status.contains("vim"),
+        "config get should report vim, got: {}",
+        state.status
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn loaded_vim_keymap_drives_navigation_keys() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let mut state = AppState::new(
+        vec![
+            sample_thread("t0", "a@example.com", 0),
+            sample_thread("t1", "b@example.com", 1),
+        ],
+        runtime,
+    );
+    state.subscription_index = 1;
+
+    // Default keymap key 'j' would move focus left; in vim mode it moves down.
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert_eq!(state.thread_index, 1, "j should move down in vim keymap");
+
+    // 'i' should NOT navigate (it is not a vim navigation key).
+    let prev_index = state.thread_index;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert_eq!(
+        state.thread_index, prev_index,
+        "i should not navigate in vim keymap"
+    );
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    );
+    assert!(
+        matches!(state.focus, Pane::Subscriptions),
+        "h should move focus left in vim keymap"
+    );
+}
+
+#[test]
 fn config_command_opens_visual_editor() {
     let mut state = AppState::new(vec![], test_runtime());
     state.palette.open = true;
