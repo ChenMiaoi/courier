@@ -29,6 +29,7 @@ English README: [README.md](README.md)
 - 浏览 thread，识别 `[PATCH vN M/N]` patch series
 - 通过 `b4` apply 或导出 patch
 - 在 TUI 中撰写回信，并通过 `git send-email` 发送
+- 回信面板会明确区分可编辑字段（`From/To/Cc/Subject`）和只读线程字段
 - `Send Preview` 会在草稿没有实际回复内容时给出警告，并高亮用户自己写的回复正文
 - 浏览本地 kernel tree，支持内联 Vim-like 编辑和外部 Vim 编辑
 

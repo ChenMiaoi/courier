@@ -895,7 +895,7 @@ impl ReplyPanelState {
             },
             self_addresses,
             mode: ReplyEditMode::Normal,
-            section: ReplySection::Body,
+            section: ReplySection::From,
             body_row: 0,
             cursor_col: 0,
             dirty: false,
@@ -3149,7 +3149,10 @@ impl AppState {
             thread.mail_id,
             thread.thread_id,
         ));
-        self.status = format!("reply panel opened for <{}>", thread.message_id);
+        self.status = format!(
+            "reply panel opened for <{}>; edit From/To/Cc/Subject before Send Preview",
+            thread.message_id
+        );
     }
 
     fn close_reply_panel(&mut self, status: impl Into<String>) {
@@ -4725,8 +4728,18 @@ fn reply_command_line_logical_row(panel: &ReplyPanelState) -> usize {
     reply_body_line_logical_row(panel.body.len()) + 1
 }
 
-fn reply_field_prefix_width(label: &str) -> usize {
-    1 + 1 + label.chars().count() + 2
+fn reply_editable_field_prefix(section: ReplySection) -> &'static str {
+    match section {
+        ReplySection::From => "[edit] From: ",
+        ReplySection::To => "[edit] To: ",
+        ReplySection::Cc => "[edit] Cc: ",
+        ReplySection::Subject => "[edit] Subject: ",
+        ReplySection::Body => "",
+    }
+}
+
+fn reply_field_prefix_width(section: ReplySection) -> usize {
+    1 + 1 + reply_editable_field_prefix(section).chars().count()
 }
 
 fn reply_body_prefix_width(body_row: usize) -> usize {

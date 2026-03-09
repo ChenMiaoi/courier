@@ -40,6 +40,11 @@
 - `In-Reply-To`
 - `References`
 
+界面必须清楚区分可编辑头部字段与只读线程字段，
+避免用户把 `To` / `Cc` 误认为不可修改的固定元数据。
+打开 `Reply Panel` 时，初始焦点应落在 `From`，
+方便用户按 Vim-like 方式向下移动并修改头部字段。
+
 `Reply Panel` 发送区最小交互：
 
 - `Send Preview`：生成并展示最终待发送邮件（头部 + 正文）

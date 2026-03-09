@@ -884,7 +884,7 @@ fn draw_reply_panel(frame: &mut Frame<'_>, state: &AppState) {
     let body_area = sections[1];
 
     let header_block = Block::default()
-        .title("Headers (From/To/Cc/Subject editable)")
+        .title("Headers ([edit] / [read-only])")
         .borders(Borders::ALL)
         .border_style(reply_panel_section_style(
             matches!(
@@ -944,28 +944,32 @@ fn draw_reply_panel(frame: &mut Frame<'_>, state: &AppState) {
 fn render_reply_header_content(panel: &ReplyPanelState) -> String {
     [
         format!(
-            "{} From: {}",
+            "{} {}{}",
             reply_section_marker(panel, ReplySection::From),
+            reply_editable_field_prefix(ReplySection::From),
             sanitize_source_preview_text(&panel.from)
         ),
         format!(
-            "{} To: {}",
+            "{} {}{}",
             reply_section_marker(panel, ReplySection::To),
+            reply_editable_field_prefix(ReplySection::To),
             sanitize_source_preview_text(&panel.to)
         ),
         format!(
-            "{} Cc: {}",
+            "{} {}{}",
             reply_section_marker(panel, ReplySection::Cc),
+            reply_editable_field_prefix(ReplySection::Cc),
             sanitize_source_preview_text(&panel.cc)
         ),
         format!(
-            "{} Subject: {}",
+            "{} {}{}",
             reply_section_marker(panel, ReplySection::Subject),
+            reply_editable_field_prefix(ReplySection::Subject),
             sanitize_source_preview_text(&panel.subject)
         ),
-        format!("  In-Reply-To: <{}>", panel.in_reply_to),
+        format!("  [read-only] In-Reply-To: <{}>", panel.in_reply_to),
         format!(
-            "  References: {}",
+            "  [read-only] References: {}",
             panel
                 .references
                 .iter()
@@ -1073,22 +1077,26 @@ fn reply_panel_cursor_position(
         ReplySection::From => reply_fixed_cursor_position(
             header_inner,
             0,
-            reply_field_prefix_width("From") + display_column(&panel.from, panel.cursor_col),
+            reply_field_prefix_width(ReplySection::From)
+                + display_column(&panel.from, panel.cursor_col),
         ),
         ReplySection::To => reply_fixed_cursor_position(
             header_inner,
             1,
-            reply_field_prefix_width("To") + display_column(&panel.to, panel.cursor_col),
+            reply_field_prefix_width(ReplySection::To)
+                + display_column(&panel.to, panel.cursor_col),
         ),
         ReplySection::Cc => reply_fixed_cursor_position(
             header_inner,
             2,
-            reply_field_prefix_width("Cc") + display_column(&panel.cc, panel.cursor_col),
+            reply_field_prefix_width(ReplySection::Cc)
+                + display_column(&panel.cc, panel.cursor_col),
         ),
         ReplySection::Subject => reply_fixed_cursor_position(
             header_inner,
             3,
-            reply_field_prefix_width("Subject") + display_column(&panel.subject, panel.cursor_col),
+            reply_field_prefix_width(ReplySection::Subject)
+                + display_column(&panel.subject, panel.cursor_col),
         ),
         ReplySection::Body => {
             let line = panel

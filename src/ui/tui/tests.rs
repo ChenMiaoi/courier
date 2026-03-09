@@ -4343,6 +4343,7 @@ fn mail_preview_e_opens_reply_panel_with_autofilled_headers() {
     assert_eq!(panel.subject, "Re: [PATCH] demo");
     assert_eq!(panel.in_reply_to, "patch@example.com");
     assert_eq!(panel.references, vec!["patch@example.com"]);
+    assert_eq!(panel.section, ReplySection::From);
 
     let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("create test terminal");
     terminal
@@ -4350,9 +4351,18 @@ fn mail_preview_e_opens_reply_panel_with_autofilled_headers() {
         .expect("draw reply panel");
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("Reply Panel"));
-    assert!(rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(rendered.contains("focus:From"));
+    assert!(rendered.contains("Headers ([edit] / [read-only])"));
     assert!(rendered.contains("Reply Body"));
+    assert!(rendered.contains("[edit] To: Bob <bob@example.com>"));
+    assert!(rendered.contains("[edit] Cc: Alice <alice@example.com>"));
+    assert!(rendered.contains("[read-only] In-Reply-To: <patch@example.com>"));
     assert!(rendered.contains("Subject: Re: [PATCH] demo"));
+    assert!(
+        state
+            .status
+            .contains("edit From/To/Cc/Subject before Send Preview")
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -4535,7 +4545,7 @@ fn reply_send_blocked_notice_and_ready_notice_replace_reply_panel_view() {
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("Send Blocked"));
     assert!(rendered.contains("You must open Send Preview"));
-    assert!(!rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(!rendered.contains("Headers ([edit] / [read-only])"));
     assert!(!rendered.contains("Reply Body"));
 
     let _ = handle_key_event(
@@ -4553,7 +4563,7 @@ fn reply_send_blocked_notice_and_ready_notice_replace_reply_panel_view() {
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("Ready To Send"));
     assert!(rendered.contains("Press S to send the reply"));
-    assert!(!rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(!rendered.contains("Headers ([edit] / [read-only])"));
     assert!(!rendered.contains("Reply Body"));
 
     let _ = fs::remove_dir_all(root);
@@ -4727,7 +4737,7 @@ fn reply_send_preview_warns_but_allows_confirm_without_authored_reply_text() {
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("Send Preview [warning]"));
     assert!(rendered.contains("draft has no authored reply content"));
-    assert!(!rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(!rendered.contains("Headers ([edit] / [read-only])"));
     assert!(!rendered.contains("Reply Body"));
 
     let _ = handle_key_event(
@@ -4794,7 +4804,7 @@ fn reply_send_preview_highlights_authored_lines_and_keeps_quotes_bright() {
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("Send Preview [reply highlighted]"));
     assert!(rendered.contains("Your authored reply lines are highlighted below."));
-    assert!(!rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(!rendered.contains("Headers ([edit] / [read-only])"));
     assert!(!rendered.contains("Reply Body"));
 
     let (authored_fg, authored_bg, authored_modifier) =
