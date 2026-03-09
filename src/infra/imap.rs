@@ -399,6 +399,10 @@ impl LoreImapClient {
                 )
             })?;
             let status_code = response.status().as_u16();
+            if !(200..300).contains(&status_code) {
+                return Ok((status_code, Vec::new()));
+            }
+
             let bytes = response.bytes().map_err(|error| {
                 CriewError::with_source(
                     ErrorCode::Imap,
@@ -607,6 +611,8 @@ impl GnuArchiveClient {
         })?;
 
         let status_code = response.status().as_u16();
+        validate_gnu_archive_mbox_response(&url, status_code)?;
+
         let bytes = response
             .bytes()
             .map(|bytes| bytes.to_vec())
@@ -618,7 +624,7 @@ impl GnuArchiveClient {
                 )
             })?;
 
-        validate_gnu_archive_mbox_response(&url, status_code, bytes)
+        Ok(bytes)
     }
 }
 
@@ -637,11 +643,7 @@ fn parse_gnu_archive_index_response(
     parse_gnu_archive_month_entries(body)
 }
 
-fn validate_gnu_archive_mbox_response(
-    url: &str,
-    status_code: u16,
-    body: Vec<u8>,
-) -> Result<Vec<u8>> {
+fn validate_gnu_archive_mbox_response(url: &str, status_code: u16) -> Result<()> {
     if !(200..300).contains(&status_code) {
         return Err(imap_error(
             ImapErrorKind::Protocol,
@@ -649,7 +651,7 @@ fn validate_gnu_archive_mbox_response(
         ));
     }
 
-    Ok(body)
+    Ok(())
 }
 
 fn build_gnu_archive_incremental_mails<F>(
@@ -2447,6 +2449,30 @@ mod tests {
         (base_url, handle)
     }
 
+    fn start_http_server_with_raw_responses<F>(
+        expected_requests: usize,
+        build_response: F,
+    ) -> (String, thread::JoinHandle<()>)
+    where
+        F: Fn(&str) -> Vec<u8> + Send + 'static,
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind http listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("listener addr"));
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept http request");
+                let path = read_http_request_path(&mut stream);
+                let response = build_response(&path);
+                stream
+                    .write_all(&response)
+                    .expect("write raw HTTP response");
+                stream.flush().expect("flush raw HTTP response");
+            }
+        });
+
+        (base_url, handle)
+    }
+
     fn read_http_request_path(stream: &mut impl Read) -> String {
         let mut request = Vec::new();
         let mut buf = [0u8; 1];
@@ -2824,6 +2850,26 @@ mod tests {
     }
 
     #[test]
+    fn lore_client_checks_status_before_reading_error_body() {
+        let (base_url, handle) = start_http_server_with_raw_responses(2, move |path| {
+            match path {
+            "/io-uring/msg-b/raw" | "/io-uring/msg-b/raw/" => b"HTTP/1.1 404 Not Found\r\nContent-Length: 64\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nshort".to_vec(),
+            _ => panic!("unexpected HTTP path {path}"),
+        }
+        });
+
+        let mut client = LoreImapClient::new(Some(&base_url)).expect("create lore client");
+        client.connect().expect("connect lore");
+
+        let error = client
+            .fetch_raw_mail(&format!("{base_url}/io-uring/msg-b/"))
+            .expect_err("HTTP status should fail before reading body");
+        assert!(error.to_string().contains("HTTP 404"));
+
+        handle.join().expect("join HTTP server");
+    }
+
+    #[test]
     fn lore_client_reports_empty_raw_message_after_trying_candidates() {
         let error = fetch_lore_raw_with("https://lore.kernel.org/io-uring/msg-empty/", |_| {
             Ok((200, Vec::new()))
@@ -2869,7 +2915,8 @@ mod tests {
 
         let fetched = build_gnu_archive_incremental_mails(&months, Some(feb_modseq), |month_key| {
             let url = client.month_url("mailbox", month_key);
-            validate_gnu_archive_mbox_response(&url, 200, mbox.to_vec())
+            validate_gnu_archive_mbox_response(&url, 200)?;
+            Ok(mbox.to_vec())
         })
         .expect("fetch gnu archive");
         assert_eq!(fetched.len(), 2);
@@ -2945,6 +2992,40 @@ mod tests {
         let error = client
             .fetch_incremental("mailbox", 0, Some(feb_modseq))
             .expect_err("HTTP errors should fail archive fetch");
+        assert!(error.to_string().contains("HTTP 404"));
+
+        handle.join().expect("join HTTP server");
+    }
+
+    #[test]
+    fn gnu_archive_client_checks_status_before_reading_error_body() {
+        let feb_modseq =
+            parse_gnu_archive_listing_timestamp("2026-02-26", "09:12").expect("feb timestamp");
+        let index_body = r#"
+<pre>
+<a href="2026-02">2026-02</a> 2026-02-26 09:12  855K
+<a href="2026-03">2026-03</a> 2026-03-07 06:37  341K
+</pre>
+"#;
+        let (base_url, handle) = start_http_server_with_raw_responses(2, move |path| {
+            match path {
+            "/mailbox/" => format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n{}",
+                index_body.len(),
+                index_body,
+            )
+            .into_bytes(),
+            "/mailbox/2026-03" => b"HTTP/1.1 404 Not Found\r\nContent-Length: 64\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\nshort".to_vec(),
+            _ => panic!("unexpected HTTP path {path}"),
+        }
+        });
+
+        let mut client = GnuArchiveClient::new(Some(&base_url)).expect("create archive client");
+        client.connect().expect("connect archive");
+
+        let error = client
+            .fetch_incremental("mailbox", 0, Some(feb_modseq))
+            .expect_err("HTTP status should fail before reading body");
         assert!(error.to_string().contains("HTTP 404"));
 
         handle.join().expect("join HTTP server");
