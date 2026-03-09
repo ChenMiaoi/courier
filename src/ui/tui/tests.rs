@@ -24,13 +24,14 @@ use crate::infra::mail_parser;
 use crate::infra::mail_store::{self, IncomingMail, SyncBatch, ThreadRow};
 use crate::infra::reply_store::{self, ReplySendStatus};
 use crate::infra::sendmail::{SendOutcome, SendRequest, SendStatus};
-use crate::infra::ui_state::UiState;
+use crate::infra::ui_state::{self, UiState};
 
 use super::palette::run_palette_sync;
 use super::preview::preview_warning_message;
 use super::reply::ReplyIdentity;
 use super::{
-    AppState, CodeEditMode, CodePaneFocus, ExternalEditorProcessResult, LoopAction, MY_INBOX_LABEL,
+    AppState, CodeEditMode, CodePaneFocus, ExternalEditorProcessResult, LoopAction,
+    MIN_MAIL_PREVIEW_WIDTH, MIN_MAIL_SUBSCRIPTIONS_WIDTH, MY_INBOX_LABEL, MailPaneLayout,
     ManualSyncOrigin, ManualSyncRequestOutcome, ManualSyncState, Pane, ReplyEditMode, ReplySection,
     StartupSyncEvent, StartupSyncMailboxStatus, StartupSyncState, SubscriptionItem, UiPage,
     catch_sync_panic, code_edit_cursor_position, draw, extract_mail_body_preview,
@@ -729,7 +730,7 @@ fn external_editor_session_restores_terminal_after_editor_exit() {
 
 #[test]
 fn mail_page_layout_keeps_preview_at_fixed_90_columns() {
-    let panes = mail_page_panes(Rect::new(0, 0, 180, 20));
+    let panes = mail_page_panes(Rect::new(0, 0, 180, 20), MailPaneLayout::default());
 
     assert_eq!(panes[2].width, 90);
     assert_eq!(panes[2].x, 90);
@@ -740,11 +741,26 @@ fn mail_page_layout_keeps_preview_at_fixed_90_columns() {
 
 #[test]
 fn mail_page_layout_falls_back_to_available_width_when_terminal_is_narrow() {
-    let panes = mail_page_panes(Rect::new(0, 0, 60, 20));
+    let panes = mail_page_panes(Rect::new(0, 0, 60, 20), MailPaneLayout::default());
 
     assert_eq!(panes[2].width, 60);
     assert_eq!(panes[0].width, 0);
     assert_eq!(panes[1].width, 0);
+}
+
+#[test]
+fn mail_page_layout_uses_persisted_fixed_mail_pane_widths() {
+    let panes = mail_page_panes(
+        Rect::new(0, 0, 180, 20),
+        MailPaneLayout {
+            subscriptions_width: 31,
+            preview_width: 84,
+        },
+    );
+
+    assert_eq!(panes[0].width, 31);
+    assert_eq!(panes[1].width, 65);
+    assert_eq!(panes[2].width, 84);
 }
 
 #[test]
@@ -851,6 +867,8 @@ fn command_palette_help_includes_keyboard_shortcuts() {
     assert!(state.status.contains("keys:"));
     assert!(state.status.contains("j/l focus"));
     assert!(state.status.contains("i/k move"));
+    assert!(state.status.contains("[ ] expand pane"));
+    assert!(state.status.contains("{ } shrink pane"));
     assert!(state.status.contains("-/= preview switch"));
     assert!(state.status.contains("y/n enable"));
     assert!(state.status.contains("a apply"));
@@ -1225,6 +1243,127 @@ fn preview_focus_supports_minus_equals_shifted_equals_and_plus_thread_navigation
     assert!(matches!(state.focus, Pane::Preview));
     assert_eq!(state.thread_index, 3);
     assert_eq!(state.preview_scroll, 0);
+}
+
+#[test]
+fn resize_shortcuts_follow_the_focused_mail_pane_and_persist_layout() {
+    let root = temp_dir("mail-pane-resize");
+    let runtime = test_runtime_in(root.clone());
+    let mut state = AppState::new(vec![], runtime);
+
+    let expand_subscriptions = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+    );
+    assert!(matches!(expand_subscriptions, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.subscriptions_width, 27);
+    assert_eq!(state.mail_pane_layout.preview_width, 90);
+
+    let shrink_subscriptions = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('}'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(shrink_subscriptions, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.subscriptions_width, 23);
+
+    state.focus = Pane::Threads;
+    let expand_threads_left = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+    );
+    assert!(matches!(expand_threads_left, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.subscriptions_width, 19);
+
+    let shrink_threads_left = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('{'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(shrink_threads_left, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.subscriptions_width, 23);
+
+    let expand_threads_right = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+    );
+    assert!(matches!(expand_threads_right, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.preview_width, 86);
+
+    let shrink_threads_right = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('}'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(shrink_threads_right, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.preview_width, 90);
+
+    state.focus = Pane::Preview;
+    let expand_preview = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+    );
+    assert!(matches!(expand_preview, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.preview_width, 94);
+
+    let shrink_preview = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('{'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(shrink_preview, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.preview_width, 90);
+
+    let persisted = ui_state::load(&state.ui_state_path)
+        .expect("load persisted ui state")
+        .expect("ui state exists");
+    assert_eq!(persisted.mail_subscriptions_width, 23);
+    assert_eq!(persisted.mail_preview_width, 90);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn resize_shortcuts_stop_at_fixed_edges_and_minimum_mail_pane_widths() {
+    let mut state = AppState::new(vec![], test_runtime());
+
+    let fixed_edge_action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+    );
+    assert!(matches!(fixed_edge_action, LoopAction::Continue));
+    assert_eq!(
+        state.mail_pane_layout.subscriptions_width,
+        ui_state::DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH
+    );
+    assert_eq!(state.status, "mail pane cannot expand in that direction");
+
+    state.mail_pane_layout.subscriptions_width = MIN_MAIL_SUBSCRIPTIONS_WIDTH;
+
+    let min_subscriptions_action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('}'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(min_subscriptions_action, LoopAction::Continue));
+    assert_eq!(
+        state.mail_pane_layout.subscriptions_width,
+        MIN_MAIL_SUBSCRIPTIONS_WIDTH
+    );
+    assert_eq!(state.status, "mail pane cannot shrink in that direction");
+
+    state.focus = Pane::Preview;
+    let preview_fixed_edge_action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+    );
+    assert!(matches!(preview_fixed_edge_action, LoopAction::Continue));
+    assert_eq!(state.status, "mail pane cannot expand in that direction");
+
+    state.mail_pane_layout.preview_width = MIN_MAIL_PREVIEW_WIDTH;
+
+    let min_preview_action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('{'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(min_preview_action, LoopAction::Continue));
+    assert_eq!(state.mail_pane_layout.preview_width, MIN_MAIL_PREVIEW_WIDTH);
+    assert_eq!(state.status, "mail pane cannot shrink in that direction");
 }
 
 #[test]
@@ -2198,7 +2337,7 @@ fn command_palette_renders_local_command_result() {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     );
 
-    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).expect("create test terminal");
     terminal
         .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
         .expect("draw frame");
@@ -2859,7 +2998,7 @@ fn code_edit_draw_sets_terminal_cursor_position() {
     );
     assert!(matches!(state.code_edit_mode, CodeEditMode::VimNormal));
 
-    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).expect("create test terminal");
     let mut expected_cursor: Option<(u16, u16)> = None;
     terminal
         .draw(|frame| {
@@ -3126,6 +3265,26 @@ fn first_open_with_complete_imap_enables_my_inbox() {
 }
 
 #[test]
+fn app_state_restores_and_re_persists_mail_pane_layout_from_ui_state() {
+    let state = AppState::new_with_ui_state(
+        vec![],
+        test_runtime(),
+        Some(UiState {
+            mail_subscriptions_width: 29,
+            mail_preview_width: 82,
+            ..UiState::default()
+        }),
+    );
+
+    assert_eq!(state.mail_pane_layout.subscriptions_width, 29);
+    assert_eq!(state.mail_pane_layout.preview_width, 82);
+
+    let persisted = state.to_ui_state();
+    assert_eq!(persisted.mail_subscriptions_width, 29);
+    assert_eq!(persisted.mail_preview_width, 82);
+}
+
+#[test]
 fn legacy_ui_state_with_complete_imap_enables_my_inbox_once() {
     let state = AppState::new_with_ui_state(
         vec![],
@@ -3140,6 +3299,7 @@ fn legacy_ui_state_with_complete_imap_enables_my_inbox_once() {
             disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: false,
             active_mailbox: Some("io-uring".to_string()),
+            ..UiState::default()
         }),
     );
 
@@ -3168,6 +3328,7 @@ fn initialized_ui_state_keeps_my_inbox_disabled_when_user_opted_out() {
             disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some("io-uring".to_string()),
+            ..UiState::default()
         }),
     );
 
@@ -3216,6 +3377,7 @@ fn empty_active_inbox_recovers_to_cached_enabled_mailbox() {
             disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            ..UiState::default()
         }),
     );
 
@@ -3252,6 +3414,7 @@ fn startup_sync_failure_for_empty_inbox_falls_back_to_cached_mailbox() {
             disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            ..UiState::default()
         }),
     );
 
@@ -3553,6 +3716,7 @@ fn enter_on_mailbox_pending_startup_sync_stays_non_blocking() {
             disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            ..UiState::default()
         }),
     );
     state.focus = Pane::Subscriptions;
@@ -3592,6 +3756,7 @@ fn enter_on_mailbox_pending_manual_sync_stays_non_blocking() {
             disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            ..UiState::default()
         }),
     );
     state.focus = Pane::Subscriptions;
@@ -3657,6 +3822,7 @@ fn background_success_does_not_steal_focus_from_pending_inbox() {
             disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: true,
             active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            ..UiState::default()
         }),
     );
     state.startup_sync = Some(startup_sync_state(&[
@@ -5844,7 +6010,7 @@ fn threads_panel_renders_thread_group_headers() {
     );
     state.focus = Pane::Threads;
 
-    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("create test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).expect("create test terminal");
     terminal
         .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
         .expect("draw frame");

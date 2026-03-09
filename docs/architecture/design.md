@@ -363,7 +363,7 @@ MVP 范围与阶段目标已迁移至独立文档：
 - TUI 左栏采用 vger 子系统模板订阅，支持 `y/n` 启停、启用/停用双分组、折叠展开、
   `Enter` 打开对应 mailbox Threads。
 - 命令栏支持 `sync` / `sync <mailbox>`，并在启动 TUI 时自动同步“已启用订阅”。
-- UI 状态持久化 `enabled_mailboxes`、分组展开状态、active mailbox 到 `ui-state.toml`；
+- UI 状态持久化 `enabled_mailboxes`、分组展开状态、active mailbox 和 mail pane 宽度到 `ui-state.toml`；
   首次启动默认全部订阅禁用；该基线在 M6 规划中仅对新增 `My Inbox` 订阅例外。
 - 右栏预览默认隐藏 RFC 头部，过滤控制字符，切换线程时清屏并重置滚动，避免残留字符。
 

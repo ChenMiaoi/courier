@@ -128,7 +128,7 @@ pub(super) fn draw(
 
     match state.ui_page {
         UiPage::Mail => {
-            let panes = mail_page_panes(areas[1]);
+            let panes = mail_page_panes(areas[1], state.mail_pane_layout);
             draw_subscriptions(frame, panes[0], state);
             draw_threads(frame, panes[1], state);
             draw_preview(frame, panes[2], state, config);
@@ -160,7 +160,7 @@ pub(super) fn draw(
             "/ search | Tab page | : palette | Enter | e/r reply".to_string()
         }
         UiPage::Mail => format!(
-            "/ search | Tab page | : palette | Enter | e/r reply | {}",
+            "/ search | Tab page | : palette | Enter | e/r reply | [ ] expand pane | {{ }} shrink pane | {}",
             main_page_navigation_shortcuts(state.runtime.ui_keymap)
         ),
         UiPage::CodeBrowser if state.is_code_edit_active() => {
@@ -240,12 +240,12 @@ fn draw_code_browser_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     draw_code_source_preview(frame, panes[1], state);
 }
 
-pub(super) fn mail_page_panes(area: Rect) -> [Rect; 3] {
+pub(super) fn mail_page_panes(area: Rect, layout: MailPaneLayout) -> [Rect; 3] {
     if area.width == 0 {
         return [area, area, area];
     }
 
-    let preview_width = area.width.min(PREVIEW_PANE_FIXED_WIDTH);
+    let preview_width = area.width.min(layout.preview_width);
     let left_width = area.width.saturating_sub(preview_width);
     let preview = Rect {
         x: area.x + left_width,
@@ -264,18 +264,22 @@ pub(super) fn mail_page_panes(area: Rect) -> [Rect; 3] {
         return [empty, empty, preview];
     }
 
-    let left = Rect {
+    let subscriptions_width = left_width.min(layout.subscriptions_width);
+    let threads_width = left_width.saturating_sub(subscriptions_width);
+    let subscriptions = Rect {
         x: area.x,
         y: area.y,
-        width: left_width,
+        width: subscriptions_width,
         height: area.height,
     };
-    let left_panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)])
-        .split(left);
+    let threads = Rect {
+        x: area.x + subscriptions_width,
+        y: area.y,
+        width: threads_width,
+        height: area.height,
+    };
 
-    [left_panes[0], left_panes[1], preview]
+    [subscriptions, threads, preview]
 }
 
 fn draw_subscriptions(frame: &mut Frame<'_>, area: Rect, state: &AppState) {

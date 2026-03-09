@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::infra::error::{CriewError, ErrorCode, Result};
 
+pub const DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH: u16 = 23;
+pub const DEFAULT_MAIL_PREVIEW_WIDTH: u16 = 90;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default)]
@@ -32,10 +35,22 @@ pub struct UiState {
     pub imap_defaults_initialized: bool,
     #[serde(default)]
     pub active_mailbox: Option<String>,
+    #[serde(default = "default_mail_subscriptions_width")]
+    pub mail_subscriptions_width: u16,
+    #[serde(default = "default_mail_preview_width")]
+    pub mail_preview_width: u16,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_mail_subscriptions_width() -> u16 {
+    DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH
+}
+
+fn default_mail_preview_width() -> u16 {
+    DEFAULT_MAIL_PREVIEW_WIDTH
 }
 
 impl Default for UiState {
@@ -50,6 +65,8 @@ impl Default for UiState {
             disabled_qemu_subsystem_expanded: true,
             imap_defaults_initialized: false,
             active_mailbox: None,
+            mail_subscriptions_width: DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH,
+            mail_preview_width: DEFAULT_MAIL_PREVIEW_WIDTH,
         }
     }
 }
@@ -138,7 +155,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{UiState, load, path_for_data_dir, save};
+    use super::{
+        DEFAULT_MAIL_PREVIEW_WIDTH, DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH, UiState, load,
+        path_for_data_dir, save,
+    };
 
     fn temp_dir(label: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -164,6 +184,8 @@ mod tests {
             disabled_qemu_subsystem_expanded: false,
             imap_defaults_initialized: true,
             active_mailbox: Some("bpf".to_string()),
+            mail_subscriptions_width: 28,
+            mail_preview_width: 84,
         };
 
         save(&path, &state).expect("save state");
@@ -181,6 +203,8 @@ mod tests {
         assert!(!loaded.disabled_qemu_subsystem_expanded);
         assert!(loaded.imap_defaults_initialized);
         assert_eq!(loaded.active_mailbox.as_deref(), Some("bpf"));
+        assert_eq!(loaded.mail_subscriptions_width, 28);
+        assert_eq!(loaded.mail_preview_width, 84);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -203,6 +227,11 @@ mod tests {
         assert!(loaded.enabled_qemu_subsystem_expanded);
         assert!(loaded.disabled_linux_subsystem_expanded);
         assert!(loaded.disabled_qemu_subsystem_expanded);
+        assert_eq!(
+            loaded.mail_subscriptions_width,
+            DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH
+        );
+        assert_eq!(loaded.mail_preview_width, DEFAULT_MAIL_PREVIEW_WIDTH);
 
         let _ = fs::remove_dir_all(root);
     }

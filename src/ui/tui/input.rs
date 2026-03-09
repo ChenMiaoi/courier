@@ -267,6 +267,18 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         {
             state.open_reply_panel(false);
         }
+        KeyCode::Char('[') if matches!(state.ui_page, UiPage::Mail) => {
+            state.resize_mail_panes(HorizontalResizeDirection::Left, MailPaneResizeMode::Expand);
+        }
+        KeyCode::Char(']') if matches!(state.ui_page, UiPage::Mail) => {
+            state.resize_mail_panes(HorizontalResizeDirection::Right, MailPaneResizeMode::Expand);
+        }
+        KeyCode::Char('{') if matches!(state.ui_page, UiPage::Mail) => {
+            state.resize_mail_panes(HorizontalResizeDirection::Left, MailPaneResizeMode::Shrink);
+        }
+        KeyCode::Char('}') if matches!(state.ui_page, UiPage::Mail) => {
+            state.resize_mail_panes(HorizontalResizeDirection::Right, MailPaneResizeMode::Shrink);
+        }
         KeyCode::Char('e') if matches!(state.ui_page, UiPage::CodeBrowser) => {
             state.enter_code_edit_mode();
         }
@@ -714,7 +726,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "restart" => return LoopAction::Restart,
                 "help" => {
                     state.status = format!(
-                        "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: {} focus, {} move, -/= preview switch, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
+                        "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
                         main_page_focus_shortcuts(state.runtime.ui_keymap),
                         main_page_move_shortcuts(state.runtime.ui_keymap)
                     );

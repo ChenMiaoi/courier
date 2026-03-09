@@ -100,6 +100,49 @@ impl Pane {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MailPaneLayout {
+    subscriptions_width: u16,
+    preview_width: u16,
+}
+
+impl Default for MailPaneLayout {
+    fn default() -> Self {
+        Self {
+            subscriptions_width: ui_state::DEFAULT_MAIL_SUBSCRIPTIONS_WIDTH,
+            preview_width: ui_state::DEFAULT_MAIL_PREVIEW_WIDTH,
+        }
+    }
+}
+
+impl MailPaneLayout {
+    fn from_persisted(state: Option<&UiState>) -> Self {
+        let defaults = Self::default();
+        Self {
+            subscriptions_width: state
+                .map(|persisted| persisted.mail_subscriptions_width)
+                .unwrap_or(defaults.subscriptions_width)
+                .max(MIN_MAIL_SUBSCRIPTIONS_WIDTH),
+            preview_width: state
+                .map(|persisted| persisted.mail_preview_width)
+                .unwrap_or(defaults.preview_width)
+                .max(MIN_MAIL_PREVIEW_WIDTH),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HorizontalResizeDirection {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailPaneResizeMode {
+    Expand,
+    Shrink,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PaletteCommand {
     name: &'static str,
@@ -159,9 +202,11 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
 ];
 
 const PALETTE_SYNC_RECONNECT_ATTEMPTS: u8 = 3;
+const MAIL_PANE_RESIZE_STEP: u16 = 4;
+const MIN_MAIL_PREVIEW_WIDTH: u16 = 40;
+const MIN_MAIL_SUBSCRIPTIONS_WIDTH: u16 = 12;
 const PREVIEW_TAB_SPACES: &str = "    ";
 const PREVIEW_RECIPIENT_PREVIEW_LIMIT: usize = 2;
-const PREVIEW_PANE_FIXED_WIDTH: u16 = 90;
 const THREAD_LINE_MAX_CHARS: usize = 120;
 const KERNEL_TREE_MAX_ROWS: usize = 2048;
 const CODE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
@@ -325,6 +370,17 @@ fn main_page_navigation_shortcuts(keymap: UiKeymap) -> String {
         main_page_focus_shortcuts(keymap),
         main_page_move_shortcuts(keymap)
     )
+}
+
+fn shrink_mail_pane_width(width: &mut u16, minimum_width: u16) -> bool {
+    if *width <= minimum_width {
+        return false;
+    }
+
+    *width = width
+        .saturating_sub(MAIL_PANE_RESIZE_STEP)
+        .max(minimum_width);
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1214,6 +1270,7 @@ struct AppState {
     imap_defaults_initialized: bool,
     ui_page: UiPage,
     focus: Pane,
+    mail_pane_layout: MailPaneLayout,
     code_focus: CodePaneFocus,
     subscriptions: Vec<SubscriptionItem>,
     enabled_group_expanded: bool,
@@ -1275,6 +1332,7 @@ impl AppState {
         persisted: Option<UiState>,
     ) -> Self {
         let ui_state_path = ui_state::path_for_data_dir(&runtime.data_dir);
+        let mail_pane_layout = MailPaneLayout::from_persisted(persisted.as_ref());
         let persisted_imap_defaults_initialized = persisted
             .as_ref()
             .map(|state| state.imap_defaults_initialized)
@@ -1313,6 +1371,7 @@ impl AppState {
             imap_defaults_initialized: persisted_imap_defaults_initialized,
             ui_page: UiPage::Mail,
             focus: Pane::Subscriptions,
+            mail_pane_layout,
             code_focus: CodePaneFocus::Tree,
             subscriptions,
             enabled_group_expanded: persisted
@@ -2722,6 +2781,8 @@ impl AppState {
             disabled_qemu_subsystem_expanded: self.disabled_qemu_subsystem_expanded,
             imap_defaults_initialized: self.imap_defaults_initialized,
             active_mailbox: Some(self.active_thread_mailbox.clone()),
+            mail_subscriptions_width: self.mail_pane_layout.subscriptions_width,
+            mail_preview_width: self.mail_pane_layout.preview_width,
         }
     }
 
@@ -3672,6 +3733,85 @@ impl AppState {
                 self.code_focus = self.code_focus.previous();
             }
         }
+    }
+
+    fn resize_mail_panes(
+        &mut self,
+        direction: HorizontalResizeDirection,
+        resize_mode: MailPaneResizeMode,
+    ) {
+        let did_resize = match (self.focus, direction, resize_mode) {
+            (Pane::Subscriptions, HorizontalResizeDirection::Left, _) => false,
+            (Pane::Subscriptions, HorizontalResizeDirection::Right, MailPaneResizeMode::Expand) => {
+                self.grow_mail_subscriptions_pane()
+            }
+            (Pane::Subscriptions, HorizontalResizeDirection::Right, MailPaneResizeMode::Shrink) => {
+                self.shrink_mail_subscriptions_pane()
+            }
+            (Pane::Threads, HorizontalResizeDirection::Left, MailPaneResizeMode::Expand) => {
+                self.shrink_mail_subscriptions_pane()
+            }
+            (Pane::Threads, HorizontalResizeDirection::Left, MailPaneResizeMode::Shrink) => {
+                self.grow_mail_subscriptions_pane()
+            }
+            (Pane::Threads, HorizontalResizeDirection::Right, MailPaneResizeMode::Expand) => {
+                self.shrink_mail_preview_pane()
+            }
+            (Pane::Threads, HorizontalResizeDirection::Right, MailPaneResizeMode::Shrink) => {
+                self.grow_mail_preview_pane()
+            }
+            (Pane::Preview, HorizontalResizeDirection::Left, MailPaneResizeMode::Expand) => {
+                self.grow_mail_preview_pane()
+            }
+            (Pane::Preview, HorizontalResizeDirection::Left, MailPaneResizeMode::Shrink) => {
+                self.shrink_mail_preview_pane()
+            }
+            (Pane::Preview, HorizontalResizeDirection::Right, _) => false,
+        };
+
+        if did_resize {
+            self.persist_ui_state();
+            self.status = format!(
+                "mail panes saved: subscriptions {} cols, preview {} cols",
+                self.mail_pane_layout.subscriptions_width, self.mail_pane_layout.preview_width
+            );
+        } else {
+            self.status = match resize_mode {
+                MailPaneResizeMode::Expand => "mail pane cannot expand in that direction",
+                MailPaneResizeMode::Shrink => "mail pane cannot shrink in that direction",
+            }
+            .to_string();
+        }
+    }
+
+    fn grow_mail_subscriptions_pane(&mut self) -> bool {
+        self.mail_pane_layout.subscriptions_width = self
+            .mail_pane_layout
+            .subscriptions_width
+            .saturating_add(MAIL_PANE_RESIZE_STEP);
+        true
+    }
+
+    fn shrink_mail_subscriptions_pane(&mut self) -> bool {
+        shrink_mail_pane_width(
+            &mut self.mail_pane_layout.subscriptions_width,
+            MIN_MAIL_SUBSCRIPTIONS_WIDTH,
+        )
+    }
+
+    fn grow_mail_preview_pane(&mut self) -> bool {
+        self.mail_pane_layout.preview_width = self
+            .mail_pane_layout
+            .preview_width
+            .saturating_add(MAIL_PANE_RESIZE_STEP);
+        true
+    }
+
+    fn shrink_mail_preview_pane(&mut self) -> bool {
+        shrink_mail_pane_width(
+            &mut self.mail_pane_layout.preview_width,
+            MIN_MAIL_PREVIEW_WIDTH,
+        )
     }
 
     fn select_filtered_thread_at(&mut self, filtered_index: usize) {
