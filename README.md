@@ -211,13 +211,16 @@ criew tui
 Inside the TUI:
 
 - `:` opens the command palette
+- the header shows the active keymap scheme (`default`, `vim`, or `custom`)
+- a numeric prefix repeats vertical movement: `count+i/k` for `default`/`custom`, `count+j/k` for `vim`
 - `y` / `n` enable or disable the selected subscription
-- `Enter` opens the selected mailbox or thread
+- `Enter` opens the selected mailbox or thread and moves focus to threads or preview
 - `a` applies the current patch series
 - `d` exports the current patch series
 - `u` undoes the most recent successful apply from the current session
 - `r` or `e` opens the reply panel
 - `Tab` switches between the mail page and the code browser
+- with `ui.keymap = "vim"`, `gg` jumps to the first line in the active pane, `G` jumps to the last line, and `qq` exits quickly
 
 ##### Background sync
 

@@ -4,6 +4,7 @@
 //! machine stays here so key handling, background work, and side effects remain
 //! readable in one place.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -230,7 +231,7 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
     },
     ConfigEditorField {
         key: "ui.keymap",
-        description: "Main-page navigation scheme. default=j/l focus+i/k move, vim=h/l focus+j/k move.",
+        description: "Main-page navigation scheme. default=j/l+i/k+count, vim=h/l+j/k+count+gg/G+qq, custom=default fallback with custom label.",
     },
     ConfigEditorField {
         key: "ui.inbox_auto_sync_interval_secs",
@@ -306,14 +307,14 @@ const EXTERNAL_EDITOR_ENTRY_HINT: &str = "select a source file in Source pane, t
 
 fn main_page_focus_shortcuts(keymap: UiKeymap) -> &'static str {
     match keymap {
-        UiKeymap::Default => "j/l",
+        UiKeymap::Default | UiKeymap::Custom => "j/l",
         UiKeymap::Vim => "h/l",
     }
 }
 
 fn main_page_move_shortcuts(keymap: UiKeymap) -> &'static str {
     match keymap {
-        UiKeymap::Default => "i/k",
+        UiKeymap::Default | UiKeymap::Custom => "i/k",
         UiKeymap::Vim => "j/k",
     }
 }
@@ -337,6 +338,28 @@ type ExternalEditorRunner =
 type ReplyIdentityResolver = fn() -> std::result::Result<ReplyIdentity, String>;
 type ReplySendExecutor = fn(&RuntimeConfig, &SendRequest) -> SendOutcome;
 type MailboxSyncSpawner = fn(RuntimeConfig, Vec<String>) -> Receiver<StartupSyncEvent>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingMainPageChord {
+    VimGoToFirstLine,
+    VimQuit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingMainPageChordState {
+    chord: PendingMainPageChord,
+    ui_page: UiPage,
+    focus: Pane,
+    code_focus: CodePaneFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingMainPageCountState {
+    count: u16,
+    ui_page: UiPage,
+    focus: Pane,
+    code_focus: CodePaneFocus,
+}
 
 #[derive(Debug, Clone)]
 enum StartupSyncEvent {
@@ -1208,6 +1231,7 @@ struct AppState {
     kernel_tree_expanded_paths: HashSet<PathBuf>,
     kernel_tree_row_index: usize,
     code_preview_scroll: u16,
+    code_preview_scroll_limit: Cell<u16>,
     code_edit_mode: CodeEditMode,
     code_edit_target: Option<PathBuf>,
     code_edit_buffer: Vec<String>,
@@ -1218,6 +1242,7 @@ struct AppState {
     reply_panel: Option<ReplyPanelState>,
     thread_index: usize,
     preview_scroll: u16,
+    preview_scroll_limit: Cell<u16>,
     selected_mail_preview: Option<MailPreview>,
     started_at: Instant,
     status: String,
@@ -1235,6 +1260,8 @@ struct AppState {
     inbox_auto_sync: Option<InboxAutoSyncState>,
     manual_sync: Option<ManualSyncState>,
     subscription_auto_sync: Option<SubscriptionAutoSyncState>,
+    pending_main_page_chord: Option<PendingMainPageChordState>,
+    pending_main_page_count: Option<PendingMainPageCountState>,
 }
 
 impl AppState {
@@ -1321,6 +1348,7 @@ impl AppState {
             kernel_tree_expanded_paths,
             kernel_tree_row_index: 0,
             code_preview_scroll: 0,
+            code_preview_scroll_limit: Cell::new(u16::MAX),
             code_edit_mode: CodeEditMode::Browse,
             code_edit_target: None,
             code_edit_buffer: Vec::new(),
@@ -1331,6 +1359,7 @@ impl AppState {
             reply_panel: None,
             thread_index: 0,
             preview_scroll: 0,
+            preview_scroll_limit: Cell::new(u16::MAX),
             selected_mail_preview: None,
             started_at: Instant::now(),
             status: String::new(),
@@ -1348,6 +1377,8 @@ impl AppState {
             inbox_auto_sync: None,
             manual_sync: None,
             subscription_auto_sync: None,
+            pending_main_page_chord: None,
+            pending_main_page_count: None,
         };
         if state.runtime.imap.is_complete() {
             state.imap_defaults_initialized = true;
@@ -3012,6 +3043,7 @@ impl AppState {
                     format!("showing threads for {}", mailbox),
                     true,
                 );
+                self.focus = Pane::Threads;
             }
             Ok(_) => {
                 if self.mailbox_sync_pending(&mailbox) {
@@ -3021,6 +3053,7 @@ impl AppState {
                         format!("{mailbox} is syncing in background; page stays responsive"),
                         true,
                     );
+                    self.focus = Pane::Threads;
                     return;
                 }
 
@@ -3036,6 +3069,7 @@ impl AppState {
                     }
                 };
                 self.show_mailbox_threads(&mailbox, Vec::new(), background_status, true);
+                self.focus = Pane::Threads;
             }
             Err(error) => {
                 tracing::error!(
@@ -3651,13 +3685,19 @@ impl AppState {
                     }
                 }
                 Pane::Preview => {
-                    self.preview_scroll = self.preview_scroll.saturating_sub(1);
+                    self.preview_scroll = self
+                        .preview_scroll
+                        .min(self.preview_scroll_limit.get())
+                        .saturating_sub(1);
                 }
             },
             UiPage::CodeBrowser => match self.code_focus {
                 CodePaneFocus::Tree => self.move_kernel_tree_up(),
                 CodePaneFocus::Source => {
-                    self.code_preview_scroll = self.code_preview_scroll.saturating_sub(1);
+                    self.code_preview_scroll = self
+                        .code_preview_scroll
+                        .min(self.code_preview_scroll_limit.get())
+                        .saturating_sub(1);
                 }
             },
         }
@@ -3677,13 +3717,23 @@ impl AppState {
                     }
                 }
                 Pane::Preview => {
-                    self.preview_scroll = self.preview_scroll.saturating_add(1);
+                    let preview_scroll_limit = self.preview_scroll_limit.get();
+                    self.preview_scroll = self
+                        .preview_scroll
+                        .min(preview_scroll_limit)
+                        .saturating_add(1)
+                        .min(preview_scroll_limit);
                 }
             },
             UiPage::CodeBrowser => match self.code_focus {
                 CodePaneFocus::Tree => self.move_kernel_tree_down(),
                 CodePaneFocus::Source => {
-                    self.code_preview_scroll = self.code_preview_scroll.saturating_add(1);
+                    let code_preview_scroll_limit = self.code_preview_scroll_limit.get();
+                    self.code_preview_scroll = self
+                        .code_preview_scroll
+                        .min(code_preview_scroll_limit)
+                        .saturating_add(1)
+                        .min(code_preview_scroll_limit);
                 }
             },
         }
@@ -3693,6 +3743,143 @@ impl AppState {
         self.search.active = true;
         self.search.input = self.search.applied_query.clone();
         self.status = "search mode".to_string();
+    }
+
+    fn jump_current_pane_to_start(&mut self) {
+        match self.ui_page {
+            UiPage::Mail => match self.focus {
+                Pane::Subscriptions => {
+                    self.subscription_row_index = 0;
+                    self.clamp_subscription_row_selection();
+                }
+                Pane::Threads => {
+                    if !self.filtered_thread_indices.is_empty() {
+                        self.thread_index = 0;
+                        self.preview_scroll = 0;
+                        self.refresh_selected_mail_preview();
+                    }
+                }
+                Pane::Preview => {
+                    self.preview_scroll = 0;
+                }
+            },
+            UiPage::CodeBrowser => match self.code_focus {
+                CodePaneFocus::Tree => {
+                    let previous_file =
+                        self.selected_kernel_tree_file_path().map(Path::to_path_buf);
+                    self.kernel_tree_row_index = 0;
+                    let next_file = self.selected_kernel_tree_file_path().map(Path::to_path_buf);
+                    if previous_file != next_file {
+                        self.code_preview_scroll = 0;
+                    }
+                }
+                CodePaneFocus::Source => {
+                    self.code_preview_scroll = 0;
+                }
+            },
+        }
+    }
+
+    fn jump_current_pane_to_end(&mut self) {
+        match self.ui_page {
+            UiPage::Mail => match self.focus {
+                Pane::Subscriptions => {
+                    let rows = self.subscription_rows();
+                    if rows.is_empty() {
+                        return;
+                    }
+                    self.subscription_row_index = rows.len().saturating_sub(1);
+                    self.clamp_subscription_row_selection();
+                }
+                Pane::Threads => {
+                    if !self.filtered_thread_indices.is_empty() {
+                        self.thread_index = self.filtered_thread_indices.len().saturating_sub(1);
+                        self.preview_scroll = 0;
+                        self.refresh_selected_mail_preview();
+                    }
+                }
+                Pane::Preview => {
+                    self.preview_scroll = u16::MAX;
+                }
+            },
+            UiPage::CodeBrowser => match self.code_focus {
+                CodePaneFocus::Tree => {
+                    if self.kernel_tree_rows.is_empty() {
+                        self.kernel_tree_row_index = 0;
+                        return;
+                    }
+                    let previous_file =
+                        self.selected_kernel_tree_file_path().map(Path::to_path_buf);
+                    self.kernel_tree_row_index = self.kernel_tree_rows.len().saturating_sub(1);
+                    let next_file = self.selected_kernel_tree_file_path().map(Path::to_path_buf);
+                    if previous_file != next_file {
+                        self.code_preview_scroll = 0;
+                    }
+                }
+                CodePaneFocus::Source => {
+                    self.code_preview_scroll = self.code_preview_scroll_limit.get();
+                }
+            },
+        }
+    }
+
+    fn pending_main_page_chord_state(
+        &self,
+        chord: PendingMainPageChord,
+    ) -> PendingMainPageChordState {
+        PendingMainPageChordState {
+            chord,
+            ui_page: self.ui_page,
+            focus: self.focus,
+            code_focus: self.code_focus,
+        }
+    }
+
+    fn pending_main_page_count_state(&self, count: u16) -> PendingMainPageCountState {
+        PendingMainPageCountState {
+            count,
+            ui_page: self.ui_page,
+            focus: self.focus,
+            code_focus: self.code_focus,
+        }
+    }
+
+    fn clear_pending_main_page_inputs(&mut self) {
+        self.pending_main_page_chord = None;
+        self.pending_main_page_count = None;
+    }
+
+    fn clear_pending_main_page_count(&mut self) {
+        self.pending_main_page_count = None;
+    }
+
+    fn has_pending_main_page_count(&self) -> bool {
+        self.pending_main_page_count.is_some_and(|state| {
+            state.ui_page == self.ui_page
+                && state.focus == self.focus
+                && state.code_focus == self.code_focus
+        })
+    }
+
+    fn push_pending_main_page_count_digit(&mut self, digit: u16) {
+        let next_count = self
+            .pending_main_page_count
+            .filter(|state| {
+                state.ui_page == self.ui_page
+                    && state.focus == self.focus
+                    && state.code_focus == self.code_focus
+            })
+            .map(|state| state.count.saturating_mul(10).saturating_add(digit))
+            .unwrap_or(digit);
+        self.pending_main_page_count = Some(self.pending_main_page_count_state(next_count));
+    }
+
+    fn take_pending_main_page_count(&mut self) -> Option<u16> {
+        let pending_state = self.pending_main_page_count.take()?;
+        let same_scope = pending_state.ui_page == self.ui_page
+            && pending_state.focus == self.focus
+            && pending_state.code_focus == self.code_focus;
+        same_scope.then_some(pending_state.count)
     }
 
     fn close_search(&mut self) {

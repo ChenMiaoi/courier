@@ -31,7 +31,7 @@ mailbox = "linux-kernel"
 
 [ui]
 startup_sync = true
-# keymap = "default" # Supported: default, vim
+# keymap = "default" # Supported: default, vim, custom
 # inbox_auto_sync_interval_secs = 30
 
 [logging]
@@ -63,6 +63,7 @@ pub enum UiKeymap {
     #[default]
     Default,
     Vim,
+    Custom,
 }
 
 impl UiKeymap {
@@ -70,6 +71,7 @@ impl UiKeymap {
         match self {
             Self::Default => "default",
             Self::Vim => "vim",
+            Self::Custom => "custom",
         }
     }
 }
@@ -733,6 +735,27 @@ trees = ["./linux-next"]
         assert!(content.contains("mailbox = \"linux-kernel\""));
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn loads_custom_ui_keymap_from_config() {
+        let base = temp_dir("config-custom-keymap");
+        let config_path = base.join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[ui]
+keymap = "custom"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load(Some(&config_path)).expect("load config");
+
+        assert_eq!(loaded.ui_keymap, UiKeymap::Custom);
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

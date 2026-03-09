@@ -19,46 +19,143 @@ pub(super) enum LoopAction {
     Restart,
 }
 
+fn pending_main_page_move_count(state: &mut AppState) -> u16 {
+    state.take_pending_main_page_count().unwrap_or(1)
+}
+
 fn handle_main_page_navigation_key(state: &mut AppState, key: KeyEvent) -> bool {
     match state.runtime.ui_keymap {
-        UiKeymap::Default => match key.code {
+        UiKeymap::Default | UiKeymap::Custom => match key.code {
             KeyCode::Char('j') => {
+                state.clear_pending_main_page_count();
                 state.move_focus_previous();
                 true
             }
             KeyCode::Char('l') => {
+                state.clear_pending_main_page_count();
                 state.move_focus_next();
                 true
             }
             KeyCode::Char('i') => {
-                state.move_up();
+                for _ in 0..pending_main_page_move_count(state) {
+                    state.move_up();
+                }
                 true
             }
             KeyCode::Char('k') => {
-                state.move_down();
+                for _ in 0..pending_main_page_move_count(state) {
+                    state.move_down();
+                }
                 true
             }
             _ => false,
         },
         UiKeymap::Vim => match key.code {
             KeyCode::Char('h') => {
+                state.clear_pending_main_page_count();
                 state.move_focus_previous();
                 true
             }
             KeyCode::Char('l') => {
+                state.clear_pending_main_page_count();
                 state.move_focus_next();
                 true
             }
             KeyCode::Char('k') => {
-                state.move_up();
+                for _ in 0..pending_main_page_move_count(state) {
+                    state.move_up();
+                }
                 true
             }
             KeyCode::Char('j') => {
-                state.move_down();
+                for _ in 0..pending_main_page_move_count(state) {
+                    state.move_down();
+                }
                 true
             }
             _ => false,
         },
+    }
+}
+
+fn handle_main_page_count_prefix(state: &mut AppState, key: KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        state.clear_pending_main_page_count();
+        return false;
+    }
+
+    let KeyCode::Char(character) = key.code else {
+        return false;
+    };
+    if !character.is_ascii_digit() {
+        return false;
+    }
+    if character == '0' && !state.has_pending_main_page_count() {
+        return false;
+    }
+
+    let digit = character
+        .to_digit(10)
+        .expect("ascii digit should convert to decimal") as u16;
+    state.push_pending_main_page_count_digit(digit);
+    true
+}
+
+fn handle_vim_main_page_chord(state: &mut AppState, key: KeyEvent) -> Option<LoopAction> {
+    if !matches!(state.runtime.ui_keymap, UiKeymap::Vim) {
+        state.pending_main_page_chord = None;
+        return None;
+    }
+
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        state.clear_pending_main_page_inputs();
+        return None;
+    }
+
+    if let Some(pending_state) = state.pending_main_page_chord.take() {
+        let same_scope = pending_state.ui_page == state.ui_page
+            && pending_state.focus == state.focus
+            && pending_state.code_focus == state.code_focus;
+        if same_scope {
+            match (pending_state.chord, key.code) {
+                (PendingMainPageChord::VimGoToFirstLine, KeyCode::Char('g')) => {
+                    state.jump_current_pane_to_start();
+                    return Some(LoopAction::Continue);
+                }
+                (PendingMainPageChord::VimQuit, KeyCode::Char('q')) => {
+                    return Some(LoopAction::Exit);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    match key.code {
+        KeyCode::Char('g') => {
+            state.clear_pending_main_page_count();
+            state.pending_main_page_chord =
+                Some(state.pending_main_page_chord_state(PendingMainPageChord::VimGoToFirstLine));
+            Some(LoopAction::Continue)
+        }
+        KeyCode::Char('G') => {
+            state.clear_pending_main_page_count();
+            state.jump_current_pane_to_end();
+            Some(LoopAction::Continue)
+        }
+        KeyCode::Char('q') => {
+            state.clear_pending_main_page_count();
+            state.pending_main_page_chord =
+                Some(state.pending_main_page_chord_state(PendingMainPageChord::VimQuit));
+            state.status = "press qq to quit or use command palette quit/exit".to_string();
+            Some(LoopAction::Continue)
+        }
+        _ => None,
     }
 }
 
@@ -78,10 +175,12 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     // Modal UI surfaces take precedence over the base page shortcuts so keys
     // keep local meaning while a dialog, editor, or search interaction is open.
     if state.config_editor.open {
+        state.clear_pending_main_page_inputs();
         return handle_config_editor_key_event(state, key);
     }
 
     if state.palette.open {
+        state.clear_pending_main_page_inputs();
         if is_palette_toggle(key) {
             state.close_palette();
             return LoopAction::Continue;
@@ -90,18 +189,30 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     }
 
     if state.search.active {
+        state.clear_pending_main_page_inputs();
         return handle_search_key_event(state, key);
     }
 
     if state.reply_panel.is_some() {
+        state.clear_pending_main_page_inputs();
         return handle_reply_key_event(state, key);
     }
 
     if state.is_code_edit_active() {
+        state.clear_pending_main_page_inputs();
         return handle_code_edit_key_event(state, key);
     }
 
+    if let Some(action) = handle_vim_main_page_chord(state, key) {
+        return action;
+    }
+
+    if handle_main_page_count_prefix(state, key) {
+        return LoopAction::Continue;
+    }
+
     if is_palette_open_shortcut(key) {
+        state.clear_pending_main_page_count();
         state.toggle_palette();
         return LoopAction::Continue;
     }
@@ -109,6 +220,8 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     if handle_main_page_navigation_key(state, key) {
         return LoopAction::Continue;
     }
+
+    state.clear_pending_main_page_count();
 
     match key.code {
         KeyCode::Char('/') => {
@@ -176,6 +289,7 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
                 Pane::Threads => {
                     if let Some(thread) = state.selected_thread() {
                         state.status = format!("selected {}", thread.message_id);
+                        state.focus = Pane::Preview;
                     }
                 }
                 Pane::Preview => {}

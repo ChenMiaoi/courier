@@ -198,13 +198,16 @@ criew tui
 #### 键位
 
 - `:` 打开命令栏
+- 顶部状态栏会显示当前 keymap 方案：`default`、`vim` 或 `custom`
+- 数字前缀可重复垂直移动：`default/custom` 使用 `数字 + i/k`，`vim` 使用 `数字 + j/k`
 - `y` / `n` 启用或禁用当前订阅
-- `Enter` 打开当前 mailbox 或 thread
+- `Enter` 打开当前 mailbox 或 thread，并自动切到 threads 或 preview pane
 - `a` apply 当前 patch series
 - `d` 导出当前 patch series
 - `u` 撤销本次会话中最近一次成功 apply
 - `r` 或 `e` 打开回信面板
 - `Tab` 在 Mail 页面和 Code Browser 页面之间切换
+- 当 `ui.keymap = "vim"` 时，`gg` 跳到当前 pane 行首，`G` 跳到行尾，`qq` 快速退出
 
 #### 命令栏命令
 
