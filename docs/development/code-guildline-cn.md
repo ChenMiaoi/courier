@@ -3,7 +3,7 @@
 ## 适用范围与优先级
 
 风格与评审决策的优先级：
-1. 本文档（`docs/coding-guideline-cn.md`）
+1. 本文档（`docs/development/code-guildline-cn.md`）
 2. 工具强制规则（`rustfmt`、`clippy`）
 3. 被修改模块的既有本地约定
 

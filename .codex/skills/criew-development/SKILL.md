@@ -1,6 +1,6 @@
 ---
 name: criew-development
-description: Repository-specific workflow and coding rules for the CRIEW codebase. Use when modifying or reviewing CRIEW Rust code, TUI behavior, sync/IMAP/reply/patch workflows, migrations, tests, docs, or config, and whenever the task must follow `docs/code-guildline.md` or `docs/code-guildline-cn.md`.
+description: Repository-specific workflow and coding rules for the CRIEW codebase. Use when modifying or reviewing CRIEW Rust code, TUI behavior, sync/IMAP/reply/patch workflows, migrations, tests, docs, or config, and whenever the task must follow `docs/development/code-guildline.md` or `docs/development/code-guildline-cn.md`.
 ---
 
 # Criew Development
@@ -14,14 +14,14 @@ Read the repository docs first, then make focused changes that preserve the curr
 
 Read the relevant repository docs before editing code.
 
-- Read `docs/code-guildline.md` first for the canonical coding rules.
-- Read `docs/code-guildline-cn.md` when the user works in Chinese or explicitly asks for the Chinese guideline.
+- Read `docs/development/code-guildline.md` first for the canonical coding rules.
+- Read `docs/development/code-guildline-cn.md` when the user works in Chinese or explicitly asks for the Chinese guideline.
 - Read `README.md` or `README-zh.md` before changing user-visible behavior, install steps, naming, or operator workflow.
-- Read `docs/design.md` before changing architecture, module boundaries, sync flow, or data-model assumptions.
-- Read `docs/reply-format-spec.md` before changing reply composition, quoting, headers, or send flow.
-- Read `docs/config.example.toml` before changing config keys, defaults, or path semantics.
+- Read `docs/architecture/design.md` before changing architecture, module boundaries, sync flow, or data-model assumptions.
+- Read `docs/specs/reply-format-spec.md` before changing reply composition, quoting, headers, or send flow.
+- Read `docs/reference/config.example.toml` before changing config keys, defaults, or path semantics.
 
-Treat `docs/code-guildline.md` as the priority source when a local convention is unclear.
+Treat `docs/development/code-guildline.md` as the priority source when a local convention is unclear.
 Then follow tool-enforced rules and the existing style in the touched module.
 
 ## Keep The CRIEW Boundaries
@@ -41,7 +41,7 @@ Do not reintroduce legacy Courier naming.
 
 ## Apply The Coding Rules Directly
 
-Implement changes in the style required by `docs/code-guildline.md`.
+Implement changes in the style required by `docs/development/code-guildline.md`.
 
 - Prefer descriptive, behavior-accurate names.
 - Encode units in names when the type system does not.
@@ -96,6 +96,6 @@ If time or environment constraints prevent a command from running, report that c
 
 Load extra repository docs only when the task needs them.
 
-- Read `docs/mvp-milestones.md` and `docs/reply-mvp-milestones.md` for historical intent or rollout sequencing.
-- Read `docs/vim-mvp-milestones.md` and `docs/code-preview-vim-prototype.md` for Vim-mode and code-preview behavior.
+- Read `docs/milestones/mvp-milestones.md` and `docs/milestones/reply-mvp-milestones.md` for historical intent or rollout sequencing.
+- Read `docs/milestones/vim-mvp-milestones.md` and `docs/specs/code-preview-vim-prototype.md` for Vim-mode and code-preview behavior.
 - Read `src/ui/tui/tests.rs` before extending TUI behavior that already has test coverage.

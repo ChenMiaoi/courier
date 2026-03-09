@@ -5,7 +5,14 @@
 1. `Patch Preview` 的 Vim 模式先完成（VM1）。
 2. SMTP 链路先打通（MVP 可直接走 `git send-email`）。
 
-详细格式规范见 `docs/reply-format-spec.md`。
+详细格式规范见 `docs/specs/reply-format-spec.md`。
+
+## 文档导航
+
+- RM0：前置依赖就绪（必须）
+- RM1：Patch Preview 一步回信（MVP，必须，已完成）
+- RM2：自实现 SMTP（增强）
+- 非目标（Reply MVP 不做）
 
 ## RM0：前置依赖就绪（必须）
 

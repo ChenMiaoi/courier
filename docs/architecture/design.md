@@ -1,5 +1,27 @@
 # CRIEW 设计文档
 
+## 文档导航
+
+1. 项目定位
+2. 目标与非目标
+3. 用户画像与关键场景
+4. 技术选型
+5. 系统架构
+6. 数据模型（逻辑）
+7. 核心流程
+8. TUI 设计（MVP）
+9. b4 集成策略
+10. 安全与可靠性
+11. MVP 里程碑文档
+12. 测试策略
+13. 开发优先级建议
+14. M1 已决策项与风险更新
+15. M2 已决策项与风险更新
+16. M3 已决策项与风险更新
+17. M6（已完成）：真实 IMAP 接入与自邮箱订阅
+18. M7（已完成）：回信编辑与预览
+19. M8（已完成）：Send Email 发送链路
+
 ## 1. 项目定位
 
 CRIEW 是一个基于 Rust 的现代 TUI 内核 patch 工作流工具，面向 Linux
@@ -280,10 +302,10 @@ MVP 阶段：
 
 MVP 范围与阶段目标已迁移至独立文档：
 
-- `docs/mvp-milestones.md`
-- `docs/vim-mvp-milestones.md`
-- `docs/reply-format-spec.md`
-- `docs/reply-mvp-milestones.md`
+- `docs/milestones/mvp-milestones.md`
+- `docs/milestones/vim-mvp-milestones.md`
+- `docs/specs/reply-format-spec.md`
+- `docs/milestones/reply-mvp-milestones.md`
 
 ## 12. 测试策略
 

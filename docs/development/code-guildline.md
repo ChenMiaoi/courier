@@ -3,7 +3,7 @@
 ## Scope And Priority
 
 Priority order for style and review decisions:
-1. This document (`docs/code-guildline.md`)
+1. This document (`docs/development/code-guildline.md`)
 2. Tool-enforced rules (`rustfmt`, `clippy`)
 3. Existing local conventions in the modified module
 

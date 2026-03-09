@@ -1,7 +1,12 @@
 # CRIEW Vim MVP 里程碑
 
 本文档定义 `Code Preview` 编辑能力的 MVP 路线：先内联 Vim-like（VM1），再切出外部 Vim（VM2）。
-详细交互原型见 `docs/code-preview-vim-prototype.md`。
+详细交互原型见 `docs/specs/code-preview-vim-prototype.md`。
+
+## 文档导航
+
+- VM1：Code Preview 内联 Vim-like 模式（必须）
+- VM2：切出外部 Vim 会话（增强）
 
 ## VM1：Code Preview 内联 Vim-like 模式（必须）
 
