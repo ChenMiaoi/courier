@@ -595,6 +595,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
                     run_palette_sync(state, value);
+                    state.dismiss_palette();
                 }
                 value if value.split_whitespace().next() == Some("config") => {
                     run_palette_config(state, value);

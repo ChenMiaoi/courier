@@ -40,7 +40,24 @@ pub(super) fn draw(
         .split(frame.area());
 
     let uptime = state.started_at.elapsed().as_secs();
-    let mut header = vec![
+    let sync_progress_text = state
+        .background_sync_progress_text()
+        .map(|value| sanitize_inline_ui_text(&value));
+    let header_sections = if let Some(progress_text) = sync_progress_text.as_ref() {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(progress_text.chars().count().min(64) as u16 + 1),
+            ])
+            .split(areas[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1)])
+            .split(areas[0])
+    };
+    let header = vec![
         Span::styled(
             " CRIEW ",
             Style::default()
@@ -81,21 +98,18 @@ pub(super) fn draw(
                 .add_modifier(Modifier::DIM),
         ),
     ];
-    if let Some(sync) = state.startup_sync_progress_text() {
-        header.push(Span::styled(
-            " | ",
-            Style::default().fg(Color::White).bg(HEADER_BG),
-        ));
-        header.push(Span::styled(
-            sanitize_inline_ui_text(&sync),
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(HEADER_BG)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
+    let header_background = Paragraph::new("").style(Style::default().bg(HEADER_BG));
+    frame.render_widget(header_background, areas[0]);
+
     let header_widget = Paragraph::new(Line::from(header)).style(Style::default().bg(HEADER_BG));
-    frame.render_widget(header_widget, areas[0]);
+    frame.render_widget(header_widget, header_sections[0]);
+
+    if let Some(progress_text) = sync_progress_text {
+        let progress = Paragraph::new(format!("{progress_text} "))
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(Color::Yellow).bg(HEADER_BG));
+        frame.render_widget(progress, header_sections[1]);
+    }
 
     match state.ui_page {
         UiPage::Mail => {
