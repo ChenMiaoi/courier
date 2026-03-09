@@ -211,6 +211,7 @@ Inside the TUI:
 
 - `:` opens the command palette
 - the header shows the active keymap scheme (`default`, `vim`, or `custom`)
+- a numeric prefix repeats vertical movement: `count+i/k` for `default`/`custom`, `count+j/k` for `vim`
 - `y` / `n` enable or disable the selected subscription
 - `Enter` opens the selected mailbox or thread and moves focus to threads or preview
 - `a` applies the current patch series

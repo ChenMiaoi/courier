@@ -231,7 +231,7 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
     },
     ConfigEditorField {
         key: "ui.keymap",
-        description: "Main-page navigation scheme. default=j/l+i/k, vim=h/l+j/k+gg/G+qq, custom=default fallback with custom label.",
+        description: "Main-page navigation scheme. default=j/l+i/k+count, vim=h/l+j/k+count+gg/G+qq, custom=default fallback with custom label.",
     },
     ConfigEditorField {
         key: "ui.inbox_auto_sync_interval_secs",
@@ -348,6 +348,14 @@ enum PendingMainPageChord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingMainPageChordState {
     chord: PendingMainPageChord,
+    ui_page: UiPage,
+    focus: Pane,
+    code_focus: CodePaneFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingMainPageCountState {
+    count: u16,
     ui_page: UiPage,
     focus: Pane,
     code_focus: CodePaneFocus,
@@ -1249,6 +1257,7 @@ struct AppState {
     manual_sync: Option<ManualSyncState>,
     subscription_auto_sync: Option<SubscriptionAutoSyncState>,
     pending_main_page_chord: Option<PendingMainPageChordState>,
+    pending_main_page_count: Option<PendingMainPageCountState>,
 }
 
 impl AppState {
@@ -1365,6 +1374,7 @@ impl AppState {
             manual_sync: None,
             subscription_auto_sync: None,
             pending_main_page_chord: None,
+            pending_main_page_count: None,
         };
         if state.runtime.imap.is_complete() {
             state.imap_defaults_initialized = true;
@@ -3807,6 +3817,53 @@ impl AppState {
             focus: self.focus,
             code_focus: self.code_focus,
         }
+    }
+
+    fn pending_main_page_count_state(&self, count: u16) -> PendingMainPageCountState {
+        PendingMainPageCountState {
+            count,
+            ui_page: self.ui_page,
+            focus: self.focus,
+            code_focus: self.code_focus,
+        }
+    }
+
+    fn clear_pending_main_page_inputs(&mut self) {
+        self.pending_main_page_chord = None;
+        self.pending_main_page_count = None;
+    }
+
+    fn clear_pending_main_page_count(&mut self) {
+        self.pending_main_page_count = None;
+    }
+
+    fn has_pending_main_page_count(&self) -> bool {
+        self.pending_main_page_count.is_some_and(|state| {
+            state.ui_page == self.ui_page
+                && state.focus == self.focus
+                && state.code_focus == self.code_focus
+        })
+    }
+
+    fn push_pending_main_page_count_digit(&mut self, digit: u16) {
+        let next_count = self
+            .pending_main_page_count
+            .filter(|state| {
+                state.ui_page == self.ui_page
+                    && state.focus == self.focus
+                    && state.code_focus == self.code_focus
+            })
+            .map(|state| state.count.saturating_mul(10).saturating_add(digit))
+            .unwrap_or(digit);
+        self.pending_main_page_count = Some(self.pending_main_page_count_state(next_count));
+    }
+
+    fn take_pending_main_page_count(&mut self) -> Option<u16> {
+        let pending_state = self.pending_main_page_count.take()?;
+        let same_scope = pending_state.ui_page == self.ui_page
+            && pending_state.focus == self.focus
+            && pending_state.code_focus == self.code_focus;
+        same_scope.then_some(pending_state.count)
     }
 
     fn close_search(&mut self) {

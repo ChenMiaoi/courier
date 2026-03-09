@@ -198,6 +198,7 @@ criew tui
 
 - `:` 打开命令栏
 - 顶部状态栏会显示当前 keymap 方案：`default`、`vim` 或 `custom`
+- 数字前缀可重复垂直移动：`default/custom` 使用 `数字 + i/k`，`vim` 使用 `数字 + j/k`
 - `y` / `n` 启用或禁用当前订阅
 - `Enter` 打开当前 mailbox 或 thread，并自动切到 threads 或 preview pane
 - `a` apply 当前 patch series

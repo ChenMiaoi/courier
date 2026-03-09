@@ -82,6 +82,16 @@ fn sample_thread_with_raw(
     }
 }
 
+fn sample_threads(count: usize) -> Vec<ThreadRow> {
+    (0..count)
+        .map(|index| {
+            let subject = format!("t{index}");
+            let message_id = format!("{index}@example.com");
+            sample_thread(&subject, &message_id, index as u16)
+        })
+        .collect()
+}
+
 fn sample_thread_in_thread(
     thread_id: i64,
     mail_id: i64,
@@ -1033,6 +1043,105 @@ fn loaded_vim_keymap_drives_navigation_keys() {
         matches!(state.focus, Pane::Subscriptions),
         "h should move focus left in vim keymap"
     );
+}
+
+#[test]
+fn default_keymap_supports_counted_ik_navigation() {
+    let mut state = AppState::new(sample_threads(15), test_runtime());
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+    );
+    let action_down = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_down, LoopAction::Continue));
+    assert_eq!(state.thread_index, 12);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+    );
+    let action_up = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_up, LoopAction::Continue));
+    assert_eq!(state.thread_index, 7);
+}
+
+#[test]
+fn vim_keymap_supports_counted_jk_navigation() {
+    let mut runtime = test_runtime();
+    runtime.ui_keymap = UiKeymap::Vim;
+    let mut state = AppState::new(sample_threads(15), runtime);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+    );
+    let action_down = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_down, LoopAction::Continue));
+    assert_eq!(state.thread_index, 12);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+    );
+    let action_up = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_up, LoopAction::Continue));
+    assert_eq!(state.thread_index, 7);
+}
+
+#[test]
+fn counted_main_page_navigation_does_not_leak_into_focus_changes() {
+    let mut state = AppState::new(sample_threads(4), test_runtime());
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+    );
+    let focus_action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    assert!(matches!(focus_action, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let move_action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    assert!(matches!(move_action, LoopAction::Continue));
+    assert_eq!(state.thread_index, 1);
 }
 
 #[test]
