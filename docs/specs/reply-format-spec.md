@@ -43,6 +43,9 @@
 `Reply Panel` 发送区最小交互：
 
 - `Send Preview`：生成并展示最终待发送邮件（头部 + 正文）
+- 若正文里没有任何“非空、非引用、非 `On ... wrote:`”的 authored reply line，仍允许打开预览，但必须显示显著警告
+- 预览中的 authored reply line 需要用明显不同于引用内容的视觉样式展示，方便最终人工检查
+- `Send Preview` 复用 `Reply Panel` 的同一块界面区域做视图切换，不额外再叠一个新的对话框
 - `Confirm Send`：用户确认无误后触发实际发送
 - `Cancel`：取消本次发送，保留当前编辑内容
 
@@ -137,7 +140,7 @@ MVP 通过 CRIEW 内部发送适配层完成发送：
 MVP 发送时序：
 
 1. 用户在 `Reply Panel` 点击或触发 `Send Preview`。
-2. 系统渲染最终邮件快照（`From/To/Cc/Subject/In-Reply-To/References/Body`）。
+2. 系统渲染最终邮件快照（`From/To/Cc/Subject/In-Reply-To/References/Body`），并在 authored reply content 为空时显示 warning。
 3. 用户执行 `Confirm Send` 后，CRIEW 调用底层发送器（MVP 为 `git send-email`）。
 4. 若发送失败，停留在 `Reply Panel` 并保留内容，允许重试。
 
@@ -182,5 +185,6 @@ git send-email \
 3. `From` 默认来自 git email 身份，允许用户修改，但必须保持有效邮箱地址。
 4. `In-Reply-To` / `References` 构造正确。
 5. 正文为 `>` 引用风格；用户回复写在不带 `>` 的空白行中，引用层级由保留的历史引用体现。
-6. 用户必须先完成 `Send Preview` 确认，才允许正式发送。
-7. MVP 路径可通过底层 `git send-email` 完成实际发送并留存结果。
+6. `Send Preview` 能明确区分 authored reply line 与引用内容；若没有 authored reply line，会显示 warning，但不阻止用户完成预览确认。
+7. 用户必须先完成 `Send Preview` 确认，才允许正式发送。
+8. MVP 路径可通过底层 `git send-email` 完成实际发送并留存结果。

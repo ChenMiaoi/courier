@@ -13,6 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier};
 
 use crate::domain::subscriptions::SubscriptionCategory;
 use crate::infra::bootstrap::BootstrapState;
@@ -111,6 +112,24 @@ fn rendered_row_text(terminal: &Terminal<TestBackend>, row: u16) -> String {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>()
+}
+
+fn rendered_cell_style_for_substring(
+    terminal: &Terminal<TestBackend>,
+    needle: &str,
+) -> Option<(Color, Color, Modifier)> {
+    let buffer = terminal.backend().buffer();
+    let width = buffer.area().width as usize;
+
+    for row in 0..buffer.area().height {
+        let row_text = rendered_row_text(terminal, row);
+        if let Some(column) = row_text.find(needle) {
+            let cell = &buffer.content()[row as usize * width + column];
+            return Some((cell.fg, cell.bg, cell.modifier));
+        }
+    }
+
+    None
 }
 
 fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
@@ -3899,7 +3918,7 @@ fn reply_send_preview_requires_confirmation_before_send() {
 }
 
 #[test]
-fn reply_send_blocked_notice_and_ready_notice_are_rendered_as_overlays() {
+fn reply_send_blocked_notice_and_ready_notice_replace_reply_panel_view() {
     let root = temp_dir("reply-notice-overlay");
     let raw = root.join("patch.eml");
     fs::write(
@@ -3938,6 +3957,8 @@ fn reply_send_blocked_notice_and_ready_notice_are_rendered_as_overlays() {
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("Send Blocked"));
     assert!(rendered.contains("You must open Send Preview"));
+    assert!(!rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(!rendered.contains("Reply Body"));
 
     let _ = handle_key_event(
         &mut state,
@@ -3954,6 +3975,8 @@ fn reply_send_blocked_notice_and_ready_notice_are_rendered_as_overlays() {
     let rendered = format!("{}", terminal.backend());
     assert!(rendered.contains("Ready To Send"));
     assert!(rendered.contains("Press S to send the reply"));
+    assert!(!rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(!rendered.contains("Reply Body"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -4071,6 +4094,142 @@ fn reply_preview_validation_blocks_confirm_on_missing_recipients() {
             .as_ref()
             .is_some_and(|panel| panel.preview_confirmed)
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_send_preview_warns_but_allows_confirm_without_authored_reply_text() {
+    let root = temp_dir("reply-preview-empty-authored");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+
+    let panel = state.reply_panel.as_ref().expect("reply panel");
+    assert!(panel.preview_open);
+    assert!(panel.preview_errors.is_empty());
+    assert!(
+        panel
+            .preview_warnings
+            .iter()
+            .any(|value| value.contains("no authored reply content"))
+    );
+    assert!(state.status.contains("send preview warning"));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw warning preview");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Send Preview [warning]"));
+    assert!(rendered.contains("draft has no authored reply content"));
+    assert!(!rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(!rendered.contains("Reply Body"));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    );
+    assert!(
+        state
+            .reply_panel
+            .as_ref()
+            .is_some_and(|panel| panel.preview_confirmed)
+    );
+    assert_eq!(state.status, "send preview confirmed; ready to send");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn reply_send_preview_highlights_authored_lines_and_keeps_quotes_bright() {
+    let root = temp_dir("reply-preview-highlighted-authored");
+    let raw = root.join("patch.eml");
+    fs::write(
+        &raw,
+        b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] demo\r\nFrom: Alice <alice@example.com>\r\nTo: Bob <bob@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nbody line\r\n",
+    )
+    .expect("write raw reply fixture");
+
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(
+        vec![sample_thread_with_raw(
+            "[PATCH] demo",
+            "patch@example.com",
+            0,
+            raw.clone(),
+        )],
+        runtime.clone(),
+    );
+    state.focus = Pane::Preview;
+    state.reply_identity_resolver = reply_identity_mock;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    );
+    if let Some(panel) = state.reply_panel.as_mut() {
+        panel.body = vec![
+            "Looks good to me.".to_string(),
+            String::new(),
+            "On Fri, 6 Mar 2026 09:30:00 +0000, Alice wrote:".to_string(),
+            "> body line".to_string(),
+        ];
+        panel.mark_dirty();
+    }
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw highlighted preview");
+    let rendered = format!("{}", terminal.backend());
+    assert!(rendered.contains("Send Preview [reply highlighted]"));
+    assert!(rendered.contains("Your authored reply lines are highlighted below."));
+    assert!(!rendered.contains("Headers (From/To/Cc/Subject editable)"));
+    assert!(!rendered.contains("Reply Body"));
+
+    let (authored_fg, authored_bg, authored_modifier) =
+        rendered_cell_style_for_substring(&terminal, "Looks good to me.")
+            .expect("authored line style");
+    assert_eq!(authored_fg, Color::Black);
+    assert_eq!(authored_bg, Color::Yellow);
+    assert!(authored_modifier.contains(Modifier::BOLD));
+
+    let (quoted_fg, quoted_bg, _) =
+        rendered_cell_style_for_substring(&terminal, "> body line").expect("quoted line style");
+    assert_eq!(quoted_fg, Color::White);
+    assert_eq!(quoted_bg, Color::Reset);
 
     let _ = fs::remove_dir_all(root);
 }

@@ -58,6 +58,7 @@ refresh your checkout or reinstall the binary and bootstrap a new CRIEW runtime 
 - kernel tree browser with source preview
 - inline Vim-like editing and external Vim editing
 - reply panel that fills `From`, `To`, `Cc`, `Subject`, `In-Reply-To`, and `References`
+- send preview warnings when the draft has no authored reply text, and authored lines stand out from quoted text
 - real reply delivery through `git send-email`
 - visual config editor, command palette completion, and structured operation logs
 

@@ -62,8 +62,8 @@ use preview::{MailPreview, load_mail_preview};
 #[cfg(test)]
 use preview::{extract_mail_body_preview, extract_mail_preview};
 use reply::{
-    PreparedReplyMessage, ReplyIdentity, ReplyPreview, ReplyPreviewRequest, ReplySeed,
-    build_reply_seed, prepare_reply_message, render_reply_preview,
+    PreparedReplyMessage, ReplyIdentity, ReplyPreview, ReplyPreviewLine, ReplyPreviewRequest,
+    ReplySeed, build_reply_seed, prepare_reply_message, render_reply_preview,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -846,7 +846,9 @@ struct ReplyPanelState {
     preview_open: bool,
     preview_scroll: u16,
     preview_rendered: String,
+    preview_lines: Vec<ReplyPreviewLine>,
     preview_errors: Vec<String>,
+    preview_warnings: Vec<String>,
     preview_confirmed: bool,
     preview_confirmed_at: Option<String>,
     reply_notice: Option<ReplyNoticeState>,
@@ -879,7 +881,9 @@ impl ReplyPanelState {
             preview_open: false,
             preview_scroll: 0,
             preview_rendered: String::new(),
+            preview_lines: Vec::new(),
             preview_errors: Vec::new(),
+            preview_warnings: Vec::new(),
             preview_confirmed: false,
             preview_confirmed_at: None,
             reply_notice: None,
@@ -3154,7 +3158,12 @@ impl AppState {
         };
         panel.reply_notice = None;
 
-        let ReplyPreview { content, errors } = render_reply_preview(ReplyPreviewRequest {
+        let ReplyPreview {
+            content,
+            lines,
+            errors,
+            warnings,
+        } = render_reply_preview(ReplyPreviewRequest {
             from: &panel.from,
             to: &panel.to,
             cc: &panel.cc,
@@ -3165,14 +3174,21 @@ impl AppState {
             self_addresses: &panel.self_addresses,
         });
         panel.preview_rendered = content;
+        panel.preview_lines = lines;
         panel.preview_errors = errors;
+        panel.preview_warnings = warnings;
         panel.preview_open = true;
         panel.preview_scroll = 0;
 
-        if panel.preview_errors.is_empty() {
-            self.status = "send preview ready; press Enter/c to confirm".to_string();
-        } else {
+        if !panel.preview_errors.is_empty() {
             self.status = format!("send preview blocked: {}", panel.preview_errors.join("; "));
+        } else if !panel.preview_warnings.is_empty() {
+            self.status = format!(
+                "send preview warning: {}; press Enter/c to confirm anyway",
+                panel.preview_warnings.join("; ")
+            );
+        } else {
+            self.status = "send preview ready; press Enter/c to confirm".to_string();
         }
     }
 

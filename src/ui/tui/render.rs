@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use super::config::draw_config_editor;
 use super::palette::palette_overlay_suggestions;
+use super::reply::ReplyPreviewLineKind;
 use super::*;
 
 const REPLY_BODY_GUIDE_COLUMN: usize = 80;
@@ -748,8 +749,16 @@ fn draw_reply_panel(frame: &mut Frame<'_>, state: &AppState) {
     };
 
     let area = centered_rect(88, 84, frame.area());
-    frame.render_widget(Clear, area);
+    if panel.preview_open {
+        draw_send_preview_panel(frame, area, panel);
+        return;
+    }
+    if panel.reply_notice.is_some() {
+        draw_reply_notice_panel(frame, area, panel);
+        return;
+    }
 
+    frame.render_widget(Clear, area);
     let title = format!(
         "Reply Panel [{} dirty:{} confirmed:{} focus:{}]",
         panel.mode.label(),
@@ -827,12 +836,6 @@ fn draw_reply_panel(frame: &mut Frame<'_>, state: &AppState) {
 
     if let Some(cursor) = reply_panel_cursor_position(panel, header_inner, body_content_area) {
         frame.set_cursor_position(cursor);
-    }
-
-    if panel.preview_open {
-        draw_send_preview_overlay(frame, panel);
-    } else if panel.reply_notice.is_some() {
-        draw_reply_notice_overlay(frame, panel);
     }
 }
 
@@ -1044,14 +1047,17 @@ fn reply_body_cursor_position(
     ))
 }
 
-fn draw_send_preview_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
-    let area = centered_rect(82, 78, frame.area());
+fn draw_send_preview_panel(frame: &mut Frame<'_>, area: Rect, panel: &ReplyPanelState) {
     frame.render_widget(Clear, area);
 
-    let title = if panel.preview_errors.is_empty() {
-        "Send Preview"
-    } else {
+    let title = if !panel.preview_errors.is_empty() {
         "Send Preview [invalid]"
+    } else if !panel.preview_warnings.is_empty() {
+        "Send Preview [warning]"
+    } else if has_authored_reply_lines(panel) {
+        "Send Preview [reply highlighted]"
+    } else {
+        "Send Preview"
     };
     let block = Block::default()
         .title(title)
@@ -1060,47 +1066,164 @@ fn draw_send_preview_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let content_area = if panel.preview_errors.is_empty() {
-        inner
-    } else {
-        let error_text = panel
-            .preview_errors
-            .iter()
-            .map(|value| format!("- {value}"))
-            .collect::<Vec<String>>()
-            .join("\n");
-        let error_height = error_text
-            .lines()
-            .count()
-            .min(inner.height.saturating_sub(1) as usize) as u16;
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(error_height), Constraint::Min(1)])
-            .split(inner);
-        let warning = Paragraph::new(error_text)
-            .style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(warning, sections[0]);
-        sections[1]
-    };
-
-    let preview = Paragraph::new(panel.preview_rendered.clone())
+    let content_area = draw_send_preview_messages(frame, inner, panel);
+    let preview = Paragraph::new(render_reply_preview_text(panel))
         .scroll((panel.preview_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(preview, content_area);
 }
 
-fn draw_reply_notice_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
+fn draw_send_preview_messages(frame: &mut Frame<'_>, area: Rect, panel: &ReplyPanelState) -> Rect {
+    let mut remaining_height = area.height.saturating_sub(1);
+    let error_height = preview_message_height(&panel.preview_errors, remaining_height);
+    remaining_height = remaining_height.saturating_sub(error_height);
+    let warning_height = preview_message_height(&panel.preview_warnings, remaining_height);
+    remaining_height = remaining_height.saturating_sub(warning_height);
+    let info_messages = preview_info_messages(panel);
+    let info_height = preview_message_height(&info_messages, remaining_height);
+
+    if error_height == 0 && warning_height == 0 && info_height == 0 {
+        return area;
+    }
+
+    let mut constraints = Vec::new();
+    if error_height > 0 {
+        constraints.push(Constraint::Length(error_height));
+    }
+    if warning_height > 0 {
+        constraints.push(Constraint::Length(warning_height));
+    }
+    if info_height > 0 {
+        constraints.push(Constraint::Length(info_height));
+    }
+    constraints.push(Constraint::Min(1));
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let mut section_index = 0usize;
+    if error_height > 0 {
+        draw_send_preview_message_block(
+            frame,
+            sections[section_index],
+            &panel.preview_errors,
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        );
+        section_index += 1;
+    }
+    if warning_height > 0 {
+        draw_send_preview_message_block(
+            frame,
+            sections[section_index],
+            &panel.preview_warnings,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        section_index += 1;
+    }
+    if info_height > 0 {
+        draw_send_preview_message_block(
+            frame,
+            sections[section_index],
+            &info_messages,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        section_index += 1;
+    }
+
+    sections[section_index]
+}
+
+fn preview_message_height(messages: &[String], remaining_height: u16) -> u16 {
+    if messages.is_empty() || remaining_height == 0 {
+        return 0;
+    }
+
+    let line_count = messages
+        .iter()
+        .map(|message| message.lines().count().max(1))
+        .sum::<usize>();
+    line_count.min(remaining_height as usize) as u16
+}
+
+fn draw_send_preview_message_block(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    messages: &[String],
+    style: Style,
+) {
+    let text = messages
+        .iter()
+        .map(|value| format!("- {value}"))
+        .collect::<Vec<String>>()
+        .join("\n");
+    let paragraph = Paragraph::new(text).style(style).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_reply_preview_text(panel: &ReplyPanelState) -> Text<'static> {
+    Text::from(
+        panel
+            .preview_lines
+            .iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.text.clone(),
+                    reply_preview_line_style(line.kind),
+                ))
+            })
+            .collect::<Vec<Line<'static>>>(),
+    )
+}
+
+fn preview_info_messages(panel: &ReplyPanelState) -> Vec<String> {
+    if has_authored_reply_lines(panel) {
+        vec!["Your authored reply lines are highlighted below.".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn has_authored_reply_lines(panel: &ReplyPanelState) -> bool {
+    panel
+        .preview_lines
+        .iter()
+        .any(|line| matches!(line.kind, ReplyPreviewLineKind::Authored))
+}
+
+fn reply_preview_line_style(kind: ReplyPreviewLineKind) -> Style {
+    match kind {
+        ReplyPreviewLineKind::Header => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        ReplyPreviewLineKind::Blank => Style::default(),
+        ReplyPreviewLineKind::Authored => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ReplyPreviewLineKind::QuoteAttribution => Style::default().fg(Color::Cyan),
+        ReplyPreviewLineKind::Quoted => Style::default().fg(Color::White),
+        ReplyPreviewLineKind::Placeholder => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    }
+}
+
+fn draw_reply_notice_panel(frame: &mut Frame<'_>, area: Rect, panel: &ReplyPanelState) {
     let Some(notice) = panel.reply_notice.as_ref() else {
         return;
     };
 
-    let area = centered_rect(62, 34, frame.area());
     frame.render_widget(Clear, area);
 
     let border = match notice.kind {
@@ -1115,6 +1238,14 @@ fn draw_reply_notice_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
     frame.render_widget(block, area);
     frame.render_widget(Clear, inner);
 
+    let content_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(35),
+            Constraint::Min(3),
+            Constraint::Percentage(35),
+        ])
+        .split(inner);
     let text = format!("{}\n\n{}", notice.message, notice.hint);
     let paragraph = Paragraph::new(Text::from(text))
         .alignment(Alignment::Center)
@@ -1124,7 +1255,7 @@ fn draw_reply_notice_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
                 .add_modifier(Modifier::BOLD),
         )
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(paragraph, content_sections[1]);
 }
 
 fn code_edit_source_line_logical_row(buffer_row: usize) -> usize {

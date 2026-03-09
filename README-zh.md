@@ -29,6 +29,7 @@ English README: [README.md](README.md)
 - 浏览 thread，识别 `[PATCH vN M/N]` patch series
 - 通过 `b4` apply 或导出 patch
 - 在 TUI 中撰写回信，并通过 `git send-email` 发送
+- `Send Preview` 会在草稿没有实际回复内容时给出警告，并高亮用户自己写的回复正文
 - 浏览本地 kernel tree，支持内联 Vim-like 编辑和外部 Vim 编辑
 
 ### 发布基线
@@ -234,6 +235,7 @@ CRIEW 的 Reply Panel 会自动填充：
 - `References`
 
 同时会生成符合 kernel 邮件习惯的引用正文模板。发送时，底层走 `git send-email`。
+`Send Preview` 会把用户自己写的未引用正文高亮出来；如果预览里只有引用内容和生成的回复骨架，也会明确给出警告。
 
 ## 延伸阅读
 
