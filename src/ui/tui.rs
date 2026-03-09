@@ -335,8 +335,6 @@ struct ExternalEditorProcessResult {
 type ExternalEditorRunner =
     fn(&str, &Path) -> std::result::Result<ExternalEditorProcessResult, String>;
 type ReplyIdentityResolver = fn() -> std::result::Result<ReplyIdentity, String>;
-type SyncRequestExecutor =
-    fn(&RuntimeConfig, sync_worker::SyncRequest) -> Result<sync_worker::SyncSummary>;
 type ReplySendExecutor = fn(&RuntimeConfig, &SendRequest) -> SendOutcome;
 type MailboxSyncSpawner = fn(RuntimeConfig, Vec<String>) -> Receiver<StartupSyncEvent>;
 
@@ -476,6 +474,103 @@ impl InboxAutoSyncState {
 
     fn in_flight(&self) -> bool {
         self.receiver.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManualSyncOrigin {
+    PaletteCommand,
+    SubscriptionOpen,
+}
+
+impl ManualSyncOrigin {
+    fn log_label(self) -> &'static str {
+        match self {
+            Self::PaletteCommand => "palette",
+            Self::SubscriptionOpen => "subscription_open",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualSyncRequestOutcome {
+    Started,
+    AlreadySyncing,
+    Busy,
+}
+
+#[derive(Debug)]
+struct ManualSyncState {
+    receiver: Receiver<StartupSyncEvent>,
+    mailbox_order: Vec<String>,
+    mailboxes: HashMap<String, StartupSyncMailboxStatus>,
+    total: usize,
+    completed: usize,
+    succeeded: usize,
+    failed: usize,
+    total_fetched: usize,
+    total_inserted: usize,
+    total_updated: usize,
+    first_error: Option<String>,
+}
+
+impl ManualSyncState {
+    fn pending_count(&self) -> usize {
+        self.mailbox_order
+            .iter()
+            .filter(|mailbox| {
+                matches!(
+                    self.mailboxes.get(mailbox.as_str()),
+                    Some(StartupSyncMailboxStatus::Pending)
+                )
+            })
+            .count()
+    }
+
+    fn inflight_mailboxes_display(&self) -> String {
+        let running: Vec<&str> = self
+            .mailbox_order
+            .iter()
+            .filter_map(|mailbox| {
+                matches!(
+                    self.mailboxes.get(mailbox.as_str()),
+                    Some(StartupSyncMailboxStatus::InFlight)
+                )
+                .then_some(mailbox.as_str())
+            })
+            .collect();
+        if running.is_empty() {
+            "-".to_string()
+        } else {
+            running.join(",")
+        }
+    }
+
+    fn progress_summary(&self) -> String {
+        format!(
+            "{}/{} ok={} fail={} queued={} running={}",
+            self.completed,
+            self.total,
+            self.succeeded,
+            self.failed,
+            self.pending_count(),
+            self.inflight_mailboxes_display()
+        )
+    }
+
+    fn mailbox_states_display(&self) -> String {
+        self.mailbox_order
+            .iter()
+            .map(|mailbox| {
+                let status = self
+                    .mailboxes
+                    .get(mailbox.as_str())
+                    .copied()
+                    .unwrap_or(StartupSyncMailboxStatus::Pending);
+                format!("{mailbox}:{}", status.log_label())
+            })
+            .collect::<Vec<String>>()
+            .join(" ")
     }
 }
 
@@ -1128,12 +1223,13 @@ struct AppState {
     config_editor: ConfigEditorState,
     external_editor_runner: ExternalEditorRunner,
     reply_identity_resolver: ReplyIdentityResolver,
-    sync_request_executor: SyncRequestExecutor,
     reply_send_executor: ReplySendExecutor,
     mailbox_sync_spawner: MailboxSyncSpawner,
+    manual_sync_spawner: MailboxSyncSpawner,
     needs_terminal_refresh: bool,
     startup_sync: Option<StartupSyncState>,
     inbox_auto_sync: Option<InboxAutoSyncState>,
+    manual_sync: Option<ManualSyncState>,
     subscription_auto_sync: Option<SubscriptionAutoSyncState>,
 }
 
@@ -1240,12 +1336,13 @@ impl AppState {
             config_editor: ConfigEditorState::default(),
             external_editor_runner: run_external_editor_session,
             reply_identity_resolver: resolve_git_reply_identity,
-            sync_request_executor: run_sync_request_guarded,
             reply_send_executor: send_reply_message,
             mailbox_sync_spawner: spawn_startup_sync_worker,
+            manual_sync_spawner: spawn_startup_sync_worker,
             needs_terminal_refresh: false,
             startup_sync: None,
             inbox_auto_sync: None,
+            manual_sync: None,
             subscription_auto_sync: None,
         };
         if state.runtime.imap.is_complete() {
@@ -1429,6 +1526,16 @@ impl AppState {
         })
     }
 
+    fn manual_sync_mailbox_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
+        self.manual_sync.as_ref().and_then(|state| {
+            state
+                .mailboxes
+                .iter()
+                .find(|(name, _)| same_mailbox_name(name, mailbox))
+                .map(|(_, status)| *status)
+        })
+    }
+
     fn inbox_auto_sync_mailbox_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
         mailbox
             .eq_ignore_ascii_case(IMAP_INBOX_MAILBOX)
@@ -1453,6 +1560,7 @@ impl AppState {
 
     fn mailbox_sync_status(&self, mailbox: &str) -> Option<StartupSyncMailboxStatus> {
         self.startup_sync_mailbox_status(mailbox)
+            .or_else(|| self.manual_sync_mailbox_status(mailbox))
             .or_else(|| self.inbox_auto_sync_mailbox_status(mailbox))
             .or_else(|| self.subscription_auto_sync_mailbox_status(mailbox))
     }
@@ -1464,8 +1572,16 @@ impl AppState {
         )
     }
 
+    fn manual_sync_mailbox_pending(&self, mailbox: &str) -> bool {
+        matches!(
+            self.manual_sync_mailbox_status(mailbox),
+            Some(StartupSyncMailboxStatus::Pending | StartupSyncMailboxStatus::InFlight)
+        )
+    }
+
     fn mailbox_sync_pending(&self, mailbox: &str) -> bool {
         self.startup_sync_mailbox_pending(mailbox)
+            || self.manual_sync_mailbox_pending(mailbox)
             || matches!(
                 self.inbox_auto_sync_mailbox_status(mailbox),
                 Some(StartupSyncMailboxStatus::InFlight)
@@ -1476,29 +1592,93 @@ impl AppState {
             )
     }
 
-    fn startup_sync_progress_text(&self) -> Option<String> {
-        self.startup_sync
+    fn background_sync_progress_text(&self) -> Option<String> {
+        self.manual_sync
             .as_ref()
             .map(|state| {
-                let running = state.inflight_mailboxes_display();
-                if running == "-" {
-                    format!("sync {}/{}", state.completed, state.total)
-                } else {
-                    format!("sync {} {}/{}", running, state.completed, state.total)
-                }
+                format!(
+                    "sync {} {}/{} {}",
+                    self.render_progress_bar(state.completed, state.total),
+                    state.completed,
+                    state.total,
+                    state.inflight_mailboxes_display()
+                )
+            })
+            .or_else(|| {
+                self.startup_sync.as_ref().map(|state| {
+                    format!(
+                        "sync {} {}/{} {}",
+                        self.render_progress_bar(state.completed, state.total),
+                        state.completed,
+                        state.total,
+                        state.inflight_mailboxes_display()
+                    )
+                })
             })
             .or_else(|| {
                 self.inbox_auto_sync
                     .as_ref()
                     .filter(|state| state.in_flight())
-                    .map(|_| "sync INBOX".to_string())
+                    .map(|_| {
+                        format!(
+                            "sync {} auto {}",
+                            self.render_indeterminate_progress_bar(),
+                            IMAP_INBOX_MAILBOX
+                        )
+                    })
             })
             .or_else(|| {
                 self.subscription_auto_sync
                     .as_ref()
                     .filter(|state| state.in_flight())
-                    .map(|state| format!("sync {}", state.inflight_mailboxes_display()))
+                    .map(|state| {
+                        format!(
+                            "sync {} auto {}",
+                            self.render_indeterminate_progress_bar(),
+                            state.inflight_mailboxes_display()
+                        )
+                    })
             })
+    }
+
+    fn render_progress_bar(&self, completed: usize, total: usize) -> String {
+        const PROGRESS_BAR_WIDTH: usize = 12;
+
+        let mut cells = vec!['.'; PROGRESS_BAR_WIDTH];
+        if total == 0 {
+            return format!("[{}]", cells.into_iter().collect::<String>());
+        }
+
+        let filled = completed.saturating_mul(PROGRESS_BAR_WIDTH) / total;
+        for cell in cells.iter_mut().take(filled.min(PROGRESS_BAR_WIDTH)) {
+            *cell = '=';
+        }
+        if completed < total {
+            let pulse_width = PROGRESS_BAR_WIDTH.saturating_sub(filled).max(1);
+            let pulse_offset = self.sync_animation_tick() % pulse_width;
+            let pulse_index = (filled + pulse_offset).min(PROGRESS_BAR_WIDTH - 1);
+            cells[pulse_index] = '>';
+        }
+
+        format!("[{}]", cells.into_iter().collect::<String>())
+    }
+
+    fn render_indeterminate_progress_bar(&self) -> String {
+        const PROGRESS_BAR_WIDTH: usize = 12;
+        const RUNNER_WIDTH: usize = 3;
+
+        let mut cells = vec!['.'; PROGRESS_BAR_WIDTH];
+        let start = self.sync_animation_tick() % PROGRESS_BAR_WIDTH;
+        for step in 0..RUNNER_WIDTH {
+            let index = (start + step) % PROGRESS_BAR_WIDTH;
+            cells[index] = '>';
+        }
+
+        format!("[{}]", cells.into_iter().collect::<String>())
+    }
+
+    fn sync_animation_tick(&self) -> usize {
+        (self.started_at.elapsed().as_millis() / 200) as usize
     }
 
     fn refresh_series_summaries(&mut self) {
@@ -1581,39 +1761,160 @@ impl AppState {
         }
     }
 
-    fn defer_inbox_auto_sync_for_mailbox(&mut self, mailbox: &str) {
-        if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
-            self.defer_inbox_auto_sync();
-        }
-    }
-
     fn defer_subscription_auto_sync(&mut self) {
         if let Some(state) = self.subscription_auto_sync.as_mut() {
             state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
         }
     }
 
-    fn defer_subscription_auto_sync_for_mailbox(&mut self, mailbox: &str) {
-        if !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+    fn start_manual_sync(
+        &mut self,
+        requested_mailboxes: Vec<String>,
+        origin: ManualSyncOrigin,
+    ) -> ManualSyncRequestOutcome {
+        let requested_mailboxes = dedup_mailboxes(requested_mailboxes);
+        if requested_mailboxes.is_empty() {
+            self.status = "sync skipped: no mailbox selected".to_string();
+            tracing::info!(
+                op = "manual_sync",
+                status = "skipped",
+                reason = "no_mailboxes",
+                origin = origin.log_label()
+            );
+            return ManualSyncRequestOutcome::Busy;
+        }
+
+        if let Some(sync_state) = self.manual_sync.as_ref() {
+            let all_tracked = requested_mailboxes.iter().all(|mailbox| {
+                sync_state
+                    .mailboxes
+                    .keys()
+                    .any(|tracked| same_mailbox_name(tracked, mailbox))
+            });
+            self.status = if all_tracked {
+                format!(
+                    "sync already running in background: {}",
+                    requested_mailboxes.join(", ")
+                )
+            } else {
+                format!("background sync busy: {}", sync_state.progress_summary())
+            };
+            tracing::info!(
+                op = "manual_sync",
+                status = "skipped",
+                reason = if all_tracked {
+                    "mailboxes_already_syncing"
+                } else {
+                    "manual_sync_busy"
+                },
+                origin = origin.log_label(),
+                requested_mailboxes = %requested_mailboxes.join(",")
+            );
+            return if all_tracked {
+                ManualSyncRequestOutcome::AlreadySyncing
+            } else {
+                ManualSyncRequestOutcome::Busy
+            };
+        }
+
+        let mut skipped_mailboxes = Vec::new();
+        let mut queued_mailboxes = Vec::new();
+        for mailbox in requested_mailboxes {
+            if self.mailbox_sync_pending(&mailbox) {
+                skipped_mailboxes.push(mailbox);
+            } else {
+                queued_mailboxes.push(mailbox);
+            }
+        }
+
+        if queued_mailboxes.is_empty() {
+            self.status = format!(
+                "sync already running in background: {}",
+                skipped_mailboxes.join(", ")
+            );
+            tracing::info!(
+                op = "manual_sync",
+                status = "skipped",
+                reason = "mailboxes_already_syncing",
+                origin = origin.log_label(),
+                requested_mailboxes = %skipped_mailboxes.join(",")
+            );
+            return ManualSyncRequestOutcome::AlreadySyncing;
+        }
+
+        if queued_mailboxes
+            .iter()
+            .any(|mailbox| mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+        {
+            self.defer_inbox_auto_sync();
+        }
+        if queued_mailboxes
+            .iter()
+            .any(|mailbox| !mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX))
+        {
             self.defer_subscription_auto_sync();
         }
+
+        let receiver = (self.manual_sync_spawner)(self.runtime.clone(), queued_mailboxes.clone());
+        self.manual_sync = Some(ManualSyncState {
+            receiver,
+            mailbox_order: queued_mailboxes.clone(),
+            mailboxes: queued_mailboxes
+                .iter()
+                .cloned()
+                .map(|mailbox| (mailbox, StartupSyncMailboxStatus::Pending))
+                .collect(),
+            total: queued_mailboxes.len(),
+            completed: 0,
+            succeeded: 0,
+            failed: 0,
+            total_fetched: 0,
+            total_inserted: 0,
+            total_updated: 0,
+            first_error: None,
+        });
+
+        self.status = if skipped_mailboxes.is_empty() {
+            format!("sync queued in background: {}", queued_mailboxes.join(", "))
+        } else {
+            format!(
+                "sync queued in background: {}; skipped already-running: {}",
+                queued_mailboxes.join(", "),
+                skipped_mailboxes.join(", ")
+            )
+        };
+        if let Some(sync_state) = self.manual_sync.as_ref() {
+            tracing::info!(
+                op = "manual_sync",
+                status = "started",
+                origin = origin.log_label(),
+                total = sync_state.total,
+                completed = sync_state.completed,
+                succeeded = sync_state.succeeded,
+                failed = sync_state.failed,
+                queued = sync_state.pending_count(),
+                running = %sync_state.inflight_mailboxes_display(),
+                mailbox_states = %sync_state.mailbox_states_display(),
+                requested_mailboxes = %sync_state.mailbox_order.join(",")
+            );
+        }
+
+        ManualSyncRequestOutcome::Started
     }
 
-    fn run_sync_request(
-        &self,
-        request: sync_worker::SyncRequest,
-    ) -> Result<sync_worker::SyncSummary> {
-        (self.sync_request_executor)(&self.runtime, request)
+    fn queue_palette_sync(&mut self, requested_mailboxes: Vec<String>) {
+        let _ = self.start_manual_sync(requested_mailboxes, ManualSyncOrigin::PaletteCommand);
     }
 
     fn maybe_start_inbox_auto_sync(&mut self) {
         self.reconcile_inbox_auto_sync();
-        let startup_pending = self.startup_sync_mailbox_pending(IMAP_INBOX_MAILBOX);
+        let inbox_sync_pending = self.startup_sync_mailbox_pending(IMAP_INBOX_MAILBOX)
+            || self.manual_sync_mailbox_pending(IMAP_INBOX_MAILBOX);
         let now = Instant::now();
         let Some(state) = self.inbox_auto_sync.as_mut() else {
             return;
         };
-        if state.in_flight() || startup_pending || now < state.next_due_at {
+        if state.in_flight() || inbox_sync_pending || now < state.next_due_at {
             return;
         }
 
@@ -1631,14 +1932,18 @@ impl AppState {
     fn maybe_start_subscription_auto_sync(&mut self) {
         self.reconcile_subscription_auto_sync();
         let mailboxes = self.enabled_background_sync_mailboxes();
-        let startup_pending = mailboxes
-            .iter()
-            .any(|mailbox| self.startup_sync_mailbox_pending(mailbox));
+        let background_pending = mailboxes.iter().any(|mailbox| {
+            self.startup_sync_mailbox_pending(mailbox) || self.manual_sync_mailbox_pending(mailbox)
+        });
         let now = Instant::now();
         let Some(state) = self.subscription_auto_sync.as_mut() else {
             return;
         };
-        if mailboxes.is_empty() || state.in_flight() || startup_pending || now < state.next_due_at {
+        if mailboxes.is_empty()
+            || state.in_flight()
+            || background_pending
+            || now < state.next_due_at
+        {
             return;
         }
 
@@ -1688,6 +1993,51 @@ impl AppState {
         }
     }
 
+    fn pump_manual_sync_events(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        {
+            let Some(sync_state) = self.manual_sync.as_ref() else {
+                return;
+            };
+            loop {
+                match sync_state.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        for event in events {
+            self.apply_manual_sync_event(event);
+        }
+
+        if disconnected && self.manual_sync.is_some() {
+            let (completed, total, succeeded, failed) = self
+                .manual_sync
+                .as_ref()
+                .map(|state| (state.completed, state.total, state.succeeded, state.failed))
+                .unwrap_or((0, 0, 0, 0));
+            self.manual_sync = None;
+            self.status = format!(
+                "background sync worker disconnected (completed={completed}/{total} ok={succeeded} failed={failed})"
+            );
+            tracing::warn!(
+                op = "manual_sync",
+                status = "failed",
+                completed,
+                total,
+                succeeded,
+                failed,
+                "manual sync worker disconnected unexpectedly"
+            );
+        }
+    }
+
     fn pump_subscription_auto_sync_events(&mut self) {
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -1727,6 +2077,121 @@ impl AppState {
         }
     }
 
+    fn apply_manual_sync_event(&mut self, event: StartupSyncEvent) {
+        match event {
+            StartupSyncEvent::MailboxStarted {
+                mailbox,
+                index,
+                total,
+            } => {
+                if let Some(sync_state) = self.manual_sync.as_mut() {
+                    sync_state
+                        .mailboxes
+                        .insert(mailbox.clone(), StartupSyncMailboxStatus::InFlight);
+                }
+                self.status = format!("sync [{index}/{total}] syncing {mailbox} in background...");
+                if let Some(sync_state) = self.manual_sync.as_ref() {
+                    tracing::info!(
+                        op = "manual_sync",
+                        status = "progress",
+                        phase = "started",
+                        mailbox = %mailbox,
+                        index,
+                        total,
+                        completed = sync_state.completed,
+                        succeeded = sync_state.succeeded,
+                        failed = sync_state.failed,
+                        queued = sync_state.pending_count(),
+                        running = %sync_state.inflight_mailboxes_display(),
+                        mailbox_states = %sync_state.mailbox_states_display()
+                    );
+                }
+            }
+            StartupSyncEvent::MailboxFinished {
+                mailbox,
+                fetched,
+                inserted,
+                updated,
+            } => {
+                if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                    self.defer_inbox_auto_sync();
+                } else {
+                    self.defer_subscription_auto_sync();
+                }
+                if let Some(sync_state) = self.manual_sync.as_mut() {
+                    sync_state
+                        .mailboxes
+                        .insert(mailbox.clone(), StartupSyncMailboxStatus::Finished);
+                    sync_state.completed += 1;
+                    sync_state.succeeded += 1;
+                    sync_state.total_fetched += fetched;
+                    sync_state.total_inserted += inserted;
+                    sync_state.total_updated += updated;
+                }
+
+                if let Some(sync_state) = self.manual_sync.as_ref() {
+                    self.status = format!(
+                        "sync [{}/{}] finished {}",
+                        sync_state.completed, sync_state.total, mailbox
+                    );
+                    tracing::info!(
+                        op = "manual_sync",
+                        status = "succeeded",
+                        phase = "finished",
+                        mailbox = %mailbox,
+                        fetched,
+                        inserted,
+                        updated,
+                        completed = sync_state.completed,
+                        total = sync_state.total,
+                        succeeded = sync_state.succeeded,
+                        failed = sync_state.failed,
+                        queued = sync_state.pending_count(),
+                        running = %sync_state.inflight_mailboxes_display(),
+                        mailbox_states = %sync_state.mailbox_states_display()
+                    );
+                }
+            }
+            StartupSyncEvent::MailboxFailed { mailbox, error } => {
+                if mailbox.eq_ignore_ascii_case(IMAP_INBOX_MAILBOX) {
+                    self.defer_inbox_auto_sync();
+                } else {
+                    self.defer_subscription_auto_sync();
+                }
+                if let Some(sync_state) = self.manual_sync.as_mut() {
+                    sync_state
+                        .mailboxes
+                        .insert(mailbox.clone(), StartupSyncMailboxStatus::Failed);
+                    sync_state.completed += 1;
+                    sync_state.failed += 1;
+                    if sync_state.first_error.is_none() {
+                        sync_state.first_error = Some(format!("{mailbox}: {error}"));
+                    }
+                }
+                self.status = format!("sync failed for {mailbox}: {error}");
+                if let Some(sync_state) = self.manual_sync.as_ref() {
+                    tracing::error!(
+                        op = "manual_sync",
+                        status = "failed",
+                        phase = "finished",
+                        mailbox = %mailbox,
+                        error = %error,
+                        completed = sync_state.completed,
+                        total = sync_state.total,
+                        succeeded = sync_state.succeeded,
+                        failed = sync_state.failed,
+                        queued = sync_state.pending_count(),
+                        running = %sync_state.inflight_mailboxes_display(),
+                        mailbox_states = %sync_state.mailbox_states_display()
+                    );
+                }
+            }
+            StartupSyncEvent::WorkerCompleted => {}
+        }
+
+        self.maybe_finish_manual_sync();
+    }
+
     fn apply_inbox_auto_sync_event(&mut self, event: StartupSyncEvent) {
         match event {
             StartupSyncEvent::MailboxStarted { mailbox, .. } => {
@@ -1747,7 +2212,17 @@ impl AppState {
                     state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
                 }
                 if same_mailbox_name(&mailbox, &self.active_thread_mailbox) {
-                    self.reload_mailbox_threads_preserving_selection(&mailbox);
+                    if let Err(error) = self.reload_mailbox_threads_preserving_selection(&mailbox) {
+                        tracing::error!(
+                            op = "inbox_auto_sync",
+                            status = "failed",
+                            mailbox = %mailbox,
+                            error = %error
+                        );
+                        self.status = format!(
+                            "background sync ok but failed to reload threads for {mailbox}: {error}"
+                        );
+                    }
                 }
                 if inserted > 0 || updated > 0 {
                     self.status = format!(
@@ -1805,7 +2280,17 @@ impl AppState {
                         .retain(|in_flight| !same_mailbox_name(in_flight, &mailbox));
                 }
                 if same_mailbox_name(&mailbox, &self.active_thread_mailbox) {
-                    self.reload_mailbox_threads_preserving_selection(&mailbox);
+                    if let Err(error) = self.reload_mailbox_threads_preserving_selection(&mailbox) {
+                        tracing::error!(
+                            op = "subscription_auto_sync",
+                            status = "failed",
+                            mailbox = %mailbox,
+                            error = %error
+                        );
+                        self.status = format!(
+                            "background sync ok but failed to reload threads for {mailbox}: {error}"
+                        );
+                    }
                 }
                 if inserted > 0 || updated > 0 {
                     self.status = format!(
@@ -2090,13 +2575,82 @@ impl AppState {
         );
     }
 
+    fn maybe_finish_manual_sync(&mut self) {
+        let Some(sync_state) = self.manual_sync.as_ref() else {
+            return;
+        };
+        if sync_state.completed < sync_state.total {
+            return;
+        }
+
+        let succeeded = sync_state.succeeded;
+        let failed = sync_state.failed;
+        let total = sync_state.total;
+        let total_fetched = sync_state.total_fetched;
+        let total_inserted = sync_state.total_inserted;
+        let total_updated = sync_state.total_updated;
+        let first_error = sync_state.first_error.clone();
+        let first_error_text = first_error
+            .clone()
+            .unwrap_or_else(|| "worker reported no success".to_string());
+        let mailbox_states = sync_state.mailbox_states_display();
+        let active_mailbox = self.active_thread_mailbox.clone();
+        let should_reload_active_mailbox = sync_state.mailboxes.iter().any(|(mailbox, status)| {
+            same_mailbox_name(mailbox, &active_mailbox)
+                && *status == StartupSyncMailboxStatus::Finished
+        });
+
+        self.manual_sync = None;
+
+        if should_reload_active_mailbox
+            && let Err(error) = self.reload_mailbox_threads_preserving_selection(&active_mailbox)
+        {
+            tracing::error!(
+                op = "manual_sync",
+                status = "failed",
+                mailbox = %active_mailbox,
+                error = %error
+            );
+            self.status =
+                format!("sync ok but failed to reload threads for {active_mailbox}: {error}");
+            return;
+        }
+
+        self.status = if failed == 0 {
+            format!(
+                "sync finished: ok={succeeded} total={total} fetched={total_fetched} inserted={total_inserted} updated={total_updated}"
+            )
+        } else if succeeded == 0 {
+            format!("sync failed: {first_error_text}")
+        } else {
+            format!(
+                "sync finished with failures: ok={succeeded} failed={failed} fetched={total_fetched} inserted={total_inserted} updated={total_updated}"
+            )
+        };
+        tracing::info!(
+            op = "manual_sync",
+            status = if failed == 0 {
+                "succeeded"
+            } else if succeeded == 0 {
+                "failed"
+            } else {
+                "partial"
+            },
+            succeeded,
+            failed,
+            total,
+            total_fetched,
+            total_inserted,
+            total_updated,
+            first_error = %first_error.as_deref().unwrap_or("-"),
+            mailbox_states = %mailbox_states
+        );
+    }
+
     fn reload_active_mailbox_threads_after_sync(&mut self) {
-        match mail_store::load_thread_rows_by_mailbox(
-            &self.runtime.database_path,
-            &self.active_thread_mailbox,
-            500,
-        ) {
-            Ok(rows) => self.replace_threads(rows),
+        let mailbox = self.active_thread_mailbox.clone();
+        match self.reload_mailbox_threads_preserving_selection(&mailbox) {
+            Ok(()) => {}
             Err(error) => {
                 tracing::error!(
                     op = "startup_sync",
@@ -2112,26 +2666,14 @@ impl AppState {
         }
     }
 
-    fn reload_mailbox_threads_preserving_selection(&mut self, mailbox: &str) {
-        match mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, mailbox, 500) {
-            Ok(rows) => {
-                if same_mailbox_name(mailbox, &self.active_thread_mailbox) {
-                    self.replace_threads_preserving_selection(rows);
-                }
-            }
-            Err(error) => {
-                tracing::error!(
-                    op = "background_auto_sync",
-                    status = "failed",
-                    mailbox = %mailbox,
-                    error = %error
-                );
-                self.status = format!(
-                    "background sync ok but failed to reload threads for {}: {}",
-                    mailbox, error
-                );
-            }
+    fn reload_mailbox_threads_preserving_selection(&mut self, mailbox: &str) -> Result<()> {
+        let rows =
+            mail_store::load_thread_rows_by_mailbox(&self.runtime.database_path, mailbox, 500)?;
+        if same_mailbox_name(mailbox, &self.active_thread_mailbox) {
+            self.replace_threads_preserving_selection(rows);
         }
+
+        Ok(())
     }
 
     fn to_ui_state(&self) -> UiState {
@@ -2478,70 +3020,18 @@ impl AppState {
                     return;
                 }
 
-                tracing::info!(
-                    op = "subscription_sync",
-                    status = "started",
-                    mailbox = %mailbox
-                );
-                let request = sync_worker::SyncRequest {
-                    mailbox: mailbox.clone(),
-                    fixture_dir: None,
-                    uidvalidity: None,
-                    reconnect_attempts: PALETTE_SYNC_RECONNECT_ATTEMPTS,
-                };
-
-                let sync_result = self.run_sync_request(request);
-                self.defer_inbox_auto_sync_for_mailbox(&mailbox);
-                self.defer_subscription_auto_sync_for_mailbox(&mailbox);
-
-                match sync_result {
-                    Ok(summary) => match mail_store::load_thread_rows_by_mailbox(
-                        &self.runtime.database_path,
-                        &mailbox,
-                        500,
-                    ) {
-                        Ok(fresh_rows) => {
-                            tracing::info!(
-                                op = "subscription_sync",
-                                status = "succeeded",
-                                mailbox = %mailbox,
-                                fetched = summary.fetched,
-                                inserted = summary.inserted,
-                                updated = summary.updated
-                            );
-                            self.show_mailbox_threads(
-                                &mailbox,
-                                fresh_rows,
-                                format!(
-                                    "synced {}: fetched={} inserted={} updated={}",
-                                    mailbox, summary.fetched, summary.inserted, summary.updated
-                                ),
-                                true,
-                            );
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                mailbox = %mailbox,
-                                error = %error,
-                                "sync succeeded but reload thread rows failed"
-                            );
-                            self.status = format!(
-                                "sync ok but failed to reload threads for {}: {error}",
-                                mailbox
-                            );
-                        }
-                    },
-                    Err(error) => {
-                        tracing::error!(
-                            op = "subscription_sync",
-                            status = "failed",
-                            mailbox = %mailbox,
-                            error = %error,
-                            "subscription sync failed"
-                        );
-                        self.status = format!("failed to sync {}: {error}", mailbox);
+                let outcome = self
+                    .start_manual_sync(vec![mailbox.clone()], ManualSyncOrigin::SubscriptionOpen);
+                let background_status = match outcome {
+                    ManualSyncRequestOutcome::Started
+                    | ManualSyncRequestOutcome::AlreadySyncing => {
+                        format!("{mailbox} is syncing in background; page stays responsive")
                     }
-                }
+                    ManualSyncRequestOutcome::Busy => {
+                        "another background sync is running; page stays responsive".to_string()
+                    }
+                };
+                self.show_mailbox_threads(&mailbox, Vec::new(), background_status, true);
             }
             Err(error) => {
                 tracing::error!(
@@ -3224,6 +3714,13 @@ impl AppState {
         self.status = "command palette closed".to_string();
     }
 
+    fn dismiss_palette(&mut self) {
+        self.palette.open = false;
+        self.palette.input.clear();
+        self.palette.clear_completion();
+        self.palette.clear_local_result();
+    }
+
     fn is_code_edit_active(&self) -> bool {
         self.code_edit_mode.is_active()
     }
@@ -3764,6 +4261,21 @@ fn spawn_startup_sync_worker(
     receiver
 }
 
+fn dedup_mailboxes(mailboxes: Vec<String>) -> Vec<String> {
+    let mut deduped: Vec<String> = Vec::new();
+    for mailbox in mailboxes {
+        if deduped
+            .iter()
+            .any(|existing| same_mailbox_name(existing, &mailbox))
+        {
+            continue;
+        }
+        deduped.push(mailbox);
+    }
+
+    deduped
+}
+
 fn run_sync_request_guarded(
     runtime: &RuntimeConfig,
     request: sync_worker::SyncRequest,
@@ -4115,6 +4627,7 @@ fn tui_loop(
         // Pump worker events before drawing so each frame reflects the newest
         // background sync state and can request a full refresh when needed.
         state.pump_startup_sync_events();
+        state.pump_manual_sync_events();
         state.pump_inbox_auto_sync_events();
         state.pump_subscription_auto_sync_events();
         state.maybe_start_inbox_auto_sync();
