@@ -851,6 +851,7 @@ fn command_palette_help_includes_keyboard_shortcuts() {
     assert!(state.status.contains("keys:"));
     assert!(state.status.contains("j/l focus"));
     assert!(state.status.contains("i/k move"));
+    assert!(state.status.contains("-/= preview switch"));
     assert!(state.status.contains("y/n enable"));
     assert!(state.status.contains("a apply"));
     assert!(state.status.contains("d download"));
@@ -1161,6 +1162,69 @@ fn counted_main_page_navigation_does_not_leak_into_focus_changes() {
     );
     assert!(matches!(move_action, LoopAction::Continue));
     assert_eq!(state.thread_index, 1);
+}
+
+#[test]
+fn preview_focus_supports_minus_equals_shifted_equals_and_plus_thread_navigation() {
+    let mut state = AppState::new(sample_threads(4), test_runtime());
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Preview));
+    assert_eq!(state.thread_index, 1);
+
+    state.preview_scroll = 7;
+    let action_previous = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_previous, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Preview));
+    assert_eq!(state.thread_index, 0);
+    assert_eq!(state.preview_scroll, 0);
+
+    state.preview_scroll = 5;
+    let action_next_with_equals = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('='), KeyModifiers::NONE),
+    );
+    assert!(matches!(action_next_with_equals, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Preview));
+    assert_eq!(state.thread_index, 1);
+    assert_eq!(state.preview_scroll, 0);
+
+    state.preview_scroll = 5;
+    let action_next_with_shifted_equals = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('='), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(
+        action_next_with_shifted_equals,
+        LoopAction::Continue
+    ));
+    assert!(matches!(state.focus, Pane::Preview));
+    assert_eq!(state.thread_index, 2);
+    assert_eq!(state.preview_scroll, 0);
+
+    state.preview_scroll = 5;
+    let action_next_with_plus = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT),
+    );
+    assert!(matches!(action_next_with_plus, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Preview));
+    assert_eq!(state.thread_index, 3);
+    assert_eq!(state.preview_scroll, 0);
 }
 
 #[test]

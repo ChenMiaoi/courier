@@ -3674,6 +3674,29 @@ impl AppState {
         }
     }
 
+    fn select_filtered_thread_at(&mut self, filtered_index: usize) {
+        debug_assert!(filtered_index < self.filtered_thread_indices.len());
+        self.thread_index = filtered_index;
+        self.preview_scroll = 0;
+        self.refresh_selected_mail_preview();
+    }
+
+    fn select_previous_thread(&mut self) {
+        if self.thread_index == 0 {
+            return;
+        }
+
+        self.select_filtered_thread_at(self.thread_index - 1);
+    }
+
+    fn select_next_thread(&mut self) {
+        if self.thread_index + 1 >= self.filtered_thread_indices.len() {
+            return;
+        }
+
+        self.select_filtered_thread_at(self.thread_index + 1);
+    }
+
     fn move_up(&mut self) {
         match self.ui_page {
             UiPage::Mail => match self.focus {
@@ -3681,11 +3704,7 @@ impl AppState {
                     self.move_subscription_up();
                 }
                 Pane::Threads => {
-                    if self.thread_index > 0 {
-                        self.thread_index -= 1;
-                        self.preview_scroll = 0;
-                        self.refresh_selected_mail_preview();
-                    }
+                    self.select_previous_thread();
                 }
                 Pane::Preview => {
                     self.preview_scroll = self
@@ -3713,11 +3732,7 @@ impl AppState {
                     self.move_subscription_down();
                 }
                 Pane::Threads => {
-                    if self.thread_index + 1 < self.filtered_thread_indices.len() {
-                        self.thread_index += 1;
-                        self.preview_scroll = 0;
-                        self.refresh_selected_mail_preview();
-                    }
+                    self.select_next_thread();
                 }
                 Pane::Preview => {
                     let preview_scroll_limit = self.preview_scroll_limit.get();
@@ -3757,9 +3772,7 @@ impl AppState {
                 }
                 Pane::Threads => {
                     if !self.filtered_thread_indices.is_empty() {
-                        self.thread_index = 0;
-                        self.preview_scroll = 0;
-                        self.refresh_selected_mail_preview();
+                        self.select_filtered_thread_at(0);
                     }
                 }
                 Pane::Preview => {
@@ -3796,9 +3809,9 @@ impl AppState {
                 }
                 Pane::Threads => {
                     if !self.filtered_thread_indices.is_empty() {
-                        self.thread_index = self.filtered_thread_indices.len().saturating_sub(1);
-                        self.preview_scroll = 0;
-                        self.refresh_selected_mail_preview();
+                        self.select_filtered_thread_at(
+                            self.filtered_thread_indices.len().saturating_sub(1),
+                        );
                     }
                 }
                 Pane::Preview => {

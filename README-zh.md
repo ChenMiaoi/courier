@@ -203,6 +203,7 @@ criew tui
 - 数字前缀可重复垂直移动：`default/custom` 使用 `数字 + i/k`，`vim` 使用 `数字 + j/k`
 - `y` / `n` 启用或禁用当前订阅
 - `Enter` 打开当前 mailbox 或 thread，并自动切到 threads 或 preview pane
+- `-` / `=` 在保持 preview pane 焦点时切换上一封或下一封邮件
 - `a` apply 当前 patch series
 - `d` 导出当前 patch series
 - `u` 撤销本次会话中最近一次成功 apply

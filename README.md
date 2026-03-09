@@ -215,6 +215,7 @@ Inside the TUI:
 - a numeric prefix repeats vertical movement: `count+i/k` for `default`/`custom`, `count+j/k` for `vim`
 - `y` / `n` enable or disable the selected subscription
 - `Enter` opens the selected mailbox or thread and moves focus to threads or preview
+- `-` / `=` switch to the previous or next mail while preview stays focused
 - `a` applies the current patch series
 - `d` exports the current patch series
 - `u` undoes the most recent successful apply from the current session

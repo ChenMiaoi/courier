@@ -245,6 +245,18 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         {
             state.set_current_subscription_enabled(false);
         }
+        KeyCode::Char('-')
+            if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Preview) =>
+        {
+            state.select_previous_thread();
+        }
+        KeyCode::Char(character)
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Preview)
+                && matches!(character, '=' | '+') =>
+        {
+            state.select_next_thread();
+        }
         KeyCode::Char('e')
             if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Preview) =>
         {
@@ -702,7 +714,7 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "restart" => return LoopAction::Restart,
                 "help" => {
                     state.status = format!(
-                        "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: {} focus, {} move, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
+                        "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: {} focus, {} move, -/= preview switch, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
                         main_page_focus_shortcuts(state.runtime.ui_keymap),
                         main_page_move_shortcuts(state.runtime.ui_keymap)
                     );
