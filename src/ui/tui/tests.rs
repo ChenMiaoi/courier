@@ -2745,10 +2745,35 @@ fn code_browser_navigation_keys_unchanged_when_not_editing() {
 }
 
 #[test]
-fn enter_on_subscription_opens_threads_without_toggling_enabled_state() {
-    let mut state = AppState::new(vec![], test_runtime());
+fn enter_on_subscription_opens_threads_and_focuses_threads_pane_without_toggling_enabled_state() {
+    let root = temp_dir("enter-open-subscription");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    seed_mailbox_thread(
+        &runtime.database_path,
+        "io-uring",
+        1,
+        "io-uring@example.com",
+        "io-uring thread",
+    );
+
+    let mut state = AppState::new_with_ui_state(
+        vec![],
+        runtime,
+        Some(UiState {
+            enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string(), "io-uring".to_string()],
+            active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+            ..UiState::default()
+        }),
+    );
     state.focus = Pane::Subscriptions;
-    let initial = state.subscriptions[0].enabled;
+    let io_uring_index = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "io-uring")
+        .expect("io-uring subscription exists");
+    state.subscription_index = io_uring_index;
+    state.sync_subscription_row_to_selected_item();
+    let initial = state.subscriptions[io_uring_index].enabled;
 
     let action = handle_key_event(
         &mut state,
@@ -2756,7 +2781,12 @@ fn enter_on_subscription_opens_threads_without_toggling_enabled_state() {
     );
 
     assert!(matches!(action, LoopAction::Continue));
-    assert_eq!(state.subscriptions[0].enabled, initial);
+    assert_eq!(state.subscriptions[io_uring_index].enabled, initial);
+    assert!(matches!(state.focus, Pane::Threads));
+    assert_eq!(state.active_thread_mailbox, "io-uring");
+    assert_eq!(state.threads.len(), 1);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3091,6 +3121,7 @@ fn opening_empty_inbox_queues_background_sync_and_defers_next_auto_sync_tick() {
     assert!(state.threads.is_empty());
     assert!(state.status.contains("syncing in background"));
     assert!(state.manual_sync.is_some());
+    assert!(matches!(state.focus, Pane::Threads));
     assert!(
         state
             .inbox_auto_sync
@@ -3341,6 +3372,7 @@ fn enter_on_mailbox_pending_startup_sync_stays_non_blocking() {
     state.open_threads_for_selected_subscription();
 
     assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    assert!(matches!(state.focus, Pane::Threads));
     assert!(state.threads.is_empty());
     assert!(state.status.contains("syncing in background"));
 
@@ -3700,7 +3732,7 @@ fn palette_bang_reports_empty_local_command() {
 }
 
 #[test]
-fn enter_on_thread_sets_selected_status_message() {
+fn enter_on_thread_focuses_preview_and_sets_selected_status_message() {
     let mut state = AppState::new(
         vec![sample_thread("normal mail", "plain@example.com", 0)],
         test_runtime(),
@@ -3713,6 +3745,7 @@ fn enter_on_thread_sets_selected_status_message() {
     );
 
     assert!(matches!(action, LoopAction::Continue));
+    assert!(matches!(state.focus, Pane::Preview));
     assert_eq!(state.status, "selected plain@example.com");
 }
 

@@ -212,7 +212,7 @@ Inside the TUI:
 - `:` opens the command palette
 - the header shows the active keymap scheme (`default`, `vim`, or `custom`)
 - `y` / `n` enable or disable the selected subscription
-- `Enter` opens the selected mailbox or thread
+- `Enter` opens the selected mailbox or thread and moves focus to threads or preview
 - `a` applies the current patch series
 - `d` exports the current patch series
 - `u` undoes the most recent successful apply from the current session

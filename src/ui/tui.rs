@@ -3029,6 +3029,7 @@ impl AppState {
                     format!("showing threads for {}", mailbox),
                     true,
                 );
+                self.focus = Pane::Threads;
             }
             Ok(_) => {
                 if self.mailbox_sync_pending(&mailbox) {
@@ -3038,6 +3039,7 @@ impl AppState {
                         format!("{mailbox} is syncing in background; page stays responsive"),
                         true,
                     );
+                    self.focus = Pane::Threads;
                     return;
                 }
 
@@ -3053,6 +3055,7 @@ impl AppState {
                     }
                 };
                 self.show_mailbox_threads(&mailbox, Vec::new(), background_status, true);
+                self.focus = Pane::Threads;
             }
             Err(error) => {
                 tracing::error!(

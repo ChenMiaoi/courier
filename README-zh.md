@@ -199,7 +199,7 @@ criew tui
 - `:` 打开命令栏
 - 顶部状态栏会显示当前 keymap 方案：`default`、`vim` 或 `custom`
 - `y` / `n` 启用或禁用当前订阅
-- `Enter` 打开当前 mailbox 或 thread
+- `Enter` 打开当前 mailbox 或 thread，并自动切到 threads 或 preview pane
 - `a` apply 当前 patch series
 - `d` 导出当前 patch series
 - `u` 撤销本次会话中最近一次成功 apply

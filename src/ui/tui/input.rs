@@ -237,6 +237,7 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
                 Pane::Threads => {
                     if let Some(thread) = state.selected_thread() {
                         state.status = format!("selected {}", thread.message_id);
+                        state.focus = Pane::Preview;
                     }
                 }
                 Pane::Preview => {}
