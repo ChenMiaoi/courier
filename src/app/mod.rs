@@ -83,6 +83,7 @@ pub fn run() -> Result<()> {
             );
             println!("  lore_base_url: {}", runtime.lore_base_url);
             println!("  startup_sync: {}", runtime.startup_sync);
+            println!("  ui_keymap: {}", runtime.ui_keymap.as_str());
             println!(
                 "  inbox_auto_sync_interval_secs: {}",
                 runtime.inbox_auto_sync_interval_secs
