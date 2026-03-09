@@ -30,12 +30,13 @@ use super::preview::preview_warning_message;
 use super::reply::ReplyIdentity;
 use super::{
     AppState, CodeEditMode, CodePaneFocus, ExternalEditorProcessResult, LoopAction, MY_INBOX_LABEL,
-    Pane, ReplyEditMode, ReplySection, StartupSyncEvent, StartupSyncMailboxStatus,
-    StartupSyncState, SubscriptionItem, UiPage, catch_sync_panic, code_edit_cursor_position, draw,
-    extract_mail_body_preview, extract_mail_preview, handle_key_event, is_palette_open_shortcut,
-    is_palette_toggle, load_source_file_preview, mail_page_panes, matching_commands,
-    pick_external_editor, resolve_palette_local_workdir, run_external_editor_session_with,
-    sanitize_inline_ui_text, subscription_line, thread_line,
+    ManualSyncOrigin, ManualSyncRequestOutcome, ManualSyncState, Pane, ReplyEditMode, ReplySection,
+    StartupSyncEvent, StartupSyncMailboxStatus, StartupSyncState, SubscriptionItem, UiPage,
+    catch_sync_panic, code_edit_cursor_position, draw, extract_mail_body_preview,
+    extract_mail_preview, handle_key_event, is_palette_open_shortcut, is_palette_toggle,
+    load_source_file_preview, mail_page_panes, matching_commands, pick_external_editor,
+    resolve_palette_local_workdir, run_external_editor_session_with, sanitize_inline_ui_text,
+    subscription_line, thread_line,
 };
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -99,6 +100,17 @@ fn sample_thread_in_thread(
         date: None,
         raw_path: None,
     }
+}
+
+fn rendered_row_text(terminal: &Terminal<TestBackend>, row: u16) -> String {
+    let buffer = terminal.backend().buffer();
+    let width = buffer.area().width as usize;
+    let start = row as usize * width;
+    let end = start + width;
+    buffer.content()[start..end]
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>()
 }
 
 fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
@@ -221,6 +233,43 @@ fn startup_sync_state(mailboxes: &[(&str, StartupSyncMailboxStatus)]) -> Startup
     }
 }
 
+fn manual_sync_state(mailboxes: &[(&str, StartupSyncMailboxStatus)]) -> ManualSyncState {
+    let (_sender, receiver) = mpsc::channel();
+    ManualSyncState {
+        receiver,
+        mailbox_order: mailboxes
+            .iter()
+            .map(|(mailbox, _)| (*mailbox).to_string())
+            .collect(),
+        mailboxes: mailboxes
+            .iter()
+            .map(|(mailbox, status)| ((*mailbox).to_string(), *status))
+            .collect(),
+        total: mailboxes.len(),
+        completed: mailboxes
+            .iter()
+            .filter(|(_, status)| {
+                matches!(
+                    status,
+                    StartupSyncMailboxStatus::Finished | StartupSyncMailboxStatus::Failed
+                )
+            })
+            .count(),
+        succeeded: mailboxes
+            .iter()
+            .filter(|(_, status)| matches!(status, StartupSyncMailboxStatus::Finished))
+            .count(),
+        failed: mailboxes
+            .iter()
+            .filter(|(_, status)| matches!(status, StartupSyncMailboxStatus::Failed))
+            .count(),
+        total_fetched: 0,
+        total_inserted: 0,
+        total_updated: 0,
+        first_error: None,
+    }
+}
+
 fn test_bootstrap(runtime: &RuntimeConfig) -> BootstrapState {
     BootstrapState {
         db: DatabaseState {
@@ -308,6 +357,31 @@ fn inbox_auto_sync_waits_for_startup_sync_to_finish() {
 }
 
 #[test]
+fn inbox_auto_sync_waits_for_manual_sync_to_finish() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.mailbox_sync_spawner = mailbox_sync_spawner_stub;
+    state.manual_sync = Some(manual_sync_state(&[(
+        IMAP_INBOX_MAILBOX,
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+    state
+        .inbox_auto_sync
+        .as_mut()
+        .expect("inbox auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    state.maybe_start_inbox_auto_sync();
+
+    assert!(
+        state
+            .inbox_auto_sync
+            .as_ref()
+            .and_then(|sync| sync.receiver.as_ref())
+            .is_none()
+    );
+}
+
+#[test]
 fn subscription_auto_sync_starts_when_due_for_enabled_linux_subscription() {
     let mut state = AppState::new(vec![], test_runtime());
     state.mailbox_sync_spawner = mailbox_sync_spawner_stub;
@@ -347,6 +421,38 @@ fn subscription_auto_sync_waits_for_startup_sync_to_finish() {
     state.subscriptions[qemu_devel_index].enabled = true;
     state.reconcile_subscription_auto_sync();
     state.startup_sync = Some(startup_sync_state(&[(
+        "qemu-devel",
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+    state
+        .subscription_auto_sync
+        .as_mut()
+        .expect("subscription auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    state.maybe_start_subscription_auto_sync();
+
+    assert!(
+        state
+            .subscription_auto_sync
+            .as_ref()
+            .and_then(|sync| sync.receiver.as_ref())
+            .is_none()
+    );
+}
+
+#[test]
+fn subscription_auto_sync_waits_for_manual_sync_to_finish() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.mailbox_sync_spawner = mailbox_sync_spawner_stub;
+    let qemu_devel_index = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "qemu-devel")
+        .expect("qemu-devel subscription exists");
+    state.subscriptions[qemu_devel_index].enabled = true;
+    state.reconcile_subscription_auto_sync();
+    state.manual_sync = Some(manual_sync_state(&[(
         "qemu-devel",
         StartupSyncMailboxStatus::InFlight,
     )]));
@@ -427,30 +533,57 @@ fn reply_send_mock_failure(_runtime: &RuntimeConfig, _request: &SendRequest) -> 
     }
 }
 
-fn sync_request_mock_success(
-    _runtime: &RuntimeConfig,
-    request: crate::app::sync::SyncRequest,
-) -> crate::infra::error::Result<crate::app::sync::SyncSummary> {
-    Ok(crate::app::sync::SyncSummary {
-        mailbox: request.mailbox,
-        source: "mock".to_string(),
-        fetched: 1,
-        inserted: 1,
-        updated: 0,
-        rebuilt_roots: 0,
-        mailbox_rebuilt: false,
-        uidvalidity: 1,
-        checkpoint_last_seen_uid: 1,
-        checkpoint_highest_modseq: Some(1),
-        checkpoint_synced_at: Some("2026-03-07T10:00:02Z".to_string()),
-    })
-}
-
 fn mailbox_sync_spawner_stub(
     _runtime: RuntimeConfig,
     _mailboxes: Vec<String>,
 ) -> mpsc::Receiver<StartupSyncEvent> {
     let (_sender, receiver) = mpsc::channel();
+    receiver
+}
+
+fn manual_sync_spawner_idle(
+    _runtime: RuntimeConfig,
+    _mailboxes: Vec<String>,
+) -> mpsc::Receiver<StartupSyncEvent> {
+    let (_sender, receiver) = mpsc::channel();
+    receiver
+}
+
+fn manual_sync_spawner_seed_success(
+    runtime: RuntimeConfig,
+    mailboxes: Vec<String>,
+) -> mpsc::Receiver<StartupSyncEvent> {
+    let (sender, receiver) = mpsc::channel();
+    let total = mailboxes.len();
+
+    for (index, mailbox) in mailboxes.into_iter().enumerate() {
+        sender
+            .send(StartupSyncEvent::MailboxStarted {
+                mailbox: mailbox.clone(),
+                index: index + 1,
+                total,
+            })
+            .expect("send mailbox started");
+        seed_mailbox_thread(
+            &runtime.database_path,
+            &mailbox,
+            index as u32 + 1,
+            &format!("{mailbox}-{index}@example.com"),
+            &format!("{mailbox} thread"),
+        );
+        sender
+            .send(StartupSyncEvent::MailboxFinished {
+                mailbox,
+                fetched: 1,
+                inserted: 1,
+                updated: 0,
+            })
+            .expect("send mailbox finished");
+    }
+    sender
+        .send(StartupSyncEvent::WorkerCompleted)
+        .expect("send worker completed");
+
     receiver
 }
 
@@ -2494,9 +2627,9 @@ fn startup_sync_failure_for_empty_inbox_falls_back_to_cached_mailbox() {
 }
 
 #[test]
-fn command_palette_sync_resets_my_inbox_auto_sync_deadline() {
+fn command_palette_sync_queues_background_job_and_resets_my_inbox_auto_sync_deadline() {
     let mut state = AppState::new(vec![], test_runtime_with_imap());
-    state.sync_request_executor = sync_request_mock_success;
+    state.manual_sync_spawner = manual_sync_spawner_idle;
     state
         .inbox_auto_sync
         .as_mut()
@@ -2505,7 +2638,8 @@ fn command_palette_sync_resets_my_inbox_auto_sync_deadline() {
 
     run_palette_sync(&mut state, "sync INBOX");
 
-    assert!(state.status.contains("sync ok"));
+    assert!(state.status.contains("sync queued in background"));
+    assert!(state.manual_sync.is_some());
     assert!(
         state
             .inbox_auto_sync
@@ -2517,7 +2651,7 @@ fn command_palette_sync_resets_my_inbox_auto_sync_deadline() {
 }
 
 #[test]
-fn foreground_inbox_sync_defers_next_auto_sync_tick() {
+fn opening_empty_inbox_queues_background_sync_and_defers_next_auto_sync_tick() {
     let root = temp_dir("imap-open-inbox-sync");
     let runtime = test_runtime_with_imap_in(root.clone());
     fs::create_dir_all(runtime.database_path.parent().expect("db parent"))
@@ -2525,7 +2659,7 @@ fn foreground_inbox_sync_defers_next_auto_sync_tick() {
     db::initialize(&runtime.database_path).expect("initialize db");
 
     let mut state = AppState::new(vec![], runtime);
-    state.sync_request_executor = sync_request_mock_success;
+    state.manual_sync_spawner = manual_sync_spawner_idle;
     state
         .inbox_auto_sync
         .as_mut()
@@ -2534,7 +2668,10 @@ fn foreground_inbox_sync_defers_next_auto_sync_tick() {
 
     state.open_threads_for_selected_subscription();
 
-    assert!(state.status.contains("synced INBOX"));
+    assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    assert!(state.threads.is_empty());
+    assert!(state.status.contains("syncing in background"));
+    assert!(state.manual_sync.is_some());
     assert!(
         state
             .inbox_auto_sync
@@ -2548,9 +2685,98 @@ fn foreground_inbox_sync_defers_next_auto_sync_tick() {
 }
 
 #[test]
-fn command_palette_sync_resets_subscription_auto_sync_deadline() {
+fn manual_sync_same_mailbox_request_reports_already_syncing() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.manual_sync = Some(manual_sync_state(&[(
+        IMAP_INBOX_MAILBOX,
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+
+    let outcome =
+        state.start_manual_sync(vec!["inbox".to_string()], ManualSyncOrigin::PaletteCommand);
+
+    assert_eq!(outcome, ManualSyncRequestOutcome::AlreadySyncing);
+    assert!(state.status.contains("sync already running in background"));
+}
+
+#[test]
+fn manual_sync_different_mailbox_request_reports_busy() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.manual_sync = Some(manual_sync_state(&[(
+        "io-uring",
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+
+    let outcome = state.start_manual_sync(
+        vec![IMAP_INBOX_MAILBOX.to_string()],
+        ManualSyncOrigin::PaletteCommand,
+    );
+
+    assert_eq!(outcome, ManualSyncRequestOutcome::Busy);
+    assert!(state.status.contains("background sync busy"));
+    assert!(state.status.contains("0/1"));
+}
+
+#[test]
+fn manual_sync_dedups_case_variants_and_defers_auto_sync_deadlines() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.manual_sync_spawner = manual_sync_spawner_idle;
+    let io_uring_index = state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "io-uring")
+        .expect("io-uring subscription exists");
+    state.subscriptions[io_uring_index].enabled = true;
+    state.reconcile_subscription_auto_sync();
+    state
+        .inbox_auto_sync
+        .as_mut()
+        .expect("inbox auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+    state
+        .subscription_auto_sync
+        .as_mut()
+        .expect("subscription auto-sync state")
+        .next_due_at = Instant::now() - Duration::from_secs(1);
+
+    let outcome = state.start_manual_sync(
+        vec![
+            IMAP_INBOX_MAILBOX.to_string(),
+            "inbox".to_string(),
+            "io-uring".to_string(),
+            "IO-URING".to_string(),
+        ],
+        ManualSyncOrigin::PaletteCommand,
+    );
+
+    assert_eq!(outcome, ManualSyncRequestOutcome::Started);
+    let sync_state = state.manual_sync.as_ref().expect("manual sync state");
+    assert_eq!(
+        sync_state.mailbox_order,
+        vec!["INBOX".to_string(), "io-uring".to_string()]
+    );
+    assert!(
+        state
+            .inbox_auto_sync
+            .as_ref()
+            .expect("inbox auto-sync state")
+            .next_due_at
+            > Instant::now() + Duration::from_secs(20)
+    );
+    assert!(
+        state
+            .subscription_auto_sync
+            .as_ref()
+            .expect("subscription auto-sync state")
+            .next_due_at
+            > Instant::now() + Duration::from_secs(20)
+    );
+}
+
+#[test]
+fn command_palette_sync_queues_background_job_and_resets_subscription_auto_sync_deadline() {
     let mut state = AppState::new(vec![], test_runtime());
-    state.sync_request_executor = sync_request_mock_success;
+    state.manual_sync_spawner = manual_sync_spawner_idle;
     let io_uring_index = state
         .subscriptions
         .iter()
@@ -2566,7 +2792,8 @@ fn command_palette_sync_resets_subscription_auto_sync_deadline() {
 
     run_palette_sync(&mut state, "sync io-uring");
 
-    assert!(state.status.contains("sync ok"));
+    assert!(state.status.contains("sync queued in background"));
+    assert!(state.manual_sync.is_some());
     assert!(
         state
             .subscription_auto_sync
@@ -2575,6 +2802,92 @@ fn command_palette_sync_resets_subscription_auto_sync_deadline() {
             .next_due_at
             > Instant::now() + Duration::from_secs(20)
     );
+}
+
+#[test]
+fn manual_sync_completion_refreshes_active_mailbox_after_worker_finishes() {
+    let root = temp_dir("manual-sync-finish-refresh");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    fs::create_dir_all(runtime.database_path.parent().expect("db parent"))
+        .expect("create db parent");
+    db::initialize(&runtime.database_path).expect("initialize db");
+
+    let mut state = AppState::new(vec![], runtime);
+    state.manual_sync_spawner = manual_sync_spawner_seed_success;
+
+    state.open_threads_for_selected_subscription();
+    assert!(state.threads.is_empty());
+    assert!(state.manual_sync.is_some());
+
+    state.pump_manual_sync_events();
+
+    assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    assert_eq!(state.threads.len(), 1);
+    assert!(state.status.contains("sync finished: ok=1"));
+    assert!(state.manual_sync.is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn manual_sync_failure_finishes_with_first_error_summary() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.manual_sync = Some(manual_sync_state(&[(
+        IMAP_INBOX_MAILBOX,
+        StartupSyncMailboxStatus::Pending,
+    )]));
+
+    state.apply_manual_sync_event(StartupSyncEvent::MailboxFailed {
+        mailbox: IMAP_INBOX_MAILBOX.to_string(),
+        error: "imap unavailable".to_string(),
+    });
+
+    assert!(state.manual_sync.is_none());
+    assert_eq!(state.status, "sync failed: INBOX: imap unavailable");
+}
+
+#[test]
+fn manual_sync_partial_failure_reports_partial_summary() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.manual_sync = Some(manual_sync_state(&[
+        ("io-uring", StartupSyncMailboxStatus::Pending),
+        ("kvm", StartupSyncMailboxStatus::Pending),
+    ]));
+
+    state.apply_manual_sync_event(StartupSyncEvent::MailboxFinished {
+        mailbox: "io-uring".to_string(),
+        fetched: 2,
+        inserted: 1,
+        updated: 0,
+    });
+    assert!(state.manual_sync.is_some());
+
+    state.apply_manual_sync_event(StartupSyncEvent::MailboxFailed {
+        mailbox: "kvm".to_string(),
+        error: "network timeout".to_string(),
+    });
+
+    assert!(state.manual_sync.is_none());
+    assert!(state.status.contains("sync finished with failures"));
+    assert!(state.status.contains("ok=1 failed=1"));
+    assert!(state.status.contains("fetched=2 inserted=1 updated=0"));
+}
+
+#[test]
+fn manual_sync_worker_disconnect_reports_failure_summary() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.manual_sync_spawner = manual_sync_spawner_idle;
+
+    let outcome = state.start_manual_sync(
+        vec!["io-uring".to_string()],
+        ManualSyncOrigin::PaletteCommand,
+    );
+    assert_eq!(outcome, ManualSyncRequestOutcome::Started);
+
+    state.pump_manual_sync_events();
+
+    assert!(state.manual_sync.is_none());
+    assert!(state.status.contains("background sync worker disconnected"));
 }
 
 #[test]
@@ -2611,6 +2924,67 @@ fn enter_on_mailbox_pending_startup_sync_stays_non_blocking() {
     assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
     assert!(state.threads.is_empty());
     assert!(state.status.contains("syncing in background"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn enter_on_mailbox_pending_manual_sync_stays_non_blocking() {
+    let root = temp_dir("imap-pending-manual-enter");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    fs::create_dir_all(runtime.database_path.parent().expect("db parent"))
+        .expect("create db parent");
+    db::initialize(&runtime.database_path).expect("initialize db");
+
+    let mut state = AppState::new_with_ui_state(
+        vec![],
+        runtime,
+        Some(UiState {
+            enabled_mailboxes: vec![IMAP_INBOX_MAILBOX.to_string()],
+            enabled_group_expanded: true,
+            disabled_group_expanded: true,
+            enabled_linux_subsystem_expanded: true,
+            enabled_qemu_subsystem_expanded: true,
+            disabled_linux_subsystem_expanded: true,
+            disabled_qemu_subsystem_expanded: true,
+            imap_defaults_initialized: true,
+            active_mailbox: Some(IMAP_INBOX_MAILBOX.to_string()),
+        }),
+    );
+    state.focus = Pane::Subscriptions;
+    state.manual_sync = Some(manual_sync_state(&[(
+        IMAP_INBOX_MAILBOX,
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+
+    state.open_threads_for_selected_subscription();
+
+    assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    assert!(state.threads.is_empty());
+    assert!(state.status.contains("syncing in background"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn opening_empty_mailbox_while_other_manual_sync_is_busy_shows_busy_hint() {
+    let root = temp_dir("manual-sync-busy-open");
+    let runtime = test_runtime_with_imap_in(root.clone());
+    fs::create_dir_all(runtime.database_path.parent().expect("db parent"))
+        .expect("create db parent");
+    db::initialize(&runtime.database_path).expect("initialize db");
+
+    let mut state = AppState::new(vec![], runtime);
+    state.manual_sync = Some(manual_sync_state(&[(
+        "io-uring",
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+
+    state.open_threads_for_selected_subscription();
+
+    assert_eq!(state.active_thread_mailbox, IMAP_INBOX_MAILBOX);
+    assert!(state.threads.is_empty());
+    assert!(state.status.contains("another background sync is running"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2875,7 +3249,7 @@ fn palette_escape_backspace_and_char_input_update_buffer() {
 #[test]
 fn palette_sync_command_runs_via_handle_key_event() {
     let mut state = AppState::new(vec![], test_runtime());
-    state.sync_request_executor = sync_request_mock_success;
+    state.manual_sync_spawner = manual_sync_spawner_idle;
     state.palette.open = true;
     state.palette.input = "sync io-uring".to_string();
 
@@ -2885,7 +3259,10 @@ fn palette_sync_command_runs_via_handle_key_event() {
     );
 
     assert!(matches!(action, LoopAction::Continue));
-    assert!(state.status.contains("sync ok"));
+    assert!(state.status.contains("sync queued in background"));
+    assert!(state.manual_sync.is_some());
+    assert!(!state.palette.open);
+    assert!(state.palette.input.is_empty());
 }
 
 #[test]
@@ -3189,7 +3566,7 @@ fn header_shows_criew_brand_and_default_footer_hides_empty_status() {
 }
 
 #[test]
-fn startup_sync_summary_stays_in_header_not_footer_middle() {
+fn startup_sync_progress_bar_renders_at_right_edge_of_header() {
     let runtime = test_runtime_in(PathBuf::from("/t"));
     let bootstrap = test_bootstrap(&runtime);
     let mut state = AppState::new(vec![], runtime.clone());
@@ -3205,12 +3582,132 @@ fn startup_sync_summary_stays_in_header_not_footer_middle() {
         .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
         .expect("draw startup sync");
     let rendered = format!("{}", terminal.backend());
-    let progress_summary = "sync INBOX 1/3";
+    let header_row = rendered_row_text(&terminal, 0);
+    let footer_row = rendered_row_text(&terminal, terminal.backend().buffer().area().height - 1);
+    let progress_text = sanitize_inline_ui_text(
+        &state
+            .background_sync_progress_text()
+            .expect("background sync progress"),
+    );
 
     assert!(rendered.contains("Mail / inbox"));
-    assert!(rendered.contains(progress_summary));
+    assert!(rendered.contains("sync ["));
+    assert!(rendered.contains("1/3"));
+    assert!(rendered.contains("INBOX"));
     assert!(rendered.contains("startup sync [1/3] syncing INBOX..."));
-    assert_eq!(rendered.matches(progress_summary).count(), 1);
+    assert!(header_row.trim_end().ends_with(&progress_text));
+    assert!(header_row.ends_with(' '));
+    assert!(!footer_row.contains(&progress_text));
+}
+
+#[test]
+fn background_sync_progress_text_prefers_manual_sync_over_other_sources() {
+    let mut state = AppState::new(vec![], test_runtime_with_imap());
+    state.manual_sync = Some(manual_sync_state(&[(
+        "io-uring",
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+    state.startup_sync = Some(startup_sync_state(&[(
+        IMAP_INBOX_MAILBOX,
+        StartupSyncMailboxStatus::InFlight,
+    )]));
+    state
+        .inbox_auto_sync
+        .as_mut()
+        .expect("inbox auto-sync state")
+        .receiver = Some(mpsc::channel().1);
+
+    let progress = state
+        .background_sync_progress_text()
+        .expect("background progress");
+
+    assert!(progress.contains("0/1"));
+    assert!(progress.contains("io-uring"));
+    assert!(!progress.contains("auto INBOX"));
+}
+
+#[test]
+fn background_sync_progress_text_reports_auto_sync_sources() {
+    let mut inbox_state = AppState::new(vec![], test_runtime_with_imap());
+    inbox_state
+        .inbox_auto_sync
+        .as_mut()
+        .expect("inbox auto-sync state")
+        .receiver = Some(mpsc::channel().1);
+    let inbox_progress = inbox_state
+        .background_sync_progress_text()
+        .expect("inbox progress");
+    assert!(inbox_progress.contains("auto INBOX"));
+    assert_eq!(inbox_progress.matches('>').count(), 3);
+
+    let mut subscription_state = AppState::new(vec![], test_runtime());
+    let io_uring_index = subscription_state
+        .subscriptions
+        .iter()
+        .position(|item| item.mailbox == "io-uring")
+        .expect("io-uring subscription exists");
+    subscription_state.subscriptions[io_uring_index].enabled = true;
+    subscription_state.reconcile_subscription_auto_sync();
+    let state = subscription_state
+        .subscription_auto_sync
+        .as_mut()
+        .expect("subscription auto-sync state");
+    state.receiver = Some(mpsc::channel().1);
+    state.in_flight_mailboxes.insert("io-uring".to_string());
+
+    let subscription_progress = subscription_state
+        .background_sync_progress_text()
+        .expect("subscription progress");
+    assert!(subscription_progress.contains("auto io-uring"));
+    assert_eq!(subscription_progress.matches('>').count(), 3);
+}
+
+#[test]
+fn progress_bar_helpers_cover_zero_total_and_completed_states() {
+    let state = AppState::new(vec![], test_runtime());
+
+    let zero_total = state.render_progress_bar(0, 0);
+    let completed = state.render_progress_bar(3, 3);
+    let indeterminate = state.render_indeterminate_progress_bar();
+
+    assert_eq!(zero_total, "[............]");
+    assert!(completed.starts_with('['));
+    assert!(completed.ends_with(']'));
+    assert_eq!(completed.matches('=').count(), 12);
+    assert_eq!(completed.matches('>').count(), 0);
+    assert_eq!(indeterminate.len(), 14);
+    assert_eq!(indeterminate.matches('>').count(), 3);
+}
+
+#[test]
+fn manual_sync_progress_bar_is_rendered_at_right_edge_of_header() {
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.manual_sync = Some(manual_sync_state(&[
+        (IMAP_INBOX_MAILBOX, StartupSyncMailboxStatus::InFlight),
+        ("io-uring", StartupSyncMailboxStatus::Pending),
+    ]));
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 35)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw manual sync progress");
+    let rendered = format!("{}", terminal.backend());
+    let header_row = rendered_row_text(&terminal, 0);
+    let footer_row = rendered_row_text(&terminal, terminal.backend().buffer().area().height - 1);
+    let progress_text = sanitize_inline_ui_text(
+        &state
+            .background_sync_progress_text()
+            .expect("background sync progress"),
+    );
+
+    assert!(rendered.contains("sync ["));
+    assert!(rendered.contains("0/2"));
+    assert!(rendered.contains(IMAP_INBOX_MAILBOX));
+    assert!(header_row.trim_end().ends_with(&progress_text));
+    assert!(header_row.ends_with(' '));
+    assert!(!footer_row.contains(&progress_text));
 }
 
 #[test]
