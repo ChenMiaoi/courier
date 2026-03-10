@@ -248,6 +248,8 @@ CRIEW 的 Reply Panel 会自动填充：
 ### 相关文档
 
 - [README.md](README.md): 英文项目说明
+- `docs/wiki`：GitHub wiki 源子模块；可通过 `cargo wiki serve` 本地预览 MkDocs 站点（默认监听 `0.0.0.0:8000`，可用 `CRIEW_WIKI_DEV_ADDR` 覆盖）
+- `cargo wiki check`：本地执行 wiki 文案检查并构建 MkDocs 站点；若缺少 `autocorrect`，首次运行 `cargo wiki lint` 或 `cargo wiki check` 时会把它缓存到 `target/wiki-venv/bin/`
 - [docs/reference/config.example.toml](docs/reference/config.example.toml): 配置示例
 - [docs/architecture/design.md](docs/architecture/design.md): 设计文档
 - [docs/specs/reply-format-spec.md](docs/specs/reply-format-spec.md): 回信格式规范

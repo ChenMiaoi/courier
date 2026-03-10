@@ -1,3 +1,6 @@
 [submodule "vendor/b4"]
 	path = vendor/b4
 	url = https://github.com/mricon/b4.git
+[submodule "docs/wiki"]
+	path = docs/wiki
+	url = https://github.com/ChenMiaoi/CRIEW.wiki.git

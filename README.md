@@ -234,6 +234,8 @@ Enabled mailing-list subscriptions also keep doing periodic background sync whil
 ### Documentation
 
 - [README-zh.md](README-zh.md): Chinese usage guide
+- `docs/wiki`: GitHub wiki source submodule; preview the MkDocs site with `cargo wiki serve` (defaults to `0.0.0.0:8000`, override with `CRIEW_WIKI_DEV_ADDR`)
+- `cargo wiki check`: lint wiki copy and build the local MkDocs site; if `autocorrect` is missing, the first `cargo wiki lint` or `cargo wiki check` download caches it under `target/wiki-venv/bin/`
 - [docs/reference/config.example.toml](docs/reference/config.example.toml): configuration example
 - [docs/architecture/design.md](docs/architecture/design.md): design notes
 - [docs/specs/reply-format-spec.md](docs/specs/reply-format-spec.md): reply panel and sending format

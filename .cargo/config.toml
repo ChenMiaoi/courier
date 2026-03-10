@@ -1,0 +1,2 @@
+[alias]
+wiki = "run --quiet -p xtask --"

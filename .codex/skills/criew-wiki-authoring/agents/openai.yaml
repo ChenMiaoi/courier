@@ -1,0 +1,4 @@
+interface:
+  display_name: "CRIEW Wiki"
+  short_description: "CRIEW GitHub wiki authoring guide"
+  default_prompt: "Use $criew-wiki-authoring to draft or revise pages under docs/wiki in the CRIEW GitHub wiki style."
