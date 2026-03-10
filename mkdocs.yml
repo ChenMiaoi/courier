@@ -8,4 +8,4 @@ site_dir: target/wiki-site
 strict: true
 
 theme:
-  name: mkdocs
+  name: material

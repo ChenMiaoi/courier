@@ -37,3 +37,7 @@ Do not consider a new or edited wiki page complete until the copy passes the lin
 `docs/wiki` is a Git submodule in the main repository.
 That means the GitHub Pages deployment uses the wiki commit pinned by the main `CRIEW` repository.
 If the standalone wiki repository advances but the main repository does not update the `docs/wiki` gitlink, GitHub Pages will keep publishing the older pinned wiki snapshot.
+
+When a wiki-only commit is created,
+the agent should not automatically create the matching main-repository commit.
+It should ask the user whether the current `CRIEW` repository also needs a commit that updates the pinned `docs/wiki` submodule pointer.

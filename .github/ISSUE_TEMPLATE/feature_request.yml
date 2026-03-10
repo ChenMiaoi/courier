@@ -17,7 +17,7 @@ body:
       options:
         - label: I searched the existing issues
           required: true
-        - label: I checked whether the current README or docs already cover this workflow
+        - label: I checked whether the current wiki or README docs already cover this workflow
           required: true
   - type: textarea
     id: summary

@@ -12,6 +12,9 @@
 # Required to customize DB location. Default: ~/.criew/db/criew.db
 database = "./.criew/db/criew.db"
 
+# Required to customize raw mail cache location. Default: ~/.criew/mail/raw
+# raw_mail_dir = "./.criew/mail/raw"
+
 # Required to customize patch file location. Default: ~/.criew/patches
 patch_dir = "./.criew/patches"
 
@@ -28,6 +31,8 @@ filter = "info"
 [source]
 # Optional default lore mailbox used by CLI `sync` when no mailbox is passed.
 # Default: linux-kernel
+# Historical compatibility alias: [imap].mailbox still maps to the same value,
+# but new config should prefer [source].mailbox.
 # mailbox = "linux-kernel"
 
 # Optional lore base URL.

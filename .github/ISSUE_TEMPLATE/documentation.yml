@@ -22,7 +22,7 @@ body:
     attributes:
       label: Affected document
       description: Which file, page, or section is involved?
-      placeholder: README.md, README-zh.md, docs/config.example.toml, ...
+      placeholder: wiki/Contribution, README.md, README-zh.md, docs/reference/config.example.toml, ...
     validations:
       required: true
   - type: textarea

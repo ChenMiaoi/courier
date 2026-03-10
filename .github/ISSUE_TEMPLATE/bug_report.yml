@@ -17,7 +17,7 @@ body:
       options:
         - label: I searched the existing issues
           required: true
-        - label: I checked the current README or README-zh
+        - label: I checked the current wiki, README, or README-zh
           required: true
   - type: textarea
     id: summary

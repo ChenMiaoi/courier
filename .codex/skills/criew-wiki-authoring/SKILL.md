@@ -47,6 +47,7 @@ Keep the source compatible with both GitHub wiki rendering and the local Pages b
 - The lint script requires `autocorrect`. If it is missing, the script downloads a local copy into `target/wiki-venv/bin/` and then reruns the check.
 - Treat a clean `./scripts/wiki-lint.sh` result as part of done for every wiki page this skill creates or edits.
 - Because `docs/wiki` is a submodule, the main repository deploys the pinned wiki commit, not the remote wiki repository's latest HEAD. A new wiki commit reaches GitHub Pages only after the CRIEW repository updates the `docs/wiki` submodule pointer.
+- If you commit inside `docs/wiki`, explicitly ask the user whether the main `CRIEW` repository should also commit the updated `docs/wiki` submodule pointer. Do not assume they want both commits automatically.
 
 6. Draft in kernel-documentation style.
 - Lead with scope and purpose.
