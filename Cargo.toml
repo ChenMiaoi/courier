@@ -36,6 +36,12 @@ include = [
 members = ["xtask"]
 resolver = "3"
 
+[package.metadata.docs.rs]
+# CRIEW is Linux-first, so keep docs.rs on the supported target instead of
+# asking it to fan out across every tier-one platform.
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
+
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
