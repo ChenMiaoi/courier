@@ -64,9 +64,25 @@ filter = "info"
 # Supported:
 #   "default" (j/l focus, i/k move)
 #   "vim" (h/l focus, j/k move, gg/G jump, qq quit)
-#   "custom" (header shows custom; navigation currently falls back to default bindings)
+#   "custom" (ui.keymap_base plus ui.custom_keymap overrides)
 # Default: "default"
 # keymap = "default"
+
+# Optional. Base preset used when keymap = "custom".
+# Supported: "default", "vim"
+# Default: inferred from ui.keymap when omitted
+# keymap_base = "default"
+
+# Optional. Custom main-page bindings.
+# Each value is an array of 1-2 printable keys.
+# [ui.custom_keymap]
+# focus_prev = ["j"]
+# focus_next = ["l"]
+# move_up = ["i"]
+# move_down = ["k"]
+# jump_top = ["g", "g"]
+# jump_bottom = ["G"]
+# quick_quit = ["q", "q"]
 
 # Optional. Seconds between `My Inbox` background auto-sync runs while TUI stays open.
 # Must be greater than 0. Default: 30

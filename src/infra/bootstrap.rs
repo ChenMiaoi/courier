@@ -144,6 +144,8 @@ mod tests {
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
             ui_keymap: UiKeymap::Default,
+            ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
+            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs: DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
             kernel_trees: Vec::new(),
         }

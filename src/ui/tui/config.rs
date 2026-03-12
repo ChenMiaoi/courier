@@ -15,9 +15,9 @@ use super::palette::PaletteCompletionContext;
 use super::render::{centered_rect, truncate_with_ellipsis};
 use super::*;
 
-struct ConfigFileUpdate {
-    rendered_value: String,
-    runtime: RuntimeConfig,
+pub(super) struct ConfigFileUpdate {
+    pub(super) rendered_value: String,
+    pub(super) runtime: RuntimeConfig,
 }
 
 impl AppState {
@@ -330,7 +330,7 @@ fn read_config_key_from_file(
     Ok(lookup_config_key(&table, key).cloned())
 }
 
-fn update_config_key_in_file(
+pub(super) fn update_config_key_in_file(
     config_path: &Path,
     key: &str,
     value_literal: &str,
@@ -354,7 +354,7 @@ fn update_config_key_in_file(
     })
 }
 
-fn remove_config_key_from_file(
+pub(super) fn remove_config_key_from_file(
     config_path: &Path,
     key: &str,
 ) -> std::result::Result<Option<RuntimeConfig>, String> {
@@ -532,7 +532,7 @@ fn config_editor_field_index(key: &str) -> Option<usize> {
         .position(|field| field.key.eq_ignore_ascii_case(key))
 }
 
-fn apply_runtime_update(state: &mut AppState, runtime: RuntimeConfig) {
+pub(super) fn apply_runtime_update(state: &mut AppState, runtime: RuntimeConfig) {
     let old_inbox_auto_sync_interval_secs = state.runtime.inbox_auto_sync_interval_secs;
     let selected_path_hint = state.selected_kernel_tree_path();
     let enabled_mailboxes: HashSet<String> = state.enabled_mailboxes().into_iter().collect();
@@ -540,6 +540,7 @@ fn apply_runtime_update(state: &mut AppState, runtime: RuntimeConfig) {
     // Preserve current UI intent across config reloads so editing one setting
     // does not unexpectedly wipe mailbox enablement or the active tree focus.
     state.runtime = runtime;
+    state.rebuild_main_page_keymap();
     state.ui_state_path = ui_state::path_for_data_dir(&state.runtime.data_dir);
     state.subscriptions = default_subscriptions(
         &state.runtime,
@@ -611,6 +612,7 @@ fn effective_config_value(state: &AppState, key: &str) -> Option<String> {
         "source.lore_base_url" => Some(state.runtime.lore_base_url.clone()),
         "ui.startup_sync" => Some(state.runtime.startup_sync.to_string()),
         "ui.keymap" => Some(state.runtime.ui_keymap.as_str().to_string()),
+        "ui.keymap_base" => Some(state.runtime.ui_keymap_base.as_str().to_string()),
         "ui.inbox_auto_sync_interval_secs" => {
             Some(state.runtime.inbox_auto_sync_interval_secs.to_string())
         }
@@ -830,7 +832,17 @@ fn config_value_suggestions(state: &AppState, key: Option<&String>) -> Vec<Palet
         "ui.keymap" => [
             ("default", "j/l focus, i/k move"),
             ("vim", "h/l focus, j/k move, gg/G jump, qq quit"),
-            ("custom", "custom label with default navigation fallback"),
+            ("custom", "ui.keymap_base plus ui.custom_keymap overrides"),
+        ]
+        .iter()
+        .map(|(value, description)| PaletteSuggestion {
+            value: (*value).to_string(),
+            description: Some((*description).to_string()),
+        })
+        .collect(),
+        "ui.keymap_base" => [
+            ("default", "j/l focus, i/k move"),
+            ("vim", "h/l focus, j/k move, gg/G jump, qq quit"),
         ]
         .iter()
         .map(|(value, description)| PaletteSuggestion {

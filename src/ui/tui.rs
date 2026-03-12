@@ -22,7 +22,7 @@ use crate::domain::subscriptions::{
     DEFAULT_SUBSCRIPTIONS, SubscriptionCategory, category_for_mailbox,
 };
 use crate::infra::bootstrap::BootstrapState;
-use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig, UiKeymap};
+use crate::infra::config::{IMAP_INBOX_MAILBOX, RuntimeConfig};
 use crate::infra::error::{CriewError, ErrorCode, Result};
 use crate::infra::mail_store::{self, ThreadRow};
 use crate::infra::reply_store::{self, ReplySendRecordRequest, ReplySendStatus};
@@ -41,6 +41,7 @@ use ratatui::widgets::{Block, Borders};
 
 mod config;
 mod input;
+mod keymap;
 mod palette;
 mod preview;
 mod render;
@@ -49,6 +50,11 @@ mod reply;
 mod tests;
 
 use input::{LoopAction, handle_key_event};
+use keymap::{
+    KeymapEditorState, PendingMainPageSequenceState, ResolvedMainPageKeymap, draw_keymap_editor,
+    handle_keymap_editor_key_event, handle_main_page_key_event, main_page_focus_shortcuts,
+    main_page_move_shortcuts, main_page_navigation_shortcuts, resolve_active_main_page_keymap,
+};
 use palette::short_commit_id;
 #[cfg(test)]
 use palette::{is_palette_open_shortcut, is_palette_toggle, resolve_palette_local_workdir};
@@ -196,6 +202,10 @@ const PALETTE_COMMANDS: &[PaletteCommand] = &[
         description: "Open visual config editor or update runtime config",
     },
     PaletteCommand {
+        name: "keymap",
+        description: "Open visual keymap editor for main-page navigation",
+    },
+    PaletteCommand {
         name: "vim",
         description: "Open selected source file in external vim",
     },
@@ -233,6 +243,7 @@ const CONFIG_GET_KEYS: &[&str] = &[
     "source.lore_base_url",
     "ui.startup_sync",
     "ui.keymap",
+    "ui.keymap_base",
     "ui.inbox_auto_sync_interval_secs",
     "kernel.tree",
     "kernel.trees",
@@ -257,6 +268,7 @@ const CONFIG_SET_KEYS: &[&str] = &[
     "source.lore_base_url",
     "ui.startup_sync",
     "ui.keymap",
+    "ui.keymap_base",
     "ui.inbox_auto_sync_interval_secs",
     "kernel.tree",
     "kernel.trees",
@@ -276,7 +288,7 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
     },
     ConfigEditorField {
         key: "ui.keymap",
-        description: "Main-page navigation scheme. default=j/l+i/k+count, vim=h/l+j/k+count+gg/G+qq, custom=default fallback with custom label.",
+        description: "Main-page navigation scheme. default=j/l+i/k+count, vim=h/l+j/k+count+gg/G+qq, custom=ui.keymap_base plus ui.custom_keymap overrides.",
     },
     ConfigEditorField {
         key: "ui.inbox_auto_sync_interval_secs",
@@ -350,28 +362,6 @@ const CONFIG_EDITOR_FIELDS: &[ConfigEditorField] = &[
 const CODE_EDIT_ENTRY_HINT: &str = "select a source file in Source pane, then press e";
 const EXTERNAL_EDITOR_ENTRY_HINT: &str = "select a source file in Source pane, then press E";
 
-fn main_page_focus_shortcuts(keymap: UiKeymap) -> &'static str {
-    match keymap {
-        UiKeymap::Default | UiKeymap::Custom => "j/l",
-        UiKeymap::Vim => "h/l",
-    }
-}
-
-fn main_page_move_shortcuts(keymap: UiKeymap) -> &'static str {
-    match keymap {
-        UiKeymap::Default | UiKeymap::Custom => "i/k",
-        UiKeymap::Vim => "j/k",
-    }
-}
-
-fn main_page_navigation_shortcuts(keymap: UiKeymap) -> String {
-    format!(
-        "{} focus | {} move",
-        main_page_focus_shortcuts(keymap),
-        main_page_move_shortcuts(keymap)
-    )
-}
-
 fn shrink_mail_pane_width(width: &mut u16, minimum_width: u16) -> bool {
     if *width <= minimum_width {
         return false;
@@ -394,20 +384,6 @@ type ExternalEditorRunner =
 type ReplyIdentityResolver = fn() -> std::result::Result<ReplyIdentity, String>;
 type ReplySendExecutor = fn(&RuntimeConfig, &SendRequest) -> SendOutcome;
 type MailboxSyncSpawner = fn(RuntimeConfig, Vec<String>) -> Receiver<StartupSyncEvent>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingMainPageChord {
-    VimGoToFirstLine,
-    VimQuit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingMainPageChordState {
-    chord: PendingMainPageChord,
-    ui_page: UiPage,
-    focus: Pane,
-    code_focus: CodePaneFocus,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PendingMainPageCountState {
@@ -1307,6 +1283,7 @@ struct AppState {
     palette: CommandPaletteState,
     search: SearchState,
     config_editor: ConfigEditorState,
+    keymap_editor: KeymapEditorState,
     external_editor_runner: ExternalEditorRunner,
     reply_identity_resolver: ReplyIdentityResolver,
     reply_send_executor: ReplySendExecutor,
@@ -1317,7 +1294,8 @@ struct AppState {
     inbox_auto_sync: Option<InboxAutoSyncState>,
     manual_sync: Option<ManualSyncState>,
     subscription_auto_sync: Option<SubscriptionAutoSyncState>,
-    pending_main_page_chord: Option<PendingMainPageChordState>,
+    main_page_keymap: ResolvedMainPageKeymap,
+    pending_main_page_sequence: Option<PendingMainPageSequenceState>,
     pending_main_page_count: Option<PendingMainPageCountState>,
 }
 
@@ -1364,6 +1342,7 @@ impl AppState {
         let kernel_tree_expanded_paths = default_kernel_tree_expanded_paths(&runtime.kernel_trees);
         let kernel_tree_rows =
             build_kernel_tree_rows(&runtime.kernel_trees, &kernel_tree_expanded_paths);
+        let main_page_keymap = resolve_active_main_page_keymap(&runtime);
         let mut state = Self {
             active_thread_mailbox,
             runtime,
@@ -1426,6 +1405,7 @@ impl AppState {
             palette: CommandPaletteState::default(),
             search: SearchState::default(),
             config_editor: ConfigEditorState::default(),
+            keymap_editor: KeymapEditorState::default(),
             external_editor_runner: run_external_editor_session,
             reply_identity_resolver: resolve_git_reply_identity,
             reply_send_executor: send_reply_message,
@@ -1436,7 +1416,8 @@ impl AppState {
             inbox_auto_sync: None,
             manual_sync: None,
             subscription_auto_sync: None,
-            pending_main_page_chord: None,
+            main_page_keymap,
+            pending_main_page_sequence: None,
             pending_main_page_count: None,
         };
         if state.runtime.imap.is_complete() {
@@ -3979,18 +3960,6 @@ impl AppState {
         }
     }
 
-    fn pending_main_page_chord_state(
-        &self,
-        chord: PendingMainPageChord,
-    ) -> PendingMainPageChordState {
-        PendingMainPageChordState {
-            chord,
-            ui_page: self.ui_page,
-            focus: self.focus,
-            code_focus: self.code_focus,
-        }
-    }
-
     fn pending_main_page_count_state(&self, count: u16) -> PendingMainPageCountState {
         PendingMainPageCountState {
             count,
@@ -4001,7 +3970,7 @@ impl AppState {
     }
 
     fn clear_pending_main_page_inputs(&mut self) {
-        self.pending_main_page_chord = None;
+        self.pending_main_page_sequence = None;
         self.pending_main_page_count = None;
     }
 

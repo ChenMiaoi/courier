@@ -161,7 +161,7 @@ pub(super) fn draw(
         }
         UiPage::Mail => format!(
             "/ search | Tab page | : palette | Enter | e/r reply | [ ] expand pane | {{ }} shrink pane | {}",
-            main_page_navigation_shortcuts(state.runtime.ui_keymap)
+            main_page_navigation_shortcuts(&state.main_page_keymap)
         ),
         UiPage::CodeBrowser if state.is_code_edit_active() => {
             "Esc normal/exit | h/j/k/l move | i insert | x delete | s save | E external vim | :w :q :q! :wq :vim".to_string()
@@ -172,7 +172,7 @@ pub(super) fn draw(
         }
         UiPage::CodeBrowser => format!(
             "Tab page | : palette | Enter expand/collapse | e inline edit | E external vim | {}",
-            main_page_navigation_shortcuts(state.runtime.ui_keymap)
+            main_page_navigation_shortcuts(&state.main_page_keymap)
         ),
     };
     let footer_background =
@@ -207,6 +207,9 @@ pub(super) fn draw(
     }
     if state.config_editor.open {
         draw_config_editor(frame, state);
+    }
+    if state.keymap_editor.open {
+        draw_keymap_editor(frame, state);
     }
     if state.reply_panel.is_some() {
         draw_reply_panel(frame, state);

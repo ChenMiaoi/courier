@@ -158,6 +158,8 @@ fn test_runtime_in(root: PathBuf) -> RuntimeConfig {
         lore_base_url: "https://lore.kernel.org".to_string(),
         startup_sync: true,
         ui_keymap: UiKeymap::Default,
+        ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
+        ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
         inbox_auto_sync_interval_secs: crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
         kernel_trees: Vec::new(),
     }
@@ -629,14 +631,15 @@ fn type_text(state: &mut AppState, text: &str) {
 #[test]
 fn empty_query_returns_all_palette_commands() {
     let all = matching_commands("");
-    assert_eq!(all.len(), 7);
+    assert_eq!(all.len(), 8);
     assert_eq!(all[0].name, "config");
     assert_eq!(all[1].name, "exit");
     assert_eq!(all[2].name, "help");
-    assert_eq!(all[3].name, "quit");
-    assert_eq!(all[4].name, "restart");
-    assert_eq!(all[5].name, "sync");
-    assert_eq!(all[6].name, "vim");
+    assert_eq!(all[3].name, "keymap");
+    assert_eq!(all[4].name, "quit");
+    assert_eq!(all[5].name, "restart");
+    assert_eq!(all[6].name, "sync");
+    assert_eq!(all[7].name, "vim");
 }
 
 #[test]
@@ -894,6 +897,22 @@ fn command_palette_help_uses_vim_keymap_labels() {
 }
 
 #[test]
+fn keymap_palette_command_opens_keymap_editor() {
+    let mut state = AppState::new(vec![], test_runtime());
+    state.palette.open = true;
+    state.palette.input = "keymap".to_string();
+
+    let action = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(action, LoopAction::Continue));
+    assert!(state.keymap_editor.open);
+    assert!(!state.palette.open);
+    assert_eq!(state.status, "keymap editor opened");
+}
+
+#[test]
 fn config_palette_get_and_set_roundtrip() {
     let root = temp_dir("palette-config");
     let config_path = root.join("criew-config.toml");
@@ -999,6 +1018,228 @@ keymap = "default"
     assert!(!rendered.contains("j/l focus | i/k move"));
     assert!(!rendered.contains("gg/G jump"));
     assert!(!rendered.contains("qq quit"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn keymap_editor_custom_binding_updates_navigation_immediately() {
+    let root = temp_dir("keymap-editor-custom");
+    let config_path = root.join("criew-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+keymap = "custom"
+keymap_base = "default"
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    runtime.ui_keymap = UiKeymap::Custom;
+    let mut state = AppState::new(
+        vec![
+            sample_thread("t0", "a@example.com", 0),
+            sample_thread("t1", "b@example.com", 1),
+        ],
+        runtime,
+    );
+
+    state.palette.open = true;
+    state.palette.input = "keymap".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.keymap_editor.open);
+
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(matches!(
+        state.keymap_editor.mode,
+        super::keymap::KeymapEditorMode::Capture
+    ));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    );
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+
+    assert!(matches!(
+        state.keymap_editor.mode,
+        super::keymap::KeymapEditorMode::Browse
+    ));
+    assert_eq!(
+        state.runtime.ui_custom_keymap.focus_prev,
+        Some(vec!["h".to_string()])
+    );
+
+    let persisted = fs::read_to_string(&config_path).expect("read config file");
+    assert!(persisted.contains("focus_prev = [\"h\"]"));
+
+    state.keymap_editor.open = false;
+    state.focus = Pane::Threads;
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Subscriptions));
+
+    state.focus = Pane::Threads;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn custom_bindings_do_not_leak_into_default_or_vim_schemes() {
+    let root = temp_dir("keymap-scheme-isolation");
+    let config_path = root.join("criew-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+keymap = "default"
+keymap_base = "default"
+
+[ui.custom_keymap]
+focus_prev = ["x"]
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path.clone();
+    let mut state = AppState::new(
+        vec![
+            sample_thread("t0", "a@example.com", 0),
+            sample_thread("t1", "b@example.com", 1),
+        ],
+        runtime,
+    );
+    state.palette.open = true;
+    state.palette.input = "keymap".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.keymap_editor.open);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    assert_eq!(state.runtime.ui_keymap, UiKeymap::Vim);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    state.focus = Pane::Threads;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Subscriptions));
+
+    state.palette.open = true;
+    state.palette.input = "keymap".to_string();
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    );
+    assert!(state.keymap_editor.open);
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    assert_eq!(state.runtime.ui_keymap, UiKeymap::Custom);
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    assert_eq!(state.runtime.ui_keymap, UiKeymap::Default);
+    let _ = handle_key_event(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+    state.focus = Pane::Threads;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Threads));
+
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+    );
+    assert!(matches!(state.focus, Pane::Subscriptions));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn keymap_editor_lists_active_bindings_for_selected_scheme() {
+    let root = temp_dir("keymap-editor-active-bindings");
+    let config_path = root.join("criew-config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[ui]
+keymap = "default"
+keymap_base = "default"
+
+[ui.custom_keymap]
+focus_prev = ["x"]
+"#,
+    )
+    .expect("write config file");
+
+    let mut runtime = test_runtime();
+    runtime.config_path = config_path;
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.open_keymap_editor();
+    state.keymap_editor.selected_field = 2;
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw default keymap editor");
+    let rendered_default = format!("{}", terminal.backend());
+    assert!(rendered_default.contains("j [default]"));
+
+    state.keymap_editor.selected_field = 0;
+    let _ = handle_key_event(
+        &mut state,
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+    );
+    state.keymap_editor.selected_field = 2;
+    let runtime_vim = state.runtime.clone();
+    let bootstrap_vim = test_bootstrap(&runtime_vim);
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime_vim, &bootstrap_vim))
+        .expect("draw vim keymap editor");
+    let rendered_vim = format!("{}", terminal.backend());
+    assert!(rendered_vim.contains("h [vim]"));
 
     let _ = fs::remove_dir_all(root);
 }

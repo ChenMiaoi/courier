@@ -19,63 +19,8 @@ pub(super) enum LoopAction {
     Restart,
 }
 
-fn pending_main_page_move_count(state: &mut AppState) -> u16 {
+pub(super) fn pending_main_page_move_count(state: &mut AppState) -> u16 {
     state.take_pending_main_page_count().unwrap_or(1)
-}
-
-fn handle_main_page_navigation_key(state: &mut AppState, key: KeyEvent) -> bool {
-    match state.runtime.ui_keymap {
-        UiKeymap::Default | UiKeymap::Custom => match key.code {
-            KeyCode::Char('j') => {
-                state.clear_pending_main_page_count();
-                state.move_focus_previous();
-                true
-            }
-            KeyCode::Char('l') => {
-                state.clear_pending_main_page_count();
-                state.move_focus_next();
-                true
-            }
-            KeyCode::Char('i') => {
-                for _ in 0..pending_main_page_move_count(state) {
-                    state.move_up();
-                }
-                true
-            }
-            KeyCode::Char('k') => {
-                for _ in 0..pending_main_page_move_count(state) {
-                    state.move_down();
-                }
-                true
-            }
-            _ => false,
-        },
-        UiKeymap::Vim => match key.code {
-            KeyCode::Char('h') => {
-                state.clear_pending_main_page_count();
-                state.move_focus_previous();
-                true
-            }
-            KeyCode::Char('l') => {
-                state.clear_pending_main_page_count();
-                state.move_focus_next();
-                true
-            }
-            KeyCode::Char('k') => {
-                for _ in 0..pending_main_page_move_count(state) {
-                    state.move_up();
-                }
-                true
-            }
-            KeyCode::Char('j') => {
-                for _ in 0..pending_main_page_move_count(state) {
-                    state.move_down();
-                }
-                true
-            }
-            _ => false,
-        },
-    }
 }
 
 fn handle_main_page_count_prefix(state: &mut AppState, key: KeyEvent) -> bool {
@@ -104,61 +49,6 @@ fn handle_main_page_count_prefix(state: &mut AppState, key: KeyEvent) -> bool {
     true
 }
 
-fn handle_vim_main_page_chord(state: &mut AppState, key: KeyEvent) -> Option<LoopAction> {
-    if !matches!(state.runtime.ui_keymap, UiKeymap::Vim) {
-        state.pending_main_page_chord = None;
-        return None;
-    }
-
-    if key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        state.clear_pending_main_page_inputs();
-        return None;
-    }
-
-    if let Some(pending_state) = state.pending_main_page_chord.take() {
-        let same_scope = pending_state.ui_page == state.ui_page
-            && pending_state.focus == state.focus
-            && pending_state.code_focus == state.code_focus;
-        if same_scope {
-            match (pending_state.chord, key.code) {
-                (PendingMainPageChord::VimGoToFirstLine, KeyCode::Char('g')) => {
-                    state.jump_current_pane_to_start();
-                    return Some(LoopAction::Continue);
-                }
-                (PendingMainPageChord::VimQuit, KeyCode::Char('q')) => {
-                    return Some(LoopAction::Exit);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    match key.code {
-        KeyCode::Char('g') => {
-            state.clear_pending_main_page_count();
-            state.pending_main_page_chord =
-                Some(state.pending_main_page_chord_state(PendingMainPageChord::VimGoToFirstLine));
-            Some(LoopAction::Continue)
-        }
-        KeyCode::Char('G') => {
-            state.clear_pending_main_page_count();
-            state.jump_current_pane_to_end();
-            Some(LoopAction::Continue)
-        }
-        KeyCode::Char('q') => {
-            state.clear_pending_main_page_count();
-            state.pending_main_page_chord =
-                Some(state.pending_main_page_chord_state(PendingMainPageChord::VimQuit));
-            state.status = "press qq to quit or use command palette quit/exit".to_string();
-            Some(LoopAction::Continue)
-        }
-        _ => None,
-    }
-}
-
 pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
     tracing::debug!(
         key = ?key,
@@ -167,6 +57,7 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         code_focus = ?state.code_focus,
         code_edit_mode = ?state.code_edit_mode,
         config_editor_open = state.config_editor.open,
+        keymap_editor_open = state.keymap_editor.open,
         palette_open = state.palette.open,
         search_active = state.search.active,
         "user key event"
@@ -177,6 +68,11 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     if state.config_editor.open {
         state.clear_pending_main_page_inputs();
         return handle_config_editor_key_event(state, key);
+    }
+
+    if state.keymap_editor.open {
+        state.clear_pending_main_page_inputs();
+        return handle_keymap_editor_key_event(state, key);
     }
 
     if state.palette.open {
@@ -203,21 +99,17 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         return handle_code_edit_key_event(state, key);
     }
 
-    if let Some(action) = handle_vim_main_page_chord(state, key) {
-        return action;
-    }
-
-    if handle_main_page_count_prefix(state, key) {
-        return LoopAction::Continue;
-    }
-
     if is_palette_open_shortcut(key) {
-        state.clear_pending_main_page_count();
+        state.clear_pending_main_page_inputs();
         state.toggle_palette();
         return LoopAction::Continue;
     }
 
-    if handle_main_page_navigation_key(state, key) {
+    if let Some(action) = handle_main_page_key_event(state, key) {
+        return action;
+    }
+
+    if handle_main_page_count_prefix(state, key) {
         return LoopAction::Continue;
     }
 
@@ -726,9 +618,9 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "restart" => return LoopAction::Restart,
                 "help" => {
                     state.status = format!(
-                        "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
-                        main_page_focus_shortcuts(state.runtime.ui_keymap),
-                        main_page_move_shortcuts(state.runtime.ui_keymap)
+                        "commands: quit, exit, restart, help, sync [mailbox], config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
+                        main_page_focus_shortcuts(&state.main_page_keymap),
+                        main_page_move_shortcuts(&state.main_page_keymap)
                     );
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
@@ -737,6 +629,9 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 }
                 value if value.split_whitespace().next() == Some("config") => {
                     run_palette_config(state, value);
+                }
+                "keymap" => {
+                    state.open_keymap_editor();
                 }
                 "vim" => {
                     state.open_external_editor();
