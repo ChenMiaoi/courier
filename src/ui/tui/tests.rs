@@ -4634,6 +4634,23 @@ fn header_shows_custom_keymap_scheme_when_configured() {
 }
 
 #[test]
+fn header_formats_uptime_with_clock_units() {
+    let runtime = test_runtime();
+    let bootstrap = test_bootstrap(&runtime);
+    let mut state = AppState::new(vec![], runtime.clone());
+    state.started_at = Instant::now() - Duration::from_secs(61);
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 35)).expect("create test terminal");
+    terminal
+        .draw(|frame| draw(frame, &state, &runtime, &bootstrap))
+        .expect("draw formatted uptime header");
+    let rendered = format!("{}", terminal.backend());
+
+    assert!(rendered.contains("up 01m:"));
+    assert!(!rendered.contains("up 61s"));
+}
+
+#[test]
 fn startup_sync_progress_bar_renders_at_right_edge_of_header() {
     let runtime = test_runtime_in(PathBuf::from("/t"));
     let bootstrap = test_bootstrap(&runtime);

@@ -46,7 +46,7 @@ pub(super) fn draw(
         ])
         .split(frame.area());
 
-    let uptime = state.started_at.elapsed().as_secs();
+    let uptime_label = format_uptime_label(state.started_at.elapsed().as_secs());
     let sync_progress_text = state
         .background_sync_progress_text()
         .map(|value| sanitize_inline_ui_text(&value));
@@ -106,7 +106,7 @@ pub(super) fn draw(
         ),
         Span::styled(" | ", Style::default().fg(Color::White).bg(HEADER_BG)),
         Span::styled(
-            format!("up {}s", uptime),
+            format!("up {uptime_label}"),
             Style::default()
                 .fg(Color::White)
                 .bg(HEADER_BG)
@@ -214,6 +214,20 @@ pub(super) fn draw(
     if state.reply_panel.is_some() {
         draw_reply_panel(frame, state);
     }
+}
+
+fn format_uptime_label(uptime_secs: u64) -> String {
+    let hours = uptime_secs / 3_600;
+    let minutes = (uptime_secs % 3_600) / 60;
+    let seconds = uptime_secs % 60;
+
+    if hours > 0 {
+        return format!("{hours:02}h:{minutes:02}m:{seconds:02}s");
+    }
+    if minutes > 0 {
+        return format!("{minutes:02}m:{seconds:02}s");
+    }
+    format!("{seconds}s")
 }
 
 fn footer_status_text(status: &str) -> Option<String> {
@@ -1593,4 +1607,16 @@ pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
         .split(vertical[1]);
 
     horizontal[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_uptime_label;
+
+    #[test]
+    fn uptime_label_uses_the_largest_needed_unit() {
+        assert_eq!(format_uptime_label(59), "59s");
+        assert_eq!(format_uptime_label(61), "01m:01s");
+        assert_eq!(format_uptime_label(3_661), "01h:01m:01s");
+    }
 }
