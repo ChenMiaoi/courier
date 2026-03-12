@@ -43,6 +43,10 @@ patch apply、
 - [贡献流程](https://github.com/ChenMiaoi/CRIEW/wiki/Contribution)
 - [docs.rs API 文档](https://docs.rs/criew/)
 
+## 当前版本
+
+当前源码版本和发布 tag 为 `v0.0.2`。
+
 ## 发布基线
 
 `v0.0.1` 是 CRIEW 第一版对外支持的发布基线。

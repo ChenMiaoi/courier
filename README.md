@@ -45,6 +45,10 @@ or reply sending.
 - [Contribution](https://github.com/ChenMiaoi/CRIEW/wiki/Contribution)
 - [API docs on docs.rs](https://docs.rs/criew/)
 
+## Current Release
+
+The current source version and release tag are `v0.0.2`.
+
 ## Release Baseline
 
 `v0.0.1` is the first supported public baseline for CRIEW.
