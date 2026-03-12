@@ -17,10 +17,17 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use super::config::draw_config_editor;
 use super::palette::palette_overlay_suggestions;
+use super::reply::ReplyPreviewLineKind;
 use super::*;
 
 const REPLY_BODY_GUIDE_COLUMN: usize = 80;
 const HEADER_BG: Color = Color::Blue;
+
+#[derive(Clone, Copy)]
+enum VerticalScrollWrapMode {
+    Disabled,
+    Enabled,
+}
 
 pub(super) fn draw(
     frame: &mut Frame<'_>,
@@ -39,8 +46,25 @@ pub(super) fn draw(
         ])
         .split(frame.area());
 
-    let uptime = state.started_at.elapsed().as_secs();
-    let mut header = vec![
+    let uptime_label = format_uptime_label(state.started_at.elapsed().as_secs());
+    let sync_progress_text = state
+        .background_sync_progress_text()
+        .map(|value| sanitize_inline_ui_text(&value));
+    let header_sections = if let Some(progress_text) = sync_progress_text.as_ref() {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(progress_text.chars().count().min(64) as u16 + 1),
+            ])
+            .split(areas[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1)])
+            .split(areas[0])
+    };
+    let header = vec![
         Span::styled(
             " CRIEW ",
             Style::default()
@@ -74,32 +98,37 @@ pub(super) fn draw(
         ),
         Span::styled(" | ", Style::default().fg(Color::White).bg(HEADER_BG)),
         Span::styled(
-            format!("up {}s", uptime),
+            format!("keymap {}", state.runtime.ui_keymap.as_str()),
+            Style::default()
+                .fg(Color::White)
+                .bg(HEADER_BG)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(" | ", Style::default().fg(Color::White).bg(HEADER_BG)),
+        Span::styled(
+            format!("up {uptime_label}"),
             Style::default()
                 .fg(Color::White)
                 .bg(HEADER_BG)
                 .add_modifier(Modifier::DIM),
         ),
     ];
-    if let Some(sync) = state.startup_sync_progress_text() {
-        header.push(Span::styled(
-            " | ",
-            Style::default().fg(Color::White).bg(HEADER_BG),
-        ));
-        header.push(Span::styled(
-            sanitize_inline_ui_text(&sync),
-            Style::default()
-                .fg(Color::Yellow)
-                .bg(HEADER_BG)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
+    let header_background = Paragraph::new("").style(Style::default().bg(HEADER_BG));
+    frame.render_widget(header_background, areas[0]);
+
     let header_widget = Paragraph::new(Line::from(header)).style(Style::default().bg(HEADER_BG));
-    frame.render_widget(header_widget, areas[0]);
+    frame.render_widget(header_widget, header_sections[0]);
+
+    if let Some(progress_text) = sync_progress_text {
+        let progress = Paragraph::new(format!("{progress_text} "))
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(Color::Yellow).bg(HEADER_BG));
+        frame.render_widget(progress, header_sections[1]);
+    }
 
     match state.ui_page {
         UiPage::Mail => {
-            let panes = mail_page_panes(areas[1]);
+            let panes = mail_page_panes(areas[1], state.mail_pane_layout);
             draw_subscriptions(frame, panes[0], state);
             draw_threads(frame, panes[1], state);
             draw_preview(frame, panes[2], state, config);
@@ -116,24 +145,35 @@ pub(super) fn draw(
                 .as_ref()
                 .is_some_and(|panel| panel.preview_open)
             {
-                "j/k scroll preview | Enter/c confirm | Esc close | S send"
+                "j/k scroll preview | Enter/c confirm | Esc close | S send".to_string()
             } else if state
                 .reply_panel
                 .as_ref()
                 .is_some_and(|panel| panel.reply_notice.is_some())
             {
-                "Enter/Esc close notice | P preview | S send"
+                "Enter/Esc close notice | P preview | S send".to_string()
             } else {
-                "Esc normal/close | Enter/o open below+insert | h/j/k/l move | i insert | x delete | p send preview | S send | :preview :send :q :q!"
+                "Esc normal/close | Enter/o open below+insert | h/j/k/l move | i insert | x delete | p send preview | S send | :preview :send :q :q!".to_string()
             }
         }
-        UiPage::Mail => "/ search | Tab page | : palette | Enter | e/r reply",
+        UiPage::Mail if state.palette.open => {
+            "/ search | Tab page | : palette | Enter | e/r reply".to_string()
+        }
+        UiPage::Mail => format!(
+            "/ search | Tab page | : palette | Enter | e/r reply | [ ] expand pane | {{ }} shrink pane | {}",
+            main_page_navigation_shortcuts(&state.main_page_keymap)
+        ),
         UiPage::CodeBrowser if state.is_code_edit_active() => {
-            "Esc normal/exit | h/j/k/l move | i insert | x delete | s save | E external vim | :w :q :q! :wq :vim"
+            "Esc normal/exit | h/j/k/l move | i insert | x delete | s save | E external vim | :w :q :q! :wq :vim".to_string()
         }
-        UiPage::CodeBrowser => {
+        UiPage::CodeBrowser if state.palette.open => {
             "Tab page | : palette | Enter expand/collapse | e inline edit | E external vim"
+                .to_string()
         }
+        UiPage::CodeBrowser => format!(
+            "Tab page | : palette | Enter expand/collapse | e inline edit | E external vim | {}",
+            main_page_navigation_shortcuts(&state.main_page_keymap)
+        ),
     };
     let footer_background =
         Paragraph::new("").style(Style::default().fg(Color::White).bg(Color::DarkGray));
@@ -168,9 +208,26 @@ pub(super) fn draw(
     if state.config_editor.open {
         draw_config_editor(frame, state);
     }
+    if state.keymap_editor.open {
+        draw_keymap_editor(frame, state);
+    }
     if state.reply_panel.is_some() {
         draw_reply_panel(frame, state);
     }
+}
+
+fn format_uptime_label(uptime_secs: u64) -> String {
+    let hours = uptime_secs / 3_600;
+    let minutes = (uptime_secs % 3_600) / 60;
+    let seconds = uptime_secs % 60;
+
+    if hours > 0 {
+        return format!("{hours:02}h:{minutes:02}m:{seconds:02}s");
+    }
+    if minutes > 0 {
+        return format!("{minutes:02}m:{seconds:02}s");
+    }
+    format!("{seconds}s")
 }
 
 fn footer_status_text(status: &str) -> Option<String> {
@@ -200,12 +257,12 @@ fn draw_code_browser_page(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     draw_code_source_preview(frame, panes[1], state);
 }
 
-pub(super) fn mail_page_panes(area: Rect) -> [Rect; 3] {
+pub(super) fn mail_page_panes(area: Rect, layout: MailPaneLayout) -> [Rect; 3] {
     if area.width == 0 {
         return [area, area, area];
     }
 
-    let preview_width = area.width.min(PREVIEW_PANE_FIXED_WIDTH);
+    let preview_width = area.width.min(layout.preview_width);
     let left_width = area.width.saturating_sub(preview_width);
     let preview = Rect {
         x: area.x + left_width,
@@ -224,18 +281,22 @@ pub(super) fn mail_page_panes(area: Rect) -> [Rect; 3] {
         return [empty, empty, preview];
     }
 
-    let left = Rect {
+    let subscriptions_width = left_width.min(layout.subscriptions_width);
+    let threads_width = left_width.saturating_sub(subscriptions_width);
+    let subscriptions = Rect {
         x: area.x,
         y: area.y,
-        width: left_width,
+        width: subscriptions_width,
         height: area.height,
     };
-    let left_panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 4), Constraint::Ratio(3, 4)])
-        .split(left);
+    let threads = Rect {
+        x: area.x + subscriptions_width,
+        y: area.y,
+        width: threads_width,
+        height: area.height,
+    };
 
-    [left_panes[0], left_panes[1], preview]
+    [subscriptions, threads, preview]
 }
 
 fn draw_subscriptions(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -322,8 +383,24 @@ fn draw_code_source_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState)
     frame.render_widget(block, area);
     frame.render_widget(Clear, inner_area);
 
-    let paragraph =
-        Paragraph::new(load_code_source_preview(state)).scroll((state.code_preview_scroll, 0));
+    let preview = load_code_source_preview(state);
+    let code_preview_scroll_limit = max_vertical_scroll(
+        &preview,
+        inner_area.width,
+        inner_area.height,
+        VerticalScrollWrapMode::Disabled,
+    );
+    state
+        .code_preview_scroll_limit
+        .set(code_preview_scroll_limit);
+    let scroll = clamp_vertical_scroll(
+        &preview,
+        inner_area.width,
+        inner_area.height,
+        state.code_preview_scroll,
+        VerticalScrollWrapMode::Disabled,
+    );
+    let paragraph = Paragraph::new(preview).scroll((scroll, 0));
     frame.render_widget(paragraph, inner_area);
 
     if let Some(cursor_position) = code_edit_cursor_position(state, inner_area) {
@@ -533,11 +610,83 @@ fn draw_preview(frame: &mut Frame<'_>, area: Rect, state: &AppState, config: &Ru
         inner_area
     };
 
+    let preview_scroll_limit = max_vertical_scroll(
+        preview.as_ref(),
+        content_area.width,
+        content_area.height,
+        VerticalScrollWrapMode::Enabled,
+    );
+    state.preview_scroll_limit.set(preview_scroll_limit);
+    let scroll = clamp_vertical_scroll(
+        preview.as_ref(),
+        content_area.width,
+        content_area.height,
+        state.preview_scroll,
+        VerticalScrollWrapMode::Enabled,
+    );
     let paragraph = Paragraph::new(preview.as_ref())
-        .scroll((state.preview_scroll, 0))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, content_area);
+}
+
+fn clamp_vertical_scroll(
+    text: &str,
+    area_width: u16,
+    area_height: u16,
+    requested_scroll: u16,
+    wrap_mode: VerticalScrollWrapMode,
+) -> u16 {
+    requested_scroll.min(max_vertical_scroll(
+        text,
+        area_width,
+        area_height,
+        wrap_mode,
+    ))
+}
+
+fn max_vertical_scroll(
+    text: &str,
+    area_width: u16,
+    area_height: u16,
+    wrap_mode: VerticalScrollWrapMode,
+) -> u16 {
+    if area_height == 0 {
+        return 0;
+    }
+
+    let visible_lines = area_height as usize;
+    let total_lines = visual_line_count(text, area_width, wrap_mode);
+    total_lines
+        .saturating_sub(visible_lines)
+        .min(u16::MAX as usize) as u16
+}
+
+fn visual_line_count(text: &str, area_width: u16, wrap_mode: VerticalScrollWrapMode) -> usize {
+    match wrap_mode {
+        VerticalScrollWrapMode::Disabled => text.split('\n').count().max(1),
+        VerticalScrollWrapMode::Enabled => {
+            if area_width == 0 {
+                return 0;
+            }
+
+            text.split('\n')
+                .map(|line| wrapped_visual_line_count(line, area_width))
+                .sum::<usize>()
+                .max(1)
+        }
+    }
+}
+
+fn wrapped_visual_line_count(line: &str, area_width: u16) -> usize {
+    if area_width == 0 {
+        return 0;
+    }
+
+    let width = area_width as usize;
+    let display_width = display_column(line, line.chars().count()).max(1);
+    display_width.saturating_add(width - 1) / width
 }
 
 fn load_series_preview(state: &AppState, config: &RuntimeConfig, thread_id: i64) -> Option<String> {
@@ -723,8 +872,16 @@ fn draw_reply_panel(frame: &mut Frame<'_>, state: &AppState) {
     };
 
     let area = centered_rect(88, 84, frame.area());
-    frame.render_widget(Clear, area);
+    if panel.preview_open {
+        draw_send_preview_panel(frame, area, panel);
+        return;
+    }
+    if panel.reply_notice.is_some() {
+        draw_reply_notice_panel(frame, area, panel);
+        return;
+    }
 
+    frame.render_widget(Clear, area);
     let title = format!(
         "Reply Panel [{} dirty:{} confirmed:{} focus:{}]",
         panel.mode.label(),
@@ -748,7 +905,7 @@ fn draw_reply_panel(frame: &mut Frame<'_>, state: &AppState) {
     let body_area = sections[1];
 
     let header_block = Block::default()
-        .title("Headers (From/To/Cc/Subject editable)")
+        .title("Headers ([edit] / [read-only])")
         .borders(Borders::ALL)
         .border_style(reply_panel_section_style(
             matches!(
@@ -803,39 +960,37 @@ fn draw_reply_panel(frame: &mut Frame<'_>, state: &AppState) {
     if let Some(cursor) = reply_panel_cursor_position(panel, header_inner, body_content_area) {
         frame.set_cursor_position(cursor);
     }
-
-    if panel.preview_open {
-        draw_send_preview_overlay(frame, panel);
-    } else if panel.reply_notice.is_some() {
-        draw_reply_notice_overlay(frame, panel);
-    }
 }
 
 fn render_reply_header_content(panel: &ReplyPanelState) -> String {
     [
         format!(
-            "{} From: {}",
+            "{} {}{}",
             reply_section_marker(panel, ReplySection::From),
+            reply_editable_field_prefix(ReplySection::From),
             sanitize_source_preview_text(&panel.from)
         ),
         format!(
-            "{} To: {}",
+            "{} {}{}",
             reply_section_marker(panel, ReplySection::To),
+            reply_editable_field_prefix(ReplySection::To),
             sanitize_source_preview_text(&panel.to)
         ),
         format!(
-            "{} Cc: {}",
+            "{} {}{}",
             reply_section_marker(panel, ReplySection::Cc),
+            reply_editable_field_prefix(ReplySection::Cc),
             sanitize_source_preview_text(&panel.cc)
         ),
         format!(
-            "{} Subject: {}",
+            "{} {}{}",
             reply_section_marker(panel, ReplySection::Subject),
+            reply_editable_field_prefix(ReplySection::Subject),
             sanitize_source_preview_text(&panel.subject)
         ),
-        format!("  In-Reply-To: <{}>", panel.in_reply_to),
+        format!("  [read-only] In-Reply-To: <{}>", panel.in_reply_to),
         format!(
-            "  References: {}",
+            "  [read-only] References: {}",
             panel
                 .references
                 .iter()
@@ -943,22 +1098,26 @@ fn reply_panel_cursor_position(
         ReplySection::From => reply_fixed_cursor_position(
             header_inner,
             0,
-            reply_field_prefix_width("From") + display_column(&panel.from, panel.cursor_col),
+            reply_field_prefix_width(ReplySection::From)
+                + display_column(&panel.from, panel.cursor_col),
         ),
         ReplySection::To => reply_fixed_cursor_position(
             header_inner,
             1,
-            reply_field_prefix_width("To") + display_column(&panel.to, panel.cursor_col),
+            reply_field_prefix_width(ReplySection::To)
+                + display_column(&panel.to, panel.cursor_col),
         ),
         ReplySection::Cc => reply_fixed_cursor_position(
             header_inner,
             2,
-            reply_field_prefix_width("Cc") + display_column(&panel.cc, panel.cursor_col),
+            reply_field_prefix_width(ReplySection::Cc)
+                + display_column(&panel.cc, panel.cursor_col),
         ),
         ReplySection::Subject => reply_fixed_cursor_position(
             header_inner,
             3,
-            reply_field_prefix_width("Subject") + display_column(&panel.subject, panel.cursor_col),
+            reply_field_prefix_width(ReplySection::Subject)
+                + display_column(&panel.subject, panel.cursor_col),
         ),
         ReplySection::Body => {
             let line = panel
@@ -1019,14 +1178,17 @@ fn reply_body_cursor_position(
     ))
 }
 
-fn draw_send_preview_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
-    let area = centered_rect(82, 78, frame.area());
+fn draw_send_preview_panel(frame: &mut Frame<'_>, area: Rect, panel: &ReplyPanelState) {
     frame.render_widget(Clear, area);
 
-    let title = if panel.preview_errors.is_empty() {
-        "Send Preview"
-    } else {
+    let title = if !panel.preview_errors.is_empty() {
         "Send Preview [invalid]"
+    } else if !panel.preview_warnings.is_empty() {
+        "Send Preview [warning]"
+    } else if has_authored_reply_lines(panel) {
+        "Send Preview [reply highlighted]"
+    } else {
+        "Send Preview"
     };
     let block = Block::default()
         .title(title)
@@ -1035,47 +1197,164 @@ fn draw_send_preview_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let content_area = if panel.preview_errors.is_empty() {
-        inner
-    } else {
-        let error_text = panel
-            .preview_errors
-            .iter()
-            .map(|value| format!("- {value}"))
-            .collect::<Vec<String>>()
-            .join("\n");
-        let error_height = error_text
-            .lines()
-            .count()
-            .min(inner.height.saturating_sub(1) as usize) as u16;
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(error_height), Constraint::Min(1)])
-            .split(inner);
-        let warning = Paragraph::new(error_text)
-            .style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(warning, sections[0]);
-        sections[1]
-    };
-
-    let preview = Paragraph::new(panel.preview_rendered.clone())
+    let content_area = draw_send_preview_messages(frame, inner, panel);
+    let preview = Paragraph::new(render_reply_preview_text(panel))
         .scroll((panel.preview_scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(preview, content_area);
 }
 
-fn draw_reply_notice_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
+fn draw_send_preview_messages(frame: &mut Frame<'_>, area: Rect, panel: &ReplyPanelState) -> Rect {
+    let mut remaining_height = area.height.saturating_sub(1);
+    let error_height = preview_message_height(&panel.preview_errors, remaining_height);
+    remaining_height = remaining_height.saturating_sub(error_height);
+    let warning_height = preview_message_height(&panel.preview_warnings, remaining_height);
+    remaining_height = remaining_height.saturating_sub(warning_height);
+    let info_messages = preview_info_messages(panel);
+    let info_height = preview_message_height(&info_messages, remaining_height);
+
+    if error_height == 0 && warning_height == 0 && info_height == 0 {
+        return area;
+    }
+
+    let mut constraints = Vec::new();
+    if error_height > 0 {
+        constraints.push(Constraint::Length(error_height));
+    }
+    if warning_height > 0 {
+        constraints.push(Constraint::Length(warning_height));
+    }
+    if info_height > 0 {
+        constraints.push(Constraint::Length(info_height));
+    }
+    constraints.push(Constraint::Min(1));
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    let mut section_index = 0usize;
+    if error_height > 0 {
+        draw_send_preview_message_block(
+            frame,
+            sections[section_index],
+            &panel.preview_errors,
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        );
+        section_index += 1;
+    }
+    if warning_height > 0 {
+        draw_send_preview_message_block(
+            frame,
+            sections[section_index],
+            &panel.preview_warnings,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+        section_index += 1;
+    }
+    if info_height > 0 {
+        draw_send_preview_message_block(
+            frame,
+            sections[section_index],
+            &info_messages,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
+        section_index += 1;
+    }
+
+    sections[section_index]
+}
+
+fn preview_message_height(messages: &[String], remaining_height: u16) -> u16 {
+    if messages.is_empty() || remaining_height == 0 {
+        return 0;
+    }
+
+    let line_count = messages
+        .iter()
+        .map(|message| message.lines().count().max(1))
+        .sum::<usize>();
+    line_count.min(remaining_height as usize) as u16
+}
+
+fn draw_send_preview_message_block(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    messages: &[String],
+    style: Style,
+) {
+    let text = messages
+        .iter()
+        .map(|value| format!("- {value}"))
+        .collect::<Vec<String>>()
+        .join("\n");
+    let paragraph = Paragraph::new(text).style(style).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn render_reply_preview_text(panel: &ReplyPanelState) -> Text<'static> {
+    Text::from(
+        panel
+            .preview_lines
+            .iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.text.clone(),
+                    reply_preview_line_style(line.kind),
+                ))
+            })
+            .collect::<Vec<Line<'static>>>(),
+    )
+}
+
+fn preview_info_messages(panel: &ReplyPanelState) -> Vec<String> {
+    if has_authored_reply_lines(panel) {
+        vec!["Your authored reply lines are highlighted below.".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn has_authored_reply_lines(panel: &ReplyPanelState) -> bool {
+    panel
+        .preview_lines
+        .iter()
+        .any(|line| matches!(line.kind, ReplyPreviewLineKind::Authored))
+}
+
+fn reply_preview_line_style(kind: ReplyPreviewLineKind) -> Style {
+    match kind {
+        ReplyPreviewLineKind::Header => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+        ReplyPreviewLineKind::Blank => Style::default(),
+        ReplyPreviewLineKind::Authored => Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ReplyPreviewLineKind::QuoteAttribution => Style::default().fg(Color::Cyan),
+        ReplyPreviewLineKind::Quoted => Style::default().fg(Color::White),
+        ReplyPreviewLineKind::Placeholder => Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    }
+}
+
+fn draw_reply_notice_panel(frame: &mut Frame<'_>, area: Rect, panel: &ReplyPanelState) {
     let Some(notice) = panel.reply_notice.as_ref() else {
         return;
     };
 
-    let area = centered_rect(62, 34, frame.area());
     frame.render_widget(Clear, area);
 
     let border = match notice.kind {
@@ -1090,6 +1369,14 @@ fn draw_reply_notice_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
     frame.render_widget(block, area);
     frame.render_widget(Clear, inner);
 
+    let content_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(35),
+            Constraint::Min(3),
+            Constraint::Percentage(35),
+        ])
+        .split(inner);
     let text = format!("{}\n\n{}", notice.message, notice.hint);
     let paragraph = Paragraph::new(Text::from(text))
         .alignment(Alignment::Center)
@@ -1099,7 +1386,7 @@ fn draw_reply_notice_overlay(frame: &mut Frame<'_>, panel: &ReplyPanelState) {
                 .add_modifier(Modifier::BOLD),
         )
         .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, inner);
+    frame.render_widget(paragraph, content_sections[1]);
 }
 
 fn code_edit_source_line_logical_row(buffer_row: usize) -> usize {
@@ -1320,4 +1607,16 @@ pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
         .split(vertical[1]);
 
     horizontal[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_uptime_label;
+
+    #[test]
+    fn uptime_label_uses_the_largest_needed_unit() {
+        assert_eq!(format_uptime_label(59), "59s");
+        assert_eq!(format_uptime_label(61), "01m:01s");
+        assert_eq!(format_uptime_label(3_661), "01h:01m:01s");
+    }
 }

@@ -1,7 +1,7 @@
 [package]
 name = "criew"
 authors = ["Chen Miao"]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Terminal-first Linux kernel patch mail workflow TUI"
@@ -31,6 +31,16 @@ include = [
     "/vendor/b4/patatt/COPYING",
     "/vendor/b4/patatt/patatt/*.py",
 ]
+
+[workspace]
+members = ["xtask"]
+resolver = "3"
+
+[package.metadata.docs.rs]
+# CRIEW is Linux-first, so keep docs.rs on the supported target instead of
+# asking it to fan out across every tier-one platform.
+default-target = "x86_64-unknown-linux-gnu"
+targets = []
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

@@ -19,6 +19,36 @@ pub(super) enum LoopAction {
     Restart,
 }
 
+pub(super) fn pending_main_page_move_count(state: &mut AppState) -> u16 {
+    state.take_pending_main_page_count().unwrap_or(1)
+}
+
+fn handle_main_page_count_prefix(state: &mut AppState, key: KeyEvent) -> bool {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        state.clear_pending_main_page_count();
+        return false;
+    }
+
+    let KeyCode::Char(character) = key.code else {
+        return false;
+    };
+    if !character.is_ascii_digit() {
+        return false;
+    }
+    if character == '0' && !state.has_pending_main_page_count() {
+        return false;
+    }
+
+    let digit = character
+        .to_digit(10)
+        .expect("ascii digit should convert to decimal") as u16;
+    state.push_pending_main_page_count_digit(digit);
+    true
+}
+
 pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
     tracing::debug!(
         key = ?key,
@@ -27,6 +57,7 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         code_focus = ?state.code_focus,
         code_edit_mode = ?state.code_edit_mode,
         config_editor_open = state.config_editor.open,
+        keymap_editor_open = state.keymap_editor.open,
         palette_open = state.palette.open,
         search_active = state.search.active,
         "user key event"
@@ -35,10 +66,17 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     // Modal UI surfaces take precedence over the base page shortcuts so keys
     // keep local meaning while a dialog, editor, or search interaction is open.
     if state.config_editor.open {
+        state.clear_pending_main_page_inputs();
         return handle_config_editor_key_event(state, key);
     }
 
+    if state.keymap_editor.open {
+        state.clear_pending_main_page_inputs();
+        return handle_keymap_editor_key_event(state, key);
+    }
+
     if state.palette.open {
+        state.clear_pending_main_page_inputs();
         if is_palette_toggle(key) {
             state.close_palette();
             return LoopAction::Continue;
@@ -47,21 +85,35 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
     }
 
     if state.search.active {
+        state.clear_pending_main_page_inputs();
         return handle_search_key_event(state, key);
     }
 
     if state.reply_panel.is_some() {
+        state.clear_pending_main_page_inputs();
         return handle_reply_key_event(state, key);
     }
 
     if state.is_code_edit_active() {
+        state.clear_pending_main_page_inputs();
         return handle_code_edit_key_event(state, key);
     }
 
     if is_palette_open_shortcut(key) {
+        state.clear_pending_main_page_inputs();
         state.toggle_palette();
         return LoopAction::Continue;
     }
+
+    if let Some(action) = handle_main_page_key_event(state, key) {
+        return action;
+    }
+
+    if handle_main_page_count_prefix(state, key) {
+        return LoopAction::Continue;
+    }
+
+    state.clear_pending_main_page_count();
 
     match key.code {
         KeyCode::Char('/') => {
@@ -85,6 +137,18 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         {
             state.set_current_subscription_enabled(false);
         }
+        KeyCode::Char('-')
+            if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Preview) =>
+        {
+            state.select_previous_thread();
+        }
+        KeyCode::Char(character)
+            if matches!(state.ui_page, UiPage::Mail)
+                && matches!(state.focus, Pane::Preview)
+                && matches!(character, '=' | '+') =>
+        {
+            state.select_next_thread();
+        }
         KeyCode::Char('e')
             if matches!(state.ui_page, UiPage::Mail) && matches!(state.focus, Pane::Preview) =>
         {
@@ -95,6 +159,18 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
         {
             state.open_reply_panel(false);
         }
+        KeyCode::Char('[') if matches!(state.ui_page, UiPage::Mail) => {
+            state.resize_mail_panes(HorizontalResizeDirection::Left, MailPaneResizeMode::Expand);
+        }
+        KeyCode::Char(']') if matches!(state.ui_page, UiPage::Mail) => {
+            state.resize_mail_panes(HorizontalResizeDirection::Right, MailPaneResizeMode::Expand);
+        }
+        KeyCode::Char('{') if matches!(state.ui_page, UiPage::Mail) => {
+            state.resize_mail_panes(HorizontalResizeDirection::Left, MailPaneResizeMode::Shrink);
+        }
+        KeyCode::Char('}') if matches!(state.ui_page, UiPage::Mail) => {
+            state.resize_mail_panes(HorizontalResizeDirection::Right, MailPaneResizeMode::Shrink);
+        }
         KeyCode::Char('e') if matches!(state.ui_page, UiPage::CodeBrowser) => {
             state.enter_code_edit_mode();
         }
@@ -102,10 +178,6 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
             state.open_external_editor();
         }
         KeyCode::Tab => state.toggle_ui_page(),
-        KeyCode::Char('j') => state.move_focus_previous(),
-        KeyCode::Char('l') => state.move_focus_next(),
-        KeyCode::Char('i') => state.move_up(),
-        KeyCode::Char('k') => state.move_down(),
         KeyCode::Char(character)
             if matches!(state.ui_page, UiPage::Mail)
                 && matches!(state.focus, Pane::Threads)
@@ -133,6 +205,7 @@ pub(super) fn handle_key_event(state: &mut AppState, key: KeyEvent) -> LoopActio
                 Pane::Threads => {
                     if let Some(thread) = state.selected_thread() {
                         state.status = format!("selected {}", thread.message_id);
+                        state.focus = Pane::Preview;
                     }
                 }
                 Pane::Preview => {}
@@ -544,13 +617,21 @@ fn handle_palette_key_event(state: &mut AppState, key: KeyEvent) -> LoopAction {
                 "quit" | "exit" => return LoopAction::Exit,
                 "restart" => return LoopAction::Restart,
                 "help" => {
-                    state.status = "commands: quit, exit, restart, help, sync [mailbox], config ..., vim, !<local shell command> | keys: j/l focus, i/k move, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim".to_string();
+                    state.status = format!(
+                        "commands: quit, exit, restart, help, sync [mailbox], config ..., keymap, vim, !<local shell command> | keys: {} focus, {} move, [ ] expand pane, {{ }} shrink pane, -/= preview switch, y/n enable, a apply, d download, u undo apply, e reply/inline edit, r reply, E external vim",
+                        main_page_focus_shortcuts(&state.main_page_keymap),
+                        main_page_move_shortcuts(&state.main_page_keymap)
+                    );
                 }
                 value if value.split_whitespace().next() == Some("sync") => {
                     run_palette_sync(state, value);
+                    state.dismiss_palette();
                 }
                 value if value.split_whitespace().next() == Some("config") => {
                     run_palette_config(state, value);
+                }
+                "keymap" => {
+                    state.open_keymap_editor();
                 }
                 "vim" => {
                     state.open_external_editor();

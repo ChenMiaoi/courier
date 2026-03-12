@@ -15,6 +15,8 @@ use chrono::Utc;
 use crate::infra::config::RuntimeConfig;
 
 const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+const EXECUTABLE_BUSY_RETRY_ATTEMPTS: u8 = 5;
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const OUTBOX_DIR_NAME: &str = "reply-outbox";
 const GIT_SENDEMAIL_FROM_ARGS: &[&str] = &["config", "sendemail.from"];
 const GIT_USER_NAME_LOOKUP_ARGS: &[&str] = &["config", "user.name"];
@@ -181,6 +183,15 @@ fn send_with_command_path(
     request: &SendRequest,
     command_path: Option<&Path>,
 ) -> SendOutcome {
+    send_with_options(runtime, request, command_path, DEFAULT_SEND_TIMEOUT)
+}
+
+fn send_with_options(
+    runtime: &RuntimeConfig,
+    request: &SendRequest,
+    command_path: Option<&Path>,
+    timeout: Duration,
+) -> SendOutcome {
     let started_at = now_timestamp();
     let message_id = generate_message_id(&request.from);
     let draft_dir = runtime.data_dir.join(OUTBOX_DIR_NAME);
@@ -234,6 +245,7 @@ fn send_with_command_path(
         );
     }
 
+    let draft_path = stabilize_child_path(&draft_path);
     let command_line = render_command_line(
         &resolved.display_name,
         &build_send_email_args(request, &draft_path),
@@ -250,7 +262,7 @@ fn send_with_command_path(
         // surface as structured outcomes the UI can record and display.
         .env("GIT_TERMINAL_PROMPT", "0");
 
-    let mut child = match command.spawn() {
+    let mut child = match spawn_command_with_retry(&mut command) {
         Ok(child) => child,
         Err(error) => {
             return failed_outcome(
@@ -269,7 +281,7 @@ fn send_with_command_path(
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if start.elapsed() >= DEFAULT_SEND_TIMEOUT {
+                if start.elapsed() >= timeout {
                     timed_out = true;
                     let _ = child.kill();
                     break;
@@ -317,7 +329,7 @@ fn send_with_command_path(
             stderr,
             error_summary: Some(format!(
                 "git send-email timed out after {}s",
-                DEFAULT_SEND_TIMEOUT.as_secs()
+                timeout.as_secs()
             )),
             started_at,
             finished_at,
@@ -361,6 +373,21 @@ fn send_with_command_path(
     }
 }
 
+fn spawn_command_with_retry(command: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut attempts_remaining = EXECUTABLE_BUSY_RETRY_ATTEMPTS;
+
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if is_retryable_executable_busy(&error) && attempts_remaining > 0 => {
+                attempts_remaining -= 1;
+                thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParsedIdentity {
     display: String,
@@ -395,8 +422,9 @@ fn git_candidates(command_path: Option<&Path>) -> Vec<GitCandidate> {
     let mut candidates = Vec::new();
     if let Some(path) = command_path {
         candidates.push(GitCandidate::Path(path.to_path_buf()));
+    } else {
+        candidates.push(GitCandidate::Program("git"));
     }
-    candidates.push(GitCandidate::Program("git"));
     candidates
 }
 
@@ -437,7 +465,7 @@ fn run_probe<T>(command: T, args: &[&str], display_path: &Path, command_text: St
 where
     T: AsRef<std::ffi::OsStr>,
 {
-    match Command::new(command).args(args).output() {
+    match output_with_retry(Command::new(command).args(args)) {
         Ok(output) if output.status.success() => Probe::Available {
             path: display_path.to_path_buf(),
             version: normalize_output(&output.stdout)
@@ -463,7 +491,7 @@ fn run_send_email_probe<T>(command: T, display_path: &Path, command_text: String
 where
     T: AsRef<std::ffi::OsStr> + Copy,
 {
-    match Command::new(command).args(["send-email", "-h"]).output() {
+    match output_with_retry(Command::new(command).args(["send-email", "-h"])) {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -508,7 +536,7 @@ fn probe_git_version<T>(command: T) -> Option<String>
 where
     T: AsRef<std::ffi::OsStr>,
 {
-    let output = Command::new(command).arg("--version").output().ok()?;
+    let output = output_with_retry(Command::new(command).arg("--version")).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -576,9 +604,7 @@ fn resolve_git_binary(
 }
 
 fn git_config_value(command: &str, args: &[&str]) -> std::result::Result<Option<String>, String> {
-    let output = Command::new(command)
-        .args(args)
-        .output()
+    let output = output_with_retry(Command::new(command).args(args))
         .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))?;
 
     if !output.status.success() {
@@ -595,6 +621,25 @@ fn git_config_value(command: &str, args: &[&str]) -> std::result::Result<Option<
     } else {
         Ok(Some(value))
     }
+}
+
+fn output_with_retry(command: &mut Command) -> std::io::Result<std::process::Output> {
+    let mut attempts_remaining = EXECUTABLE_BUSY_RETRY_ATTEMPTS;
+
+    loop {
+        match command.output() {
+            Ok(output) => return Ok(output),
+            Err(error) if is_retryable_executable_busy(&error) && attempts_remaining > 0 => {
+                attempts_remaining -= 1;
+                thread::sleep(EXECUTABLE_BUSY_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_retryable_executable_busy(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::ExecutableFileBusy
 }
 
 fn parse_identity(value: &str) -> Option<ParsedIdentity> {
@@ -631,10 +676,7 @@ fn extract_email_address(value: &str) -> Option<String> {
 fn normalize_message_id(value: &str) -> String {
     value
         .trim()
-        .trim_matches('<')
-        .trim_matches('>')
-        .trim_matches('"')
-        .trim_matches(',')
+        .trim_matches(|character| matches!(character, '<' | '>' | '"' | ','))
         .trim()
         .to_string()
 }
@@ -697,6 +739,16 @@ fn build_send_email_args(request: &SendRequest, draft_path: &Path) -> Vec<String
 
     args.push(draft_path.display().to_string());
     args
+}
+
+fn stabilize_child_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|current_dir| current_dir.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn generate_message_id(from: &str) -> String {
@@ -792,6 +844,7 @@ fn now_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -799,8 +852,11 @@ mod tests {
     use crate::infra::config::RuntimeConfig;
 
     use super::{
-        GitSendEmailStatus, SendRequest, SendStatus, check_with_command_path,
-        resolve_reply_identity_with_command_path, send_with_command_path,
+        GitSendEmailStatus, ReplyIdentitySource, SendRequest, SendStatus, check_with_command_path,
+        extract_email_address, generate_message_id, normalize_message_id, normalize_output,
+        render_command_line, render_message_file, resolve_reply_identity_with_command_path,
+        resolve_working_dir, send_with_command_path, send_with_options, stabilize_child_path,
+        summarize_failure,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -808,7 +864,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("criew-sendmail-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!(
+            "criew-sendmail-{label}-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -827,6 +886,9 @@ mod tests {
             imap: crate::infra::config::ImapConfig::default(),
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
+            ui_keymap: crate::infra::config::UiKeymap::Default,
+            ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
+            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
             kernel_trees: Vec::new(),
@@ -835,10 +897,19 @@ mod tests {
 
     fn write_fake_git(root: &Path, body: &str) -> PathBuf {
         let path = root.join("fake-git.sh");
-        fs::write(&path, body).expect("write fake git");
-        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        let staging_path = root.join(".fake-git.sh.tmp");
+        let mut staging_file = fs::File::create(&staging_path).expect("create staging fake git");
+        staging_file
+            .write_all(body.as_bytes())
+            .expect("write staging fake git");
+        staging_file.sync_all().expect("sync staging fake git");
+        drop(staging_file);
+        let mut permissions = fs::metadata(&staging_path)
+            .expect("staging metadata")
+            .permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("chmod");
+        fs::set_permissions(&staging_path, permissions).expect("chmod");
+        fs::rename(&staging_path, &path).expect("install fake git");
         path
     }
 
@@ -912,6 +983,63 @@ mod tests {
     }
 
     #[test]
+    fn check_reports_broken_and_missing_send_email() {
+        let root = temp_dir("check-broken");
+        let fake_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'fatal: send-email support missing' >&2\n  exit 1\nfi\nexit 1\n",
+        );
+
+        match check_with_command_path(Some(&fake_git)).status {
+            GitSendEmailStatus::Broken { reason, .. } => {
+                assert_eq!(reason, "fatal: send-email support missing");
+            }
+            other => panic!("unexpected status: {other:?}"),
+        }
+
+        match check_with_command_path(Some(&root.join("missing-git"))).status {
+            GitSendEmailStatus::Missing => {}
+            other => panic!("unexpected status: {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_identity_falls_back_to_user_name_email_and_reports_errors() {
+        let root = temp_dir("identity-fallback");
+        let fallback_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"sendemail.from\" ]; then\n  exit 1\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.email\" ]; then\n  echo 'fallback@example.com'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.name\" ]; then\n  echo '   '\n  exit 0\nfi\nexit 1\n",
+        );
+
+        let identity = resolve_reply_identity_with_command_path(Some(&fallback_git))
+            .expect("resolve fallback identity");
+        assert_eq!(identity.display, "fallback@example.com");
+        assert_eq!(identity.email, "fallback@example.com");
+        assert_eq!(identity.source, ReplyIdentitySource::UserNameEmail);
+        assert_eq!(identity.source.as_str(), "git config user.name/user.email");
+
+        let invalid_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"sendemail.from\" ]; then\n  echo 'No Email Here'\n  exit 0\nfi\nexit 1\n",
+        );
+        let invalid = resolve_reply_identity_with_command_path(Some(&invalid_git))
+            .expect_err("invalid sendemail.from should fail");
+        assert!(invalid.contains("does not contain a valid email address"));
+
+        let missing_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"sendemail.from\" ]; then\n  exit 1\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.email\" ]; then\n  exit 1\nfi\nif [ \"$1\" = \"config\" ] && [ \"$2\" = \"user.name\" ]; then\n  exit 1\nfi\nexit 1\n",
+        );
+        let missing = resolve_reply_identity_with_command_path(Some(&missing_git))
+            .expect_err("missing user email should fail");
+        assert!(missing.contains("git email identity missing"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn send_success_removes_draft_and_keeps_generated_message_id() {
         let root = temp_dir("send-success");
         let capture = root.join("captured.eml");
@@ -919,7 +1047,7 @@ mod tests {
         let fake_git = write_fake_git(
             &root,
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  printf '%s\n' \"$@\" > '{}'\n  last=''\n  for arg in \"$@\"; do\n    last=\"$arg\"\n  done\n  cp \"$last\" '{}'\n  echo 'sent'\n  exit 0\nfi\nexit 1\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  printf '%s\\n' \"$@\" > '{}'\n  last=''\n  for arg in \"$@\"; do\n    last=\"$arg\"\n  done\n  cp \"$last\" '{}'\n  echo 'sent'\n  exit 0\nfi\nexit 1\n",
                 capture_args.display(),
                 capture.display()
             ),
@@ -976,6 +1104,118 @@ mod tests {
     }
 
     #[test]
+    fn send_reports_unavailable_transport_without_creating_draft() {
+        let root = temp_dir("send-unavailable");
+        let fake_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'fatal: send-email support missing' >&2\n  exit 1\nfi\nexit 1\n",
+        );
+        let runtime = test_runtime_in(&root);
+
+        let outcome = send_with_command_path(&runtime, &sample_request(), Some(&fake_git));
+
+        assert_eq!(outcome.status, SendStatus::Failed);
+        assert!(outcome.command_line.is_none());
+        assert!(outcome.draft_path.is_none());
+        assert!(
+            outcome
+                .error_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("git send-email unavailable"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn send_failure_uses_stdout_or_exit_code_when_stderr_is_empty() {
+        let root = temp_dir("send-summary-fallbacks");
+        let stdout_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  echo 'smtp failed on stdout'\n  exit 2\nfi\nexit 1\n",
+        );
+        let runtime = test_runtime_in(&root);
+        let stdout_outcome = send_with_command_path(&runtime, &sample_request(), Some(&stdout_git));
+        assert_eq!(stdout_outcome.status, SendStatus::Failed);
+        assert_eq!(
+            stdout_outcome.error_summary.as_deref(),
+            Some("smtp failed on stdout")
+        );
+
+        let exit_code_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  exit 7\nfi\nexit 1\n",
+        );
+        let exit_code_outcome =
+            send_with_command_path(&runtime, &sample_request(), Some(&exit_code_git));
+        assert_eq!(exit_code_outcome.status, SendStatus::Failed);
+        assert_eq!(
+            exit_code_outcome.error_summary.as_deref(),
+            Some("git send-email exited with 7")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn send_times_out_and_keeps_draft_for_retry() {
+        let root = temp_dir("send-timeout");
+        let fake_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  sleep 1\n  exit 0\nfi\nexit 1\n",
+        );
+        let runtime = test_runtime_in(&root);
+
+        let outcome = send_with_options(
+            &runtime,
+            &sample_request(),
+            Some(&fake_git),
+            std::time::Duration::from_millis(50),
+        );
+
+        assert_eq!(outcome.status, SendStatus::TimedOut);
+        assert!(outcome.timed_out);
+        assert!(
+            outcome
+                .draft_path
+                .as_ref()
+                .is_some_and(|path| path.exists())
+        );
+        assert_eq!(
+            outcome.error_summary.as_deref(),
+            Some("git send-email timed out after 0s")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn send_reports_outbox_creation_failure() {
+        let root = temp_dir("send-outbox-fail");
+        let data_file = root.join("blocked-data");
+        fs::write(&data_file, "not a directory").expect("write blocking data file");
+        let fake_git = write_fake_git(
+            &root,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nexit 1\n",
+        );
+        let mut runtime = test_runtime_in(&root);
+        runtime.data_dir = data_file;
+
+        let outcome = send_with_command_path(&runtime, &sample_request(), Some(&fake_git));
+
+        assert_eq!(outcome.status, SendStatus::Failed);
+        assert!(outcome.draft_path.is_none());
+        assert!(
+            outcome
+                .error_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("failed to create reply outbox"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn send_prefers_configured_kernel_tree_as_working_dir() {
         let root = temp_dir("send-working-dir");
         let kernel_tree = root.join("linux");
@@ -998,6 +1238,109 @@ mod tests {
         let invoked_pwd = fs::read_to_string(&capture_pwd).expect("read captured pwd");
         assert_eq!(PathBuf::from(invoked_pwd.trim()), kernel_tree);
         assert_ne!(PathBuf::from(invoked_pwd.trim()), current_dir);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn send_passes_absolute_draft_path_when_runtime_data_dir_is_relative() {
+        let root = temp_dir("send-relative-data-dir");
+        let kernel_tree = root.join("linux");
+        fs::create_dir_all(&kernel_tree).expect("create kernel tree");
+        let capture_arg = root.join("captured-draft-arg.txt");
+        let fake_git = write_fake_git(
+            &root,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'git version 2.51.0'\n  exit 0\nfi\nif [ \"$1\" = \"send-email\" ] && [ \"$2\" = \"-h\" ]; then\n  echo 'usage: git send-email [<options>] <file|directory>...'\n  exit 129\nfi\nif [ \"$1\" = \"send-email\" ]; then\n  last=''\n  for arg in \"$@\"; do\n    last=\"$arg\"\n  done\n  printf '%s' \"$last\" > '{}'\n  if [ -f \"$last\" ]; then\n    echo 'sent'\n    exit 0\n  fi\n  echo \"missing draft: $last\" >&2\n  exit 1\nfi\nexit 1\n",
+                capture_arg.display()
+            ),
+        );
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let relative_data_dir = PathBuf::from(format!(
+            "target/test-relative-reply-outbox-{}-{nonce}",
+            std::process::id()
+        ));
+        let relative_data_dir_absolute = std::env::current_dir()
+            .expect("current dir")
+            .join(&relative_data_dir);
+        let mut runtime = test_runtime_in(&root);
+        runtime.data_dir = relative_data_dir;
+        runtime.kernel_trees = vec![kernel_tree];
+
+        let outcome = send_with_command_path(&runtime, &sample_request(), Some(&fake_git));
+
+        assert_eq!(outcome.status, SendStatus::Sent);
+        let captured_arg = fs::read_to_string(&capture_arg).expect("read captured draft arg");
+        assert!(Path::new(&captured_arg).is_absolute());
+        assert!(captured_arg.starts_with(relative_data_dir_absolute.to_string_lossy().as_ref()));
+
+        let _ = fs::remove_dir_all(relative_data_dir_absolute);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn message_rendering_and_helper_outputs_follow_reply_contract() {
+        let mut request = sample_request();
+        request.cc.clear();
+        request.references = vec![
+            "<older@example.com>,".to_string(),
+            "patch@example.com".to_string(),
+        ];
+
+        let rendered = render_message_file(&request, "generated@example.com");
+        assert!(rendered.contains("From: CRIEW Test <criew@example.com>"));
+        assert!(rendered.contains("To: maintainer@example.com"));
+        assert!(!rendered.contains("\nCc: "));
+        assert!(rendered.contains("Message-ID: <generated@example.com>"));
+        assert!(rendered.contains("In-Reply-To: <patch@example.com>"));
+        assert!(rendered.contains("References: <older@example.com> <patch@example.com>"));
+        assert!(rendered.ends_with("reply body\n"));
+
+        assert_eq!(
+            render_command_line(
+                "git send-email",
+                &[
+                    "--from".to_string(),
+                    "CRIEW Test <criew@example.com>".to_string(),
+                    String::new(),
+                ]
+            ),
+            "'git send-email' --from 'CRIEW Test <criew@example.com>' ''"
+        );
+        assert_eq!(
+            normalize_output(b"\n first line \nsecond\n"),
+            Some("first line".to_string())
+        );
+        assert_eq!(
+            summarize_failure(Some(9), "", ""),
+            Some("git send-email exited with 9".to_string())
+        );
+        assert_eq!(
+            normalize_message_id(" <older@example.com>, "),
+            "older@example.com"
+        );
+        assert_eq!(
+            extract_email_address("CRIEW Test <criew@example.com>"),
+            Some("criew@example.com".to_string())
+        );
+        assert_eq!(extract_email_address("invalid identity"), None);
+        assert!(generate_message_id("No Email").ends_with("@localhost"));
+        assert!(stabilize_child_path(Path::new("relative/file.eml")).is_absolute());
+    }
+
+    #[test]
+    fn resolve_working_dir_falls_back_when_kernel_tree_is_missing() {
+        let root = temp_dir("send-working-dir-fallback");
+        let runtime = test_runtime_in(&root);
+        let current_dir = std::env::current_dir().expect("current dir");
+        assert_eq!(resolve_working_dir(&runtime), current_dir);
+
+        let mut with_invalid_tree = test_runtime_in(&root);
+        with_invalid_tree.kernel_trees = vec![root.join("missing-tree")];
+        assert_eq!(resolve_working_dir(&with_invalid_tree), current_dir);
 
         let _ = fs::remove_dir_all(root);
     }

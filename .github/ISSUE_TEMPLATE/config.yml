@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Usage guide
-    url: https://github.com/ChenMiaoi/CRIEW/blob/develop/README.md
+    url: https://github.com/ChenMiaoi/CRIEW/wiki
     about: Start here for installation, configuration, and common workflows.
   - name: 中文使用说明
     url: https://github.com/ChenMiaoi/CRIEW/blob/develop/README-zh.md
-    about: 中文安装、配置与使用说明。
+    about: 中文项目入口与文档导航。

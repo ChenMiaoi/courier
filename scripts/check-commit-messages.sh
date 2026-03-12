@@ -108,7 +108,7 @@ for commit_sha in "${commits[@]}"; do
     git show -s --format=%B "${commit_sha}" > "${commit_message_file}"
 
     printf '%s\n' "checking commit ${commit_sha}: ${commit_subject}"
-    if ! "${hook_path}" "${commit_message_file}"; then
+    if ! CRIEW_COMMIT_SHA="${commit_sha}" "${hook_path}" "${commit_message_file}"; then
         status=1
     fi
 

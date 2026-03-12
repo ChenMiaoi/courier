@@ -12,6 +12,9 @@
 # Required to customize DB location. Default: ~/.criew/db/criew.db
 database = "./.criew/db/criew.db"
 
+# Required to customize raw mail cache location. Default: ~/.criew/mail/raw
+# raw_mail_dir = "./.criew/mail/raw"
+
 # Required to customize patch file location. Default: ~/.criew/patches
 patch_dir = "./.criew/patches"
 
@@ -28,6 +31,8 @@ filter = "info"
 [source]
 # Optional default lore mailbox used by CLI `sync` when no mailbox is passed.
 # Default: linux-kernel
+# Historical compatibility alias: [imap].mailbox still maps to the same value,
+# but new config should prefer [source].mailbox.
 # mailbox = "linux-kernel"
 
 # Optional lore base URL.
@@ -54,6 +59,30 @@ filter = "info"
 # Optional. Whether to auto-sync enabled subscriptions after TUI starts.
 # Default: true
 # startup_sync = true
+
+# Optional. Main-page navigation scheme.
+# Supported:
+#   "default" (j/l focus, i/k move)
+#   "vim" (h/l focus, j/k move, gg/G jump, qq quit)
+#   "custom" (ui.keymap_base plus ui.custom_keymap overrides)
+# Default: "default"
+# keymap = "default"
+
+# Optional. Base preset used when keymap = "custom".
+# Supported: "default", "vim"
+# Default: inferred from ui.keymap when omitted
+# keymap_base = "default"
+
+# Optional. Custom main-page bindings.
+# Each value is an array of 1-2 printable keys.
+# [ui.custom_keymap]
+# focus_prev = ["j"]
+# focus_next = ["l"]
+# move_up = ["i"]
+# move_down = ["k"]
+# jump_top = ["g", "g"]
+# jump_bottom = ["G"]
+# quick_quit = ["q", "q"]
 
 # Optional. Seconds between `My Inbox` background auto-sync runs while TUI stays open.
 # Must be greater than 0. Default: 30

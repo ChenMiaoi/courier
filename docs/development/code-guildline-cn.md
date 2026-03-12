@@ -3,7 +3,7 @@
 ## 适用范围与优先级
 
 风格与评审决策的优先级：
-1. 本文档（`docs/coding-guideline-cn.md`）
+1. 本文档（`docs/development/code-guildline-cn.md`）
 2. 工具强制规则（`rustfmt`、`clippy`）
 3. 被修改模块的既有本地约定
 
@@ -84,12 +84,18 @@
 - `atomic-commits`：一个 commit 一个逻辑变化。
 - `refactor-then-feature`：先重构再功能，分开提交。
 - `focused-prs`：一个 PR 聚焦一个主题。
+- `signed-commits`：仓库内提交必须使用 `git commit -s`，确保每个 commit 都带有有效的 `Signed-off-by:` trailer。
+- `large-commit-body`：简单提交可以只有标题行；改动量较大的提交必须带 body，并用分点条目说明主要改动。
 
 提交信息策略（兼容本项目规范与参考的 Asterinas 规则）：
 - 保留本项目 Conventional Commit 前缀：`feat:`、`fix:`、`docs:`、`refactor:`、`test:`、`chore:`。
 - 可选使用 scope，格式如：`feat(ci): ...`、`fix(sync): ...`。
 - 前缀后的主题句使用祈使语气，描述清晰。
 - 主题行尽量不超过 72 字符。
+- 作者自己产生的 commit 一律使用 `git commit -s`；`.githooks/commit-msg` 与 CI 会校验 `Signed-off-by:` trailer。
+- 简单提交可以只写标题行，不强制写 body。
+- 改动量较大的提交必须写 body，并使用 `- ...` 这类分点条目说明做了什么。
+- 当前 hook 与 CI 将“较大提交”定义为：单个 commit 改动至少 6 个文件，或新增/删除总行数至少 150 行。
 
 ## 评审检查清单
 
@@ -104,6 +110,8 @@
 - [ ] 测试验证可观察行为并完成资源清理（`test-visible-behavior`, `test-cleanup`）。
 - [ ] `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --all-targets --all-features` 和 `./scripts/check-coverage.sh` 通过。
 - [ ] commit 与 PR 规模原子、主题聚焦（`atomic-commits`, `focused-prs`）。
+- [ ] 作者自己产生的每个 commit 都带有有效的 `Signed-off-by:` trailer（`signed-commits`）。
+- [ ] 较大提交带有分点 body，用来说明主要改动（`large-commit-body`）。
 
 ## 渐进式采用
 

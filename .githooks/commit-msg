@@ -4,26 +4,18 @@ set -euo pipefail
 
 message_file=${1:?missing commit message file}
 
-comment_char="$(git config --get core.commentChar || true)"
-if [[ -z "${comment_char}" || "${comment_char}" == "auto" ]]; then
-    comment_char="#"
-fi
+large_commit_file_threshold=${CRIEW_LARGE_COMMIT_FILE_THRESHOLD:-6}
+large_commit_line_threshold=${CRIEW_LARGE_COMMIT_LINE_THRESHOLD:-150}
+
+cleaned_message="$(git stripspace --strip-comments < "${message_file}")"
 
 subject="$(
-    awk -v comment_char="${comment_char}" '
-        {
-            trimmed = $0
-            sub(/^[[:space:]]+/, "", trimmed)
-            if (trimmed == "") {
-                next
-            }
-            if (substr(trimmed, 1, length(comment_char)) == comment_char) {
-                next
-            }
-            print trimmed
+    printf '%s\n' "${cleaned_message}" | awk '
+        NF {
+            print
             exit
         }
-    ' "${message_file}"
+    '
 )"
 
 if [[ -z "${subject}" ]]; then
@@ -31,17 +23,25 @@ if [[ -z "${subject}" ]]; then
     exit 1
 fi
 
-if [[ "${subject}" =~ ^(Merge|Revert)\  ]]; then
+if [[ "${subject}" =~ ^Merge\  ]]; then
     exit 0
 fi
 
+skip_conventional_subject_check=0
+skip_large_commit_body_check=0
+if [[ "${subject}" =~ ^Revert\  ]]; then
+    skip_conventional_subject_check=1
+    skip_large_commit_body_check=1
+fi
+
 if [[ "${subject}" =~ ^(fixup\!\ |squash\!\ ) ]]; then
+    skip_large_commit_body_check=1
     subject=${subject#*! }
 fi
 
 conventional_subject_pattern='^(feat|fix|docs|refactor|test|chore)(\([^)[:space:]]+\))?: .+'
 
-if [[ ! "${subject}" =~ ${conventional_subject_pattern} ]]; then
+if (( ! skip_conventional_subject_check )) && [[ ! "${subject}" =~ ${conventional_subject_pattern} ]]; then
     cat >&2 <<'EOF'
 commit message subject must use one of:
   feat: summary
@@ -65,4 +65,77 @@ if (( subject_length > 72 )); then
     printf '%s\n' \
         "warning: commit subject is ${subject_length} characters; keep it within 72 when possible" \
         >&2
+fi
+
+trailers="$(printf '%s\n' "${cleaned_message}" | git interpret-trailers --parse)"
+signed_off_by_pattern='^Signed-off-by: .+ <.+>$'
+
+if ! grep -Eq "${signed_off_by_pattern}" <<< "${trailers}"; then
+    cat >&2 <<'EOF'
+commit message must include a Signed-off-by trailer.
+
+Use `git commit -s` (or `git commit --signoff`) so Git appends:
+  Signed-off-by: Your Name <you@example.com>
+EOF
+    exit 1
+fi
+
+commit_file_count=${CRIEW_COMMIT_FILE_COUNT:-}
+commit_line_count=${CRIEW_COMMIT_LINE_COUNT:-}
+
+if [[ -z "${commit_file_count}" || -z "${commit_line_count}" ]]; then
+    if [[ -n "${CRIEW_COMMIT_SHA:-}" ]]; then
+        diff_numstat="$(git show --format= --numstat --find-renames "${CRIEW_COMMIT_SHA}")"
+    elif git rev-parse --verify --quiet HEAD >/dev/null; then
+        diff_numstat="$(git diff --cached --numstat --find-renames HEAD)"
+    else
+        diff_numstat="$(git diff --cached --numstat --find-renames --root)"
+    fi
+
+    read -r commit_file_count commit_line_count <<< "$(
+        printf '%s\n' "${diff_numstat}" | awk '
+            NF >= 3 {
+                files += 1
+                if ($1 != "-") {
+                    lines += $1
+                }
+                if ($2 != "-") {
+                    lines += $2
+                }
+            }
+            END {
+                print files + 0, lines + 0
+            }
+        '
+    )"
+fi
+
+is_large_commit=0
+if (( commit_file_count >= large_commit_file_threshold || commit_line_count >= large_commit_line_threshold )); then
+    is_large_commit=1
+fi
+
+body_lines="$(printf '%s\n' "${cleaned_message}" | sed '1d')"
+has_bullet_body=0
+if grep -Eq '^[[:space:]]*[-*][[:space:]]+\S' <<< "${body_lines}"; then
+    has_bullet_body=1
+fi
+
+if (( is_large_commit )) && (( ! skip_large_commit_body_check )); then
+    if (( ! has_bullet_body )); then
+        cat >&2 <<EOF
+larger commits must include a body with bullet points that summarize the main changes.
+
+Current threshold:
+  - at least ${large_commit_file_threshold} changed files, or
+  - at least ${large_commit_line_threshold} added/deleted lines
+
+Example:
+  feat: improve inbox sync startup behavior
+
+  - split IMAP startup sync scheduling from periodic auto-sync
+  - add regression coverage for inbox fallback and config defaults
+EOF
+        exit 1
+    fi
 fi

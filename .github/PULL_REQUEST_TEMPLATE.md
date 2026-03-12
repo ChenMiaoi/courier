@@ -36,6 +36,7 @@ List what you ran locally.
 - [ ] Tests were added or updated when needed
 - [ ] User-visible behavior was documented when needed
 - [ ] I checked for regressions in related workflows
+- [ ] If this branch conflicted with `develop`, I used `rebase` to resolve it
 
 ## Notes For Reviewers
 

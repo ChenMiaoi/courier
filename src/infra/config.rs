@@ -31,6 +31,16 @@ mailbox = "linux-kernel"
 
 [ui]
 startup_sync = true
+# keymap = "default" # Supported: default, vim, custom
+# keymap_base = "default" # Base scheme used when keymap = "custom"
+# [ui.custom_keymap]
+# focus_prev = ["j"]
+# focus_next = ["l"]
+# move_up = ["i"]
+# move_down = ["k"]
+# jump_top = ["g", "g"]
+# jump_bottom = ["G"]
+# quick_quit = ["q", "q"]
 # inbox_auto_sync_interval_secs = 30
 
 [logging]
@@ -54,6 +64,60 @@ impl ImapEncryption {
             Self::None => "none",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UiKeymap {
+    #[default]
+    Default,
+    Vim,
+    Custom,
+}
+
+impl UiKeymap {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Vim => "vim",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn default_base(self) -> UiKeymapBase {
+        match self {
+            Self::Vim => UiKeymapBase::Vim,
+            Self::Default | Self::Custom => UiKeymapBase::Default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UiKeymapBase {
+    #[default]
+    Default,
+    Vim,
+}
+
+impl UiKeymapBase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Vim => "vim",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiCustomKeymapConfig {
+    pub focus_prev: Option<Vec<String>>,
+    pub focus_next: Option<Vec<String>>,
+    pub move_up: Option<Vec<String>>,
+    pub move_down: Option<Vec<String>>,
+    pub jump_top: Option<Vec<String>>,
+    pub jump_bottom: Option<Vec<String>>,
+    pub quick_quit: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -133,6 +197,9 @@ pub struct RuntimeConfig {
     pub imap: ImapConfig,
     pub lore_base_url: String,
     pub startup_sync: bool,
+    pub ui_keymap: UiKeymap,
+    pub ui_keymap_base: UiKeymapBase,
+    pub ui_custom_keymap: UiCustomKeymapConfig,
     pub inbox_auto_sync_interval_secs: u64,
     pub kernel_trees: Vec<PathBuf>,
 }
@@ -197,7 +264,22 @@ struct SourceConfig {
 #[derive(Debug, Default, Deserialize)]
 struct UiConfig {
     startup_sync: Option<bool>,
+    keymap: Option<UiKeymap>,
+    keymap_base: Option<UiKeymapBase>,
+    #[serde(default)]
+    custom_keymap: UiCustomKeymapFileConfig,
     inbox_auto_sync_interval_secs: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UiCustomKeymapFileConfig {
+    focus_prev: Option<Vec<String>>,
+    focus_next: Option<Vec<String>>,
+    move_up: Option<Vec<String>>,
+    move_down: Option<Vec<String>>,
+    jump_top: Option<Vec<String>>,
+    jump_bottom: Option<Vec<String>>,
+    quick_quit: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -346,6 +428,13 @@ fn build_runtime_config(
     let lore_base_url = normalize_optional_string(file_config.source.lore_base_url)
         .unwrap_or_else(|| DEFAULT_LORE_BASE_URL.to_string());
     let startup_sync = file_config.ui.startup_sync.unwrap_or(true);
+    let ui_keymap = file_config.ui.keymap.unwrap_or_default();
+    let ui_keymap_base = file_config
+        .ui
+        .keymap_base
+        .unwrap_or_else(|| ui_keymap.default_base());
+    let ui_custom_keymap = build_ui_custom_keymap_config(&file_config.ui.custom_keymap)?;
+    validate_ui_custom_keymap_config(ui_keymap_base, &ui_custom_keymap)?;
     let inbox_auto_sync_interval_secs = file_config
         .ui
         .inbox_auto_sync_interval_secs
@@ -383,6 +472,9 @@ fn build_runtime_config(
         imap,
         lore_base_url,
         startup_sync,
+        ui_keymap,
+        ui_keymap_base,
+        ui_custom_keymap,
         inbox_auto_sync_interval_secs,
         kernel_trees,
     })
@@ -458,6 +550,227 @@ fn parse_config_document(content: &str, path: &Path) -> Result<FileConfig> {
 
 fn build_imap_config(file_config: &ImapFileConfig, config_path: &Path) -> Result<ImapConfig> {
     build_imap_config_with_env(file_config, config_path, |key| std::env::var(key).ok())
+}
+
+fn build_ui_custom_keymap_config(
+    file_config: &UiCustomKeymapFileConfig,
+) -> Result<UiCustomKeymapConfig> {
+    Ok(UiCustomKeymapConfig {
+        focus_prev: normalize_ui_custom_keymap_binding(
+            "ui.custom_keymap.focus_prev",
+            file_config.focus_prev.clone(),
+            1,
+            1,
+        )?,
+        focus_next: normalize_ui_custom_keymap_binding(
+            "ui.custom_keymap.focus_next",
+            file_config.focus_next.clone(),
+            1,
+            1,
+        )?,
+        move_up: normalize_ui_custom_keymap_binding(
+            "ui.custom_keymap.move_up",
+            file_config.move_up.clone(),
+            1,
+            1,
+        )?,
+        move_down: normalize_ui_custom_keymap_binding(
+            "ui.custom_keymap.move_down",
+            file_config.move_down.clone(),
+            1,
+            1,
+        )?,
+        jump_top: normalize_ui_custom_keymap_binding(
+            "ui.custom_keymap.jump_top",
+            file_config.jump_top.clone(),
+            1,
+            2,
+        )?,
+        jump_bottom: normalize_ui_custom_keymap_binding(
+            "ui.custom_keymap.jump_bottom",
+            file_config.jump_bottom.clone(),
+            1,
+            2,
+        )?,
+        quick_quit: normalize_ui_custom_keymap_binding(
+            "ui.custom_keymap.quick_quit",
+            file_config.quick_quit.clone(),
+            1,
+            2,
+        )?,
+    })
+}
+
+fn normalize_ui_custom_keymap_binding(
+    key: &str,
+    tokens: Option<Vec<String>>,
+    min_len: usize,
+    max_len: usize,
+) -> Result<Option<Vec<String>>> {
+    let Some(tokens) = tokens else {
+        return Ok(None);
+    };
+    if tokens.len() < min_len || tokens.len() > max_len {
+        return Err(CriewError::new(
+            ErrorCode::ConfigParse,
+            format!("{key} must contain between {min_len} and {max_len} keys"),
+        ));
+    }
+
+    let mut normalized = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let Some(character) = normalize_ui_custom_keymap_token(&token) else {
+            return Err(CriewError::new(
+                ErrorCode::ConfigParse,
+                format!("{key} contains an unsupported key token: {token}"),
+            ));
+        };
+        if is_reserved_main_page_keymap_character(character) {
+            return Err(CriewError::new(
+                ErrorCode::ConfigParse,
+                format!("{key} uses reserved key {character}"),
+            ));
+        }
+        normalized.push(character.to_string());
+    }
+
+    Ok(Some(normalized))
+}
+
+fn normalize_ui_custom_keymap_token(token: &str) -> Option<char> {
+    let trimmed = token.trim();
+    let mut characters = trimmed.chars();
+    let character = characters.next()?;
+    if characters.next().is_some()
+        || character.is_ascii_control()
+        || character.is_ascii_whitespace()
+        || character.is_ascii_digit()
+    {
+        return None;
+    }
+
+    Some(character)
+}
+
+fn is_reserved_main_page_keymap_character(character: char) -> bool {
+    matches!(
+        character,
+        ':' | '/'
+            | 'e'
+            | 'r'
+            | 'a'
+            | 'd'
+            | 'u'
+            | 'y'
+            | 'n'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | 'E'
+            | '-'
+            | '='
+            | '+'
+    )
+}
+
+fn validate_ui_custom_keymap_config(
+    base: UiKeymapBase,
+    custom: &UiCustomKeymapConfig,
+) -> Result<()> {
+    let mut bindings = vec![
+        (
+            "focus_prev",
+            resolved_ui_keymap_binding(base, custom.focus_prev.as_ref(), "focus_prev")
+                .expect("focus_prev should always resolve"),
+        ),
+        (
+            "focus_next",
+            resolved_ui_keymap_binding(base, custom.focus_next.as_ref(), "focus_next")
+                .expect("focus_next should always resolve"),
+        ),
+        (
+            "move_up",
+            resolved_ui_keymap_binding(base, custom.move_up.as_ref(), "move_up")
+                .expect("move_up should always resolve"),
+        ),
+        (
+            "move_down",
+            resolved_ui_keymap_binding(base, custom.move_down.as_ref(), "move_down")
+                .expect("move_down should always resolve"),
+        ),
+    ];
+
+    if let Some(binding) = resolved_ui_keymap_binding(base, custom.jump_top.as_ref(), "jump_top") {
+        bindings.push(("jump_top", binding));
+    }
+    if let Some(binding) =
+        resolved_ui_keymap_binding(base, custom.jump_bottom.as_ref(), "jump_bottom")
+    {
+        bindings.push(("jump_bottom", binding));
+    }
+    if let Some(binding) =
+        resolved_ui_keymap_binding(base, custom.quick_quit.as_ref(), "quick_quit")
+    {
+        bindings.push(("quick_quit", binding));
+    }
+
+    for (index, (left_name, left_binding)) in bindings.iter().enumerate() {
+        for (right_name, right_binding) in bindings.iter().skip(index + 1) {
+            if left_binding == right_binding {
+                return Err(CriewError::new(
+                    ErrorCode::ConfigParse,
+                    format!("ui.custom_keymap.{left_name} conflicts with {right_name}"),
+                ));
+            }
+            if binding_is_prefix(left_binding, right_binding)
+                || binding_is_prefix(right_binding, left_binding)
+            {
+                return Err(CriewError::new(
+                    ErrorCode::ConfigParse,
+                    format!("ui.custom_keymap.{left_name} has a prefix conflict with {right_name}"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn resolved_ui_keymap_binding<'a>(
+    base: UiKeymapBase,
+    custom: Option<&'a Vec<String>>,
+    action: &str,
+) -> Option<Vec<&'a str>> {
+    if let Some(binding) = custom {
+        return Some(binding.iter().map(String::as_str).collect());
+    }
+
+    preset_ui_keymap_binding(base, action).map(|binding| binding.to_vec())
+}
+
+fn preset_ui_keymap_binding(base: UiKeymapBase, action: &str) -> Option<&'static [&'static str]> {
+    match (base, action) {
+        (UiKeymapBase::Default, "focus_prev") => Some(&["j"]),
+        (UiKeymapBase::Default, "focus_next") => Some(&["l"]),
+        (UiKeymapBase::Default, "move_up") => Some(&["i"]),
+        (UiKeymapBase::Default, "move_down") => Some(&["k"]),
+        (UiKeymapBase::Default, "jump_top") => None,
+        (UiKeymapBase::Default, "jump_bottom") => None,
+        (UiKeymapBase::Default, "quick_quit") => None,
+        (UiKeymapBase::Vim, "focus_prev") => Some(&["h"]),
+        (UiKeymapBase::Vim, "focus_next") => Some(&["l"]),
+        (UiKeymapBase::Vim, "move_up") => Some(&["k"]),
+        (UiKeymapBase::Vim, "move_down") => Some(&["j"]),
+        (UiKeymapBase::Vim, "jump_top") => Some(&["g", "g"]),
+        (UiKeymapBase::Vim, "jump_bottom") => Some(&["G"]),
+        (UiKeymapBase::Vim, "quick_quit") => Some(&["q", "q"]),
+        _ => unreachable!("unexpected keymap action"),
+    }
+}
+
+fn binding_is_prefix(left: &[&str], right: &[&str]) -> bool {
+    left.len() < right.len() && right.starts_with(left)
 }
 
 fn build_imap_config_with_env<F>(
@@ -610,8 +923,8 @@ mod tests {
 
     use super::{
         DEFAULT_CONFIG_FILE_NAME, DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS, IMAP_INBOX_MAILBOX,
-        ImapFileConfig, LEGACY_CONFIG_FILE_NAME, SelfEmailSource, build_imap_config_with_env, load,
-        load_with_home, resolve_self_email_with,
+        ImapFileConfig, LEGACY_CONFIG_FILE_NAME, SelfEmailSource, UiKeymap, UiKeymapBase,
+        build_imap_config_with_env, load, load_with_home, resolve_self_email_with,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -651,6 +964,7 @@ lore_base_url = "https://lore.kernel.org"
 
 [ui]
 startup_sync = false
+keymap = "vim"
 inbox_auto_sync_interval_secs = 45
 
 [kernel]
@@ -672,6 +986,7 @@ trees = ["./linux-next"]
         assert_eq!(loaded.source_mailbox, "linux-kernel");
         assert_eq!(loaded.lore_base_url, "https://lore.kernel.org");
         assert!(!loaded.startup_sync);
+        assert_eq!(loaded.ui_keymap, UiKeymap::Vim);
         assert_eq!(loaded.inbox_auto_sync_interval_secs, 45);
         assert_eq!(
             loaded.kernel_trees,
@@ -697,6 +1012,7 @@ trees = ["./linux-next"]
         assert_eq!(loaded.patch_dir, home.join(".criew/patches"));
         assert_eq!(loaded.database_path, home.join(".criew/db/criew.db"));
         assert!(loaded.startup_sync);
+        assert_eq!(loaded.ui_keymap, UiKeymap::Default);
         assert_eq!(
             loaded.inbox_auto_sync_interval_secs,
             DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS
@@ -708,6 +1024,114 @@ trees = ["./linux-next"]
         assert!(content.contains("mailbox = \"linux-kernel\""));
 
         let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn loads_custom_ui_keymap_from_config() {
+        let base = temp_dir("config-custom-keymap");
+        let config_path = base.join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[ui]
+keymap = "custom"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load(Some(&config_path)).expect("load config");
+
+        assert_eq!(loaded.ui_keymap, UiKeymap::Custom);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn loads_custom_ui_keymap_overrides_and_base_from_config() {
+        let base = temp_dir("config-custom-keymap-overrides");
+        let config_path = base.join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[ui]
+keymap = "custom"
+keymap_base = "vim"
+
+[ui.custom_keymap]
+focus_prev = ["x"]
+quick_quit = ["z", "z"]
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load(Some(&config_path)).expect("load config");
+
+        assert_eq!(loaded.ui_keymap, UiKeymap::Custom);
+        assert_eq!(loaded.ui_keymap_base, UiKeymapBase::Vim);
+        assert_eq!(
+            loaded.ui_custom_keymap.focus_prev,
+            Some(vec!["x".to_string()])
+        );
+        assert_eq!(
+            loaded.ui_custom_keymap.quick_quit,
+            Some(vec!["z".to_string(), "z".to_string()])
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn infers_custom_keymap_base_from_vim_scheme_when_omitted() {
+        let base = temp_dir("config-vim-infers-custom-base");
+        let config_path = base.join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[ui]
+keymap = "vim"
+"#,
+        )
+        .expect("write config");
+
+        let loaded = load(Some(&config_path)).expect("load config");
+
+        assert_eq!(loaded.ui_keymap, UiKeymap::Vim);
+        assert_eq!(loaded.ui_keymap_base, UiKeymapBase::Vim);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn rejects_custom_keymap_prefix_conflicts_against_base() {
+        let base = temp_dir("config-custom-keymap-conflict");
+        let config_path = base.join("config.toml");
+
+        fs::write(
+            &config_path,
+            r#"
+[ui]
+keymap = "custom"
+keymap_base = "vim"
+
+[ui.custom_keymap]
+focus_prev = ["g"]
+"#,
+        )
+        .expect("write config");
+
+        let error = match load(Some(&config_path)) {
+            Ok(_) => panic!("conflicting config should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("prefix conflict"),
+            "unexpected error: {error}"
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
@@ -765,7 +1189,6 @@ imapencryption = "tls"
             loaded.imap.encryption.map(|value| value.as_str()),
             Some("tls")
         );
-        assert_eq!(loaded.imap.proxy, None);
         assert!(loaded.imap.is_complete());
         assert_eq!(loaded.default_active_mailbox(), IMAP_INBOX_MAILBOX);
 

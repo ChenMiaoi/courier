@@ -1127,19 +1127,29 @@ fn format_seq(values: &[u32]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::process::Command as ProcessCommand;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use rusqlite::{Connection, params};
+
+    use crate::domain::models::PatchSeriesStatus;
     use crate::infra::config::RuntimeConfig;
+    use crate::infra::db;
+    use crate::infra::error::ErrorCode;
     use crate::infra::mail_store::ThreadRow;
+    use crate::infra::patch_store;
 
     use super::{
         APPLY_ARTIFACTS_DIR, PatchAction, SeriesIntegrity, action_args, action_subcommand,
-        action_working_dir, build_series_index, download_series_name, parse_patch_subject,
-        parse_seq_total_token, parse_version_token, relocate_new_apply_artifacts,
-        snapshot_apply_artifacts, subject_is_patch_related, undo_last_apply,
+        action_working_dir, build_series_index, download_series_name, hydrate_series_statuses,
+        load_latest_report, parse_patch_subject, parse_seq_total_token, parse_version_token,
+        relocate_new_apply_artifacts, run_action, snapshot_apply_artifacts,
+        subject_is_patch_related, undo_last_apply,
     };
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -1147,7 +1157,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("criew-patch-{label}-{nonce}"));
+        let path = std::env::temp_dir().join(format!(
+            "criew-patch-{label}-{}-{nonce}",
+            std::process::id()
+        ));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }
@@ -1167,6 +1180,32 @@ mod tests {
             imap: crate::infra::config::ImapConfig::default(),
             lore_base_url: "https://lore.kernel.org".to_string(),
             startup_sync: true,
+            ui_keymap: crate::infra::config::UiKeymap::Default,
+            ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
+            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
+            inbox_auto_sync_interval_secs:
+                crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
+            kernel_trees,
+        }
+    }
+
+    fn runtime_in(root: &Path, kernel_trees: Vec<PathBuf>) -> RuntimeConfig {
+        RuntimeConfig {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            database_path: root.join("data").join("criew.db"),
+            raw_mail_dir: root.join("data").join("raw"),
+            patch_dir: root.join("data").join("patches"),
+            log_dir: root.join("data").join("logs"),
+            b4_path: None,
+            log_filter: "info".to_string(),
+            source_mailbox: "io-uring".to_string(),
+            imap: crate::infra::config::ImapConfig::default(),
+            lore_base_url: "https://lore.kernel.org".to_string(),
+            startup_sync: true,
+            ui_keymap: crate::infra::config::UiKeymap::Default,
+            ui_keymap_base: crate::infra::config::UiKeymapBase::Default,
+            ui_custom_keymap: crate::infra::config::UiCustomKeymapConfig::default(),
             inbox_auto_sync_interval_secs:
                 crate::infra::config::DEFAULT_INBOX_AUTO_SYNC_INTERVAL_SECS,
             kernel_trees,
@@ -1202,6 +1241,41 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn write_script(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        fs::write(&path, body).expect("write script");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("mark executable");
+        }
+        path
+    }
+
+    fn seed_mail_rows(path: &Path, rows: &[(i64, &str)]) {
+        let connection = Connection::open(path).expect("open db");
+        for (id, message_id) in rows {
+            connection
+                .execute(
+                    "
+INSERT INTO mail(id, message_id, subject, from_addr, imap_mailbox, imap_uid)
+VALUES (?1, ?2, ?3, ?4, 'io-uring', ?1)
+",
+                    params![id, message_id, format!("subject-{id}"), "alice@example.com"],
+                )
+                .expect("insert mail row");
+        }
+    }
+
+    fn initialize_patch_runtime(runtime: &RuntimeConfig, mail_rows: &[(i64, &str)]) {
+        if let Some(parent) = runtime.database_path.parent() {
+            fs::create_dir_all(parent).expect("create db parent");
+        }
+        let _ = db::initialize(&runtime.database_path).expect("initialize db");
+        seed_mail_rows(&runtime.database_path, mail_rows);
     }
 
     fn thread_row(
@@ -1248,6 +1322,162 @@ mod tests {
             integrity: super::SeriesIntegrity::Complete,
             status: crate::domain::models::PatchSeriesStatus::New,
         }
+    }
+
+    #[test]
+    fn integrity_helpers_match_user_visible_patch_status_contract() {
+        let mut summary = sample_summary("[PATCH 1/1] io_uring: demo", 1);
+
+        assert_eq!(summary.present_count(), 1);
+        assert_eq!(summary.status_label(), "new");
+        assert_eq!(SeriesIntegrity::Complete.as_str(), "complete");
+        assert_eq!(SeriesIntegrity::Complete.short_label(), "ready");
+        assert!(SeriesIntegrity::Complete.is_ready());
+        assert_eq!(summary.integrity_reason(), None);
+
+        summary.integrity = SeriesIntegrity::Missing;
+        summary.missing_seq = vec![2, 4];
+        assert_eq!(summary.integrity.as_str(), "missing");
+        assert_eq!(summary.integrity.short_label(), "missing");
+        assert!(!summary.integrity.is_ready());
+        assert_eq!(
+            summary.integrity_reason().as_deref(),
+            Some("missing patch index: 2,4")
+        );
+
+        summary.integrity = SeriesIntegrity::Duplicate;
+        summary.duplicate_seq = vec![1];
+        assert_eq!(summary.integrity.as_str(), "duplicate");
+        assert_eq!(summary.integrity.short_label(), "duplicate");
+        assert_eq!(
+            summary.integrity_reason().as_deref(),
+            Some("duplicate patch index: 1")
+        );
+
+        summary.integrity = SeriesIntegrity::OutOfOrder;
+        assert_eq!(summary.integrity.as_str(), "out-of-order");
+        assert_eq!(summary.integrity.short_label(), "out-of-order");
+        assert_eq!(
+            summary.integrity_reason().as_deref(),
+            Some("patch order is out-of-order in thread")
+        );
+
+        summary.integrity = SeriesIntegrity::Invalid;
+        assert_eq!(summary.integrity.as_str(), "invalid");
+        assert_eq!(summary.integrity.short_label(), "invalid");
+        assert_eq!(
+            summary.integrity_reason().as_deref(),
+            Some("no valid [PATCH vN M/N] sequence found")
+        );
+
+        summary.status = PatchSeriesStatus::Conflict;
+        assert_eq!(summary.status_label(), "conflict");
+    }
+
+    #[test]
+    fn hydrate_series_statuses_overlays_only_visible_threads() {
+        let root = temp_dir("hydrate-status");
+        let runtime = runtime_in(&root, Vec::new());
+        initialize_patch_runtime(&runtime, &[(1, "patch@example.com")]);
+
+        let series = patch_store::upsert_series(
+            &runtime.database_path,
+            &patch_store::UpsertSeriesRequest {
+                mailbox: "io-uring".to_string(),
+                thread_id: 42,
+                version: 1,
+                expected_total: 1,
+                author: "Alice".to_string(),
+                subject: "demo".to_string(),
+                anchor_message_id: "patch@example.com".to_string(),
+                integrity: "complete".to_string(),
+                missing_seq: Vec::new(),
+                duplicate_seq: Vec::new(),
+                out_of_order: false,
+                items: vec![patch_store::UpsertSeriesItem {
+                    seq: 1,
+                    total: 1,
+                    mail_id: 1,
+                    message_id: "patch@example.com".to_string(),
+                    subject: "demo".to_string(),
+                    raw_path: None,
+                    sort_ord: 0,
+                }],
+            },
+        )
+        .expect("persist series");
+        patch_store::update_series_result(
+            &runtime.database_path,
+            series.id,
+            &patch_store::SeriesResultUpdate {
+                status: PatchSeriesStatus::Applied,
+                last_error: None,
+                last_command: Some("b4 am patch@example.com".to_string()),
+                last_exit_code: Some(0),
+                last_stdout: Some("applied".to_string()),
+                last_stderr: None,
+                output_path: None,
+            },
+        )
+        .expect("update series status");
+
+        let mut visible_summaries = HashMap::from([
+            (42, sample_summary("[PATCH 1/1] io_uring: demo", 1)),
+            (
+                99,
+                super::SeriesSummary {
+                    thread_id: 99,
+                    status: PatchSeriesStatus::Failed,
+                    ..sample_summary("[PATCH 1/1] io_uring: another", 1)
+                },
+            ),
+        ]);
+
+        hydrate_series_statuses(&runtime.database_path, "io-uring", &mut visible_summaries)
+            .expect("hydrate statuses");
+
+        assert_eq!(
+            visible_summaries.get(&42).map(|summary| summary.status),
+            Some(PatchSeriesStatus::Applied)
+        );
+        assert_eq!(
+            visible_summaries.get(&99).map(|summary| summary.status),
+            Some(PatchSeriesStatus::Failed)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_latest_report_returns_none_when_thread_has_no_patch_state() {
+        let root = temp_dir("latest-report-none");
+        let runtime = runtime_in(&root, Vec::new());
+        initialize_patch_runtime(&runtime, &[]);
+
+        let report =
+            load_latest_report(&runtime.database_path, "io-uring", 42).expect("load latest report");
+        assert!(report.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_action_rejects_incomplete_series_before_persisting_or_running_b4() {
+        let root = temp_dir("reject-incomplete");
+        let runtime = runtime_in(&root, Vec::new());
+        let mut summary = sample_summary("[PATCH 1/2] io_uring: demo", 1);
+        summary.integrity = SeriesIntegrity::Missing;
+        summary.expected_total = 2;
+        summary.missing_seq = vec![2];
+
+        let error = run_action(&runtime, &summary, PatchAction::Apply).expect_err("reject apply");
+
+        assert_eq!(error.code(), ErrorCode::Command);
+        assert!(error.to_string().contains("cannot apply series"));
+        assert!(error.to_string().contains("missing patch index: 2"));
+        assert!(!runtime.database_path.exists());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1360,10 +1590,81 @@ mod tests {
     }
 
     #[test]
+    fn build_series_index_detects_duplicate_and_out_of_order_series() {
+        let duplicate_rows = vec![
+            thread_row(20, 1, "[PATCH v2 1/2] first", "a@example.com", 0),
+            thread_row(20, 2, "[PATCH v2 1/2] reroll", "b@example.com", 1),
+            thread_row(20, 3, "[PATCH v2 2/2] second", "c@example.com", 1),
+        ];
+        let duplicate_index = build_series_index("io-uring", &duplicate_rows);
+        let duplicate = duplicate_index.get(&20).expect("duplicate series exists");
+        assert_eq!(duplicate.integrity, SeriesIntegrity::Duplicate);
+        assert_eq!(duplicate.duplicate_seq, vec![1]);
+        assert_eq!(
+            duplicate.integrity_reason().as_deref(),
+            Some("duplicate patch index: 1")
+        );
+        assert_eq!(duplicate.integrity.short_label(), "duplicate");
+
+        let out_of_order_rows = vec![
+            thread_row(21, 1, "[PATCH v1 2/2] second", "p2@example.com", 0),
+            thread_row(21, 2, "[PATCH v1 1/2] first", "p1@example.com", 1),
+        ];
+        let out_of_order_index = build_series_index("io-uring", &out_of_order_rows);
+        let out_of_order = out_of_order_index
+            .get(&21)
+            .expect("out-of-order series exists");
+        assert_eq!(out_of_order.integrity, SeriesIntegrity::OutOfOrder);
+        assert!(out_of_order.out_of_order);
+        assert_eq!(
+            out_of_order.integrity_reason().as_deref(),
+            Some("patch order is out-of-order in thread")
+        );
+    }
+
+    #[test]
+    fn build_series_index_marks_cover_only_series_invalid() {
+        let rows = vec![thread_row(
+            22,
+            1,
+            "[PATCH v4 0/2] io_uring: cover letter only",
+            "cover@example.com",
+            0,
+        )];
+        let index = build_series_index("io-uring", &rows);
+        let series = index.get(&22).expect("series exists");
+        assert_eq!(series.integrity, SeriesIntegrity::Invalid);
+        assert!(series.items.is_empty());
+        assert_eq!(series.anchor_message_id, "cover@example.com");
+        assert_eq!(
+            series.integrity_reason().as_deref(),
+            Some("no valid [PATCH vN M/N] sequence found")
+        );
+    }
+
+    #[test]
     fn apply_requires_kernel_tree_configuration() {
         let runtime = runtime_with_kernel_trees(Vec::new());
         let error = action_working_dir(&runtime, PatchAction::Apply).expect_err("should fail");
         assert!(error.to_string().contains("[kernel].tree"));
+    }
+
+    #[test]
+    fn apply_requires_existing_kernel_tree_directory() {
+        let root = temp_dir("apply-missing-tree");
+        let missing = root.join("missing-tree");
+        let runtime = runtime_in(&root, vec![missing.clone()]);
+
+        let error = action_working_dir(&runtime, PatchAction::Apply).expect_err("missing tree");
+        assert!(error.to_string().contains("does not exist"));
+
+        let file_path = root.join("not-a-directory");
+        fs::write(&file_path, "file").expect("write file");
+        let runtime = runtime_in(&root, vec![file_path.clone()]);
+        let error = action_working_dir(&runtime, PatchAction::Apply).expect_err("file tree");
+        assert!(error.to_string().contains("is not"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1384,6 +1685,187 @@ mod tests {
         let working_dir =
             action_working_dir(&runtime, PatchAction::Download).expect("download dir resolution");
         assert!(working_dir.is_none());
+    }
+
+    #[test]
+    fn run_action_download_records_reviewing_report() {
+        let root = temp_dir("run-action-download");
+        let b4_script = write_script(
+            &root,
+            "fake-b4.sh",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'b4 0.14.0'\n  exit 0\nfi\nif [ \"$1\" = \"am\" ]; then\n  echo 'downloaded patch series'\n  exit 0\nfi\nexit 1\n",
+        );
+        let mut runtime = runtime_in(&root, Vec::new());
+        runtime.b4_path = Some(b4_script);
+        initialize_patch_runtime(&runtime, &[(1, "patch@example.com")]);
+        let summary = sample_summary("io_uring: exported series", 2);
+
+        let result = run_action(&runtime, &summary, PatchAction::Download).expect("download runs");
+
+        assert_eq!(result.status, PatchSeriesStatus::Reviewing);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.timed_out);
+        assert!(result.command_line.contains("am"));
+        assert!(result.summary.starts_with("series downloaded to "));
+        let output_path = result.output_path.expect("download path");
+        assert!(output_path.starts_with(&runtime.patch_dir));
+        assert!(output_path.is_dir());
+
+        let latest = load_latest_report(&runtime.database_path, "io-uring", summary.thread_id)
+            .expect("load latest report")
+            .expect("report exists");
+        assert_eq!(latest.status, PatchSeriesStatus::Reviewing);
+        assert_eq!(latest.last_error, None);
+        assert_eq!(latest.last_exit_code, Some(0));
+        assert_eq!(
+            latest.last_summary.as_deref(),
+            Some(result.summary.as_str())
+        );
+        assert_eq!(
+            latest.last_command.as_deref(),
+            Some(result.command_line.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_action_apply_marks_conflicts_in_latest_report() {
+        let root = temp_dir("run-action-conflict");
+        let repo = root.join("linux");
+        fs::create_dir_all(&repo).expect("create repo");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "CRIEW Test"]);
+        run_git(&repo, &["config", "user.email", "criew@example.com"]);
+        fs::write(repo.join("base.txt"), "base\n").expect("write base");
+        run_git(&repo, &["add", "base.txt"]);
+        run_git(&repo, &["commit", "-m", "base"]);
+
+        let b4_script = write_script(
+            &root,
+            "fake-b4.sh",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'b4 0.14.0'\n  exit 0\nfi\nif [ \"$1\" = \"shazam\" ]; then\n  echo 'patch failed at 0001 demo' >&2\n  exit 1\nfi\nexit 1\n",
+        );
+        let mut runtime = runtime_in(&root, vec![repo.clone()]);
+        runtime.b4_path = Some(b4_script);
+        initialize_patch_runtime(&runtime, &[(1, "patch@example.com")]);
+        let summary = sample_summary("io_uring: conflict series", 1);
+
+        let result = run_action(&runtime, &summary, PatchAction::Apply).expect("apply runs");
+
+        assert_eq!(result.status, PatchSeriesStatus::Conflict);
+        assert_eq!(result.exit_code, Some(1));
+        assert!(result.summary.contains("series apply conflict"));
+        assert!(result.head_before.is_none());
+        assert!(result.head_after.is_none());
+
+        let latest = load_latest_report(&runtime.database_path, "io-uring", summary.thread_id)
+            .expect("load latest report")
+            .expect("report exists");
+        assert_eq!(latest.status, PatchSeriesStatus::Conflict);
+        assert_eq!(latest.last_error.as_deref(), Some(result.summary.as_str()));
+        assert_eq!(
+            latest.last_summary.as_deref(),
+            Some(result.summary.as_str())
+        );
+        assert_eq!(latest.last_exit_code, Some(1));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_action_apply_rejects_noop_success_when_head_does_not_move() {
+        let root = temp_dir("run-action-noop");
+        let repo = root.join("linux");
+        fs::create_dir_all(&repo).expect("create repo");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "CRIEW Test"]);
+        run_git(&repo, &["config", "user.email", "criew@example.com"]);
+        fs::write(repo.join("base.txt"), "base\n").expect("write base");
+        run_git(&repo, &["add", "base.txt"]);
+        run_git(&repo, &["commit", "-m", "base"]);
+
+        let b4_script = write_script(
+            &root,
+            "fake-b4.sh",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'b4 0.14.0'\n  exit 0\nfi\nif [ \"$1\" = \"shazam\" ]; then\n  echo 'applied without commit'\n  exit 0\nfi\nexit 1\n",
+        );
+        let mut runtime = runtime_in(&root, vec![repo.clone()]);
+        runtime.b4_path = Some(b4_script);
+        initialize_patch_runtime(&runtime, &[(1, "patch@example.com")]);
+        let summary = sample_summary("io_uring: noop series", 1);
+
+        let result = run_action(&runtime, &summary, PatchAction::Apply).expect("apply runs");
+
+        assert_eq!(result.status, PatchSeriesStatus::Failed);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.summary.contains("git HEAD did not move"));
+        assert!(result.head_before.is_none());
+        assert!(result.head_after.is_none());
+
+        let latest = load_latest_report(&runtime.database_path, "io-uring", summary.thread_id)
+            .expect("load latest report")
+            .expect("report exists");
+        assert_eq!(latest.status, PatchSeriesStatus::Failed);
+        assert_eq!(latest.last_error.as_deref(), Some(result.summary.as_str()));
+        assert_eq!(
+            latest.last_summary.as_deref(),
+            Some(result.summary.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_action_apply_records_head_change_and_moves_artifacts() {
+        let root = temp_dir("run-action-apply-success");
+        let repo = root.join("linux");
+        fs::create_dir_all(&repo).expect("create repo");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.name", "CRIEW Test"]);
+        run_git(&repo, &["config", "user.email", "criew@example.com"]);
+        fs::write(repo.join("base.txt"), "base\n").expect("write base");
+        run_git(&repo, &["add", "base.txt"]);
+        run_git(&repo, &["commit", "-m", "base"]);
+
+        let b4_script = write_script(
+            &root,
+            "fake-b4.sh",
+            "#!/bin/sh\nset -e\nif [ \"$1\" = \"--version\" ]; then\n  echo 'b4 0.14.0'\n  exit 0\nfi\nif [ \"$1\" = \"shazam\" ]; then\n  printf 'applied by fake b4\\n' > applied.txt\n  git add applied.txt\n  git commit -m 'apply-series' >/dev/null 2>&1\n  printf 'mbx\\n' > demo-series.mbx\n  printf 'cover\\n' > demo-series.cover\n  exit 0\nfi\nexit 1\n",
+        );
+        let mut runtime = runtime_in(&root, vec![repo.clone()]);
+        runtime.b4_path = Some(b4_script);
+        initialize_patch_runtime(&runtime, &[(1, "patch@example.com")]);
+        let summary = sample_summary("io_uring: applied series", 1);
+
+        let result = run_action(&runtime, &summary, PatchAction::Apply).expect("apply runs");
+
+        assert_eq!(result.status, PatchSeriesStatus::Applied);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.summary.contains("series applied by b4 shazam"));
+        assert!(result.summary.contains("artifacts moved to"));
+        let head_before = result.head_before.expect("head before");
+        let head_after = result.head_after.expect("head after");
+        assert_ne!(head_before, head_after);
+
+        let output_path = result.output_path.expect("artifact path");
+        assert!(output_path.starts_with(runtime.patch_dir.join(APPLY_ARTIFACTS_DIR)));
+        assert!(output_path.join("demo-series.mbx").exists());
+        assert!(output_path.join("demo-series.cover").exists());
+        assert!(!repo.join("demo-series.mbx").exists());
+        assert!(!repo.join("demo-series.cover").exists());
+
+        let latest = load_latest_report(&runtime.database_path, "io-uring", summary.thread_id)
+            .expect("load latest report")
+            .expect("report exists");
+        assert_eq!(latest.status, PatchSeriesStatus::Applied);
+        assert_eq!(latest.last_error, None);
+        assert_eq!(
+            latest.last_summary.as_deref(),
+            Some(result.summary.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

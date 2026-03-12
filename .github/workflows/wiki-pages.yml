@@ -1,0 +1,80 @@
+name: Wiki Pages
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/wiki-pages.yml
+      - .gitmodules
+      - docs/wiki
+      - docs/wiki-requirements.txt
+      - mkdocs.yml
+      - scripts/prepare-wiki-site.py
+      - scripts/wiki-lint.sh
+      - scripts/wiki-site.sh
+  push:
+    branches:
+      - develop
+    paths:
+      - .github/workflows/wiki-pages.yml
+      - .gitmodules
+      - docs/wiki
+      - docs/wiki-requirements.txt
+      - mkdocs.yml
+      - scripts/prepare-wiki-site.py
+      - scripts/wiki-lint.sh
+      - scripts/wiki-site.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wiki-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Lint wiki copy
+        run: ./scripts/wiki-lint.sh
+
+      - name: Build wiki site
+        run: ./scripts/wiki-site.sh build
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: target/wiki-site
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

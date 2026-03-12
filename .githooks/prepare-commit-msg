@@ -40,4 +40,11 @@ ${comment_char} Rules from docs/code-guildline-cn.md:
 ${comment_char} - one commit for one logical change
 ${comment_char} - use an imperative subject after the prefix
 ${comment_char} - keep the subject line within 72 characters when possible
+${comment_char} - create authored commits with git commit -s
+${comment_char} - include a Signed-off-by: trailer
+${comment_char} - for larger commits, add a body with bullet points
+${comment_char}
+${comment_char} Example large-commit body:
+${comment_char}   - explain the first user-visible or structural change
+${comment_char}   - explain the second important change or validation work
 EOF

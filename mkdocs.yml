@@ -1,0 +1,11 @@
+site_name: CRIEW Wiki
+site_description: CRIEW GitHub wiki rendered as a MkDocs site.
+repo_name: ChenMiaoi/CRIEW
+repo_url: https://github.com/ChenMiaoi/CRIEW
+edit_uri: ""
+docs_dir: target/wiki-docs
+site_dir: target/wiki-site
+strict: true
+
+theme:
+  name: material

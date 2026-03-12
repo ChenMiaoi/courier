@@ -2,11 +2,27 @@
 
 本文档承载 CRIEW 的 MVP 范围、阶段目标、交付物与验收标准。
 
+## 文档导航
+
+- 使用方式
+- 跨阶段约束
+- M1：基础骨架（必须）
+- M2：邮件读取链路（必须，已完成）
+- M3：patch 工作流（必须，已完成）
+- M4：Code Preview Vim（VM1，必须）
+- M5：Code Preview 外部 Vim（VM2，增强，已完成）
+- M6：真实 IMAP 接入与自邮箱订阅（必须，已完成）
+- M7：回信编辑与预览（必须，已完成）
+- M8：Send Email 发送链路（MVP，必须，已完成）
+- M9：过滤规则（必须）
+- M10：配置体验增强（可选，低优先）
+- 维护规则
+
 ## 使用方式
 
 - 里程碑按顺序推进，默认前一阶段完成后进入下一阶段。
 - 每个阶段都要求可演示、可回归、可记录，不接受“仅代码提交”。
-- 阶段完成后，同步更新 `docs/design.md` 的已决策项与风险项。
+- 阶段完成后，同步更新 `docs/architecture/design.md` 的已决策项与风险项。
 
 ## 跨阶段约束
 
@@ -149,7 +165,7 @@ TUI 主循环，确保项目具备后续迭代基础。
 3. 文本缓冲区：支持最小移动、插入、删除、保存能力。
 4. 渲染与提示：展示 mode/dirty/command 状态，确保切换无残影。
 5. 回归测试：未进入编辑态时，现有全局键位行为保持不变。
-6. 文档同步：与 `docs/vim-mvp-milestones.md`、`docs/code-preview-vim-prototype.md` 保持一致。
+6. 文档同步：与 `docs/milestones/vim-mvp-milestones.md`、`docs/specs/code-preview-vim-prototype.md` 保持一致。
 
 ### 交付物
 
@@ -296,8 +312,8 @@ TUI 主循环，确保项目具备后续迭代基础。
 - 标准回信头部/正文构造器（内核风格）。
 - `Send Preview` 预览能力与确认门控。
 - 回信相关设计文档：
-  - `docs/reply-format-spec.md`
-  - `docs/reply-mvp-milestones.md`
+  - `docs/specs/reply-format-spec.md`
+  - `docs/milestones/reply-mvp-milestones.md`
 
 ### 验收标准
 

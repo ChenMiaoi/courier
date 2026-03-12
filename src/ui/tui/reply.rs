@@ -33,10 +33,28 @@ pub(super) struct ReplySeed {
     pub body: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplyPreviewLineKind {
+    Header,
+    Blank,
+    Authored,
+    QuoteAttribution,
+    Quoted,
+    Placeholder,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ReplyPreviewLine {
+    pub kind: ReplyPreviewLineKind,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ReplyPreview {
     pub content: String,
+    pub lines: Vec<ReplyPreviewLine>,
     pub errors: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +69,7 @@ pub(super) struct PreparedReplyMessage {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(super) struct ReplyPreviewRequest<'a> {
     pub from: &'a str,
     pub to: &'a str,
@@ -157,9 +176,13 @@ pub(super) fn build_reply_seed(
 
 pub(super) fn render_reply_preview(request: ReplyPreviewRequest<'_>) -> ReplyPreview {
     let (prepared, errors) = prepare_reply_message(request);
+    let body_lines = render_reply_preview_body_lines(request.body);
+    let lines = render_prepared_reply_preview_lines(&prepared, &body_lines);
     ReplyPreview {
-        content: render_prepared_reply_preview(&prepared),
+        content: render_reply_preview_text(&lines),
+        lines,
         errors,
+        warnings: build_reply_preview_warnings(&body_lines),
     }
 }
 
@@ -239,17 +262,53 @@ pub(super) fn prepare_reply_message(
     )
 }
 
-fn render_prepared_reply_preview(message: &PreparedReplyMessage) -> String {
-    format!(
-        "From: {}\nTo: {}\nCc: {}\nSubject: {}\nIn-Reply-To: {}\nReferences: {}\n\n{}",
-        message.from,
-        render_recipient_line(&message.to),
-        render_recipient_line(&message.cc),
-        message.subject,
-        render_message_id(&message.in_reply_to),
-        render_references_line(&message.references),
-        message.body,
-    )
+fn render_prepared_reply_preview_lines(
+    message: &PreparedReplyMessage,
+    body_lines: &[ReplyPreviewLine],
+) -> Vec<ReplyPreviewLine> {
+    let mut lines = vec![
+        ReplyPreviewLine {
+            kind: ReplyPreviewLineKind::Header,
+            text: format!("From: {}", message.from),
+        },
+        ReplyPreviewLine {
+            kind: ReplyPreviewLineKind::Header,
+            text: format!("To: {}", render_recipient_line(&message.to)),
+        },
+        ReplyPreviewLine {
+            kind: ReplyPreviewLineKind::Header,
+            text: format!("Cc: {}", render_recipient_line(&message.cc)),
+        },
+        ReplyPreviewLine {
+            kind: ReplyPreviewLineKind::Header,
+            text: format!("Subject: {}", message.subject),
+        },
+        ReplyPreviewLine {
+            kind: ReplyPreviewLineKind::Header,
+            text: format!("In-Reply-To: {}", render_message_id(&message.in_reply_to)),
+        },
+        ReplyPreviewLine {
+            kind: ReplyPreviewLineKind::Header,
+            text: format!(
+                "References: {}",
+                render_references_line(&message.references)
+            ),
+        },
+        ReplyPreviewLine {
+            kind: ReplyPreviewLineKind::Blank,
+            text: String::new(),
+        },
+    ];
+    lines.extend(body_lines.iter().cloned());
+    lines
+}
+
+fn render_reply_preview_text(lines: &[ReplyPreviewLine]) -> String {
+    lines
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<&str>>()
+        .join("\n")
 }
 
 fn git_config_value(args: &[&str]) -> std::result::Result<Option<String>, String> {
@@ -469,25 +528,66 @@ where
 fn normalize_message_id(value: &str) -> String {
     value
         .trim()
-        .trim_matches('<')
-        .trim_matches('>')
-        .trim_matches('"')
-        .trim_matches(',')
+        .trim_matches(|character| matches!(character, '<' | '>' | '"' | ','))
         .trim()
         .to_string()
 }
 
 fn render_reply_body(body: &[String]) -> String {
-    let rendered = body
+    render_reply_preview_text(&render_reply_preview_body_lines(body))
+}
+
+fn render_reply_preview_body_lines(body: &[String]) -> Vec<ReplyPreviewLine> {
+    let normalized_body = body
         .iter()
-        .map(|line| line.trim_end())
-        .collect::<Vec<&str>>()
-        .join("\n");
-    if rendered.trim().is_empty() {
-        "<empty body>".to_string()
-    } else {
-        rendered
+        .map(|line| line.trim_end().to_string())
+        .collect::<Vec<String>>();
+    if normalized_body.iter().all(|line| line.trim().is_empty()) {
+        return vec![ReplyPreviewLine {
+            kind: ReplyPreviewLineKind::Placeholder,
+            text: "<empty body>".to_string(),
+        }];
     }
+
+    normalized_body
+        .into_iter()
+        .map(classify_reply_preview_line)
+        .collect()
+}
+
+fn classify_reply_preview_line(text: String) -> ReplyPreviewLine {
+    let trimmed = text.trim();
+    let kind = if trimmed.is_empty() {
+        ReplyPreviewLineKind::Blank
+    } else if trimmed.starts_with('>') {
+        ReplyPreviewLineKind::Quoted
+    } else if is_quote_attribution_line(trimmed) {
+        ReplyPreviewLineKind::QuoteAttribution
+    } else {
+        ReplyPreviewLineKind::Authored
+    };
+
+    ReplyPreviewLine { kind, text }
+}
+
+fn build_reply_preview_warnings(body_lines: &[ReplyPreviewLine]) -> Vec<String> {
+    if body_lines
+        .iter()
+        .any(|line| matches!(line.kind, ReplyPreviewLineKind::Authored))
+    {
+        Vec::new()
+    } else {
+        vec![
+            "draft has no authored reply content; only quoted text and generated scaffolding are visible"
+                .to_string(),
+        ]
+    }
+}
+
+fn is_quote_attribution_line(value: &str) -> bool {
+    value
+        .strip_prefix("On ")
+        .is_some_and(|remaining| remaining.ends_with(" wrote:"))
 }
 
 fn render_recipient_line(values: &[String]) -> String {
@@ -621,8 +721,9 @@ mod tests {
     use crate::infra::mail_store::ThreadRow;
 
     use super::{
-        ReplyIdentity, ReplyPreviewRequest, build_reply_seed, extract_email_address,
-        normalize_reply_subject, render_reply_preview,
+        ReplyIdentity, ReplyPreviewLineKind, ReplyPreviewRequest, build_reply_seed,
+        extract_email_address, normalize_reply_subject, prepare_reply_message,
+        render_reply_preview,
     };
 
     fn sample_thread(subject: &str, message_id: &str) -> ThreadRow {
@@ -704,6 +805,100 @@ mod tests {
     }
 
     #[test]
+    fn build_reply_seed_falls_back_to_thread_metadata_and_empty_body() {
+        let raw = b"Message-ID: <patch@example.com>\r\n\r\n";
+        let mut thread = sample_thread("[PATCH] fallback", "thread@example.com");
+        thread.from_addr = "Thread Author <author@example.com>".to_string();
+        thread.date = Some("Sat, 7 Mar 2026 12:00:00 +0000".to_string());
+
+        let seed = build_reply_seed(raw, &thread, &identity(), &[identity().email.clone()]);
+
+        assert_eq!(seed.to, "Thread Author <author@example.com>");
+        assert!(seed.cc.is_empty());
+        assert_eq!(seed.subject, "Re: [PATCH] fallback");
+        assert_eq!(seed.in_reply_to, "patch@example.com");
+        assert_eq!(seed.references, vec!["patch@example.com"]);
+        assert_eq!(
+            seed.body[1],
+            "On Sat, 7 Mar 2026 12:00:00 +0000, Thread Author <author@example.com> wrote:"
+        );
+        assert_eq!(seed.body[2], "> <empty mail body>");
+    }
+
+    #[test]
+    fn build_reply_seed_handles_folded_headers_and_blank_body_lines() {
+        let raw = b"Message-ID: <patch@example.com>\r\nSubject: [PATCH] folded\r\nFrom: Alice <alice@example.com>\r\nTo: \"Doe, Jane\" <jane@example.com>,\r\n Bob <bob@example.com>\r\nCc: Carol <carol@example.com>;\r\n\tCRIEW Test <criew@example.com>\r\nDate: Fri, 6 Mar 2026 09:30:00 +0000\r\n\r\nline one\r\n\r\nline two\r\n";
+        let thread = sample_thread("[PATCH] folded", "patch@example.com");
+
+        let seed = build_reply_seed(raw, &thread, &identity(), &[identity().email.clone()]);
+
+        assert_eq!(
+            seed.to,
+            "\"Doe, Jane\" <jane@example.com>, Bob <bob@example.com>"
+        );
+        assert_eq!(seed.cc, "Carol <carol@example.com>");
+        assert_eq!(seed.body[2], "> line one");
+        assert_eq!(seed.body[3], ">");
+        assert_eq!(seed.body[4], "> line two");
+    }
+
+    #[test]
+    fn prepare_reply_message_uses_parent_when_references_missing() {
+        let (message, errors) = prepare_reply_message(ReplyPreviewRequest {
+            from: "CRIEW Test <criew@example.com>",
+            to: "Bob <bob@example.com>",
+            cc: "",
+            subject: "[PATCH] demo",
+            in_reply_to: " <parent@example.com>, ",
+            references: &[],
+            body: &[
+                "line one   ".to_string(),
+                String::new(),
+                "line two".to_string(),
+            ],
+            self_addresses: &[identity().email.clone()],
+        });
+
+        assert!(errors.is_empty());
+        assert_eq!(message.subject, "Re: [PATCH] demo");
+        assert_eq!(message.in_reply_to, "parent@example.com");
+        assert_eq!(message.references, vec!["parent@example.com"]);
+        assert_eq!(message.body, "line one\n\nline two");
+    }
+
+    #[test]
+    fn prepare_reply_message_adds_parent_to_existing_references_and_filters_self() {
+        let (message, errors) = prepare_reply_message(ReplyPreviewRequest {
+            from: " CRIEW Test <criew@example.com> ",
+            to: "Bob <bob@example.com>; \"Doe, Jane\" <jane@example.com>; CRIEW Test <criew@example.com>",
+            cc: "Carol <carol@example.com>, criew@example.com",
+            subject: "fwd: [PATCH] demo",
+            in_reply_to: " <parent@example.com>, ",
+            references: &["<older@example.com>".to_string()],
+            body: &["body".to_string()],
+            self_addresses: &[identity().email.clone(), "alias@example.com".to_string()],
+        });
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            message.to,
+            vec![
+                "Bob <bob@example.com>".to_string(),
+                "\"Doe, Jane\" <jane@example.com>".to_string()
+            ]
+        );
+        assert_eq!(message.cc, vec!["Carol <carol@example.com>".to_string()]);
+        assert_eq!(message.subject, "Re: [PATCH] demo");
+        assert_eq!(
+            message.references,
+            vec![
+                "older@example.com".to_string(),
+                "parent@example.com".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn preview_validation_reports_missing_recipients() {
         let preview = render_reply_preview(ReplyPreviewRequest {
             from: "CRIEW Test <criew@example.com>",
@@ -722,6 +917,12 @@ mod tests {
                 .errors
                 .iter()
                 .any(|value| value.contains("no recipients"))
+        );
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|value| value.contains("no authored reply content"))
         );
         assert!(preview.content.contains("To: <none>"));
     }
@@ -748,6 +949,121 @@ mod tests {
     }
 
     #[test]
+    fn render_reply_preview_reports_missing_headers_and_renders_placeholders() {
+        let preview = render_reply_preview(ReplyPreviewRequest {
+            from: "CRIEW Test",
+            to: "",
+            cc: "",
+            subject: "   ",
+            in_reply_to: "   ",
+            references: &[],
+            body: &["   ".to_string(), String::new()],
+            self_addresses: &[],
+        });
+
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|value| value == "From is missing a valid email address")
+        );
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|value| value == "reply preview has no recipients after removing self")
+        );
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|value| value == "Subject is empty")
+        );
+        assert!(
+            preview
+                .errors
+                .iter()
+                .any(|value| value == "In-Reply-To is missing")
+        );
+        assert!(preview.content.contains("To: <none>"));
+        assert!(preview.content.contains("Cc: <none>"));
+        assert!(preview.content.contains("Subject: Re:"));
+        assert!(preview.content.contains("In-Reply-To: <none>"));
+        assert!(preview.content.contains("References: <none>"));
+        assert!(preview.content.ends_with("<empty body>"));
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|value| value.contains("no authored reply content"))
+        );
+    }
+
+    #[test]
+    fn render_reply_preview_warns_when_body_only_contains_generated_quote_scaffolding() {
+        let preview = render_reply_preview(ReplyPreviewRequest {
+            from: "CRIEW Test <criew@example.com>",
+            to: "Bob <bob@example.com>",
+            cc: "",
+            subject: "Re: [PATCH] demo",
+            in_reply_to: "patch@example.com",
+            references: &["patch@example.com".to_string()],
+            body: &[
+                String::new(),
+                "On Fri, 6 Mar 2026 09:30:00 +0000, Alice wrote:".to_string(),
+                "> quoted line".to_string(),
+                ">".to_string(),
+            ],
+            self_addresses: &[identity().email.clone()],
+        });
+
+        assert!(preview.errors.is_empty());
+        assert_eq!(preview.warnings.len(), 1);
+        assert!(
+            preview.warnings[0].contains("no authored reply content"),
+            "unexpected warning: {}",
+            preview.warnings[0]
+        );
+        assert!(
+            preview
+                .lines
+                .iter()
+                .any(|line| matches!(line.kind, ReplyPreviewLineKind::QuoteAttribution))
+        );
+        assert!(
+            preview
+                .lines
+                .iter()
+                .any(|line| matches!(line.kind, ReplyPreviewLineKind::Quoted))
+        );
+    }
+
+    #[test]
+    fn render_reply_preview_marks_authored_reply_lines() {
+        let preview = render_reply_preview(ReplyPreviewRequest {
+            from: "CRIEW Test <criew@example.com>",
+            to: "Bob <bob@example.com>",
+            cc: "",
+            subject: "Re: [PATCH] demo",
+            in_reply_to: "patch@example.com",
+            references: &["patch@example.com".to_string()],
+            body: &[
+                "Looks good to me.".to_string(),
+                String::new(),
+                "On Fri, 6 Mar 2026 09:30:00 +0000, Alice wrote:".to_string(),
+                "> quoted line".to_string(),
+            ],
+            self_addresses: &[identity().email.clone()],
+        });
+
+        assert!(preview.errors.is_empty());
+        assert!(preview.warnings.is_empty());
+        assert!(preview.lines.iter().any(|line| {
+            matches!(line.kind, ReplyPreviewLineKind::Authored) && line.text == "Looks good to me."
+        }));
+    }
+
+    #[test]
     fn extracts_email_from_display_or_bare_value() {
         assert_eq!(
             extract_email_address("Alice <alice@example.com>"),
@@ -757,5 +1073,7 @@ mod tests {
             extract_email_address("alice@example.com"),
             Some("alice@example.com".to_string())
         );
+        assert_eq!(extract_email_address("Alice Example"), None);
+        assert_eq!(extract_email_address("<>"), None);
     }
 }
