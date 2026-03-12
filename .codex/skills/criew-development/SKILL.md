@@ -1,6 +1,6 @@
 ---
 name: criew-development
-description: Repository-specific workflow and coding rules for the CRIEW codebase. Use when modifying or reviewing CRIEW Rust code, TUI behavior, sync/IMAP/reply/patch workflows, migrations, tests, docs, or config, and whenever the task must follow `docs/development/code-guildline.md` or `docs/development/code-guildline-cn.md`.
+description: Repository-specific workflow and coding rules for the CRIEW codebase. Use when modifying or reviewing CRIEW Rust code, TUI behavior, sync/IMAP/reply/patch workflows, migrations, tests, docs, or config, when code or workflow changes may require syncing `docs/wiki/`, and whenever the task must follow `docs/development/code-guildline.md` or `docs/development/code-guildline-cn.md`.
 ---
 
 # Criew Development
@@ -64,9 +64,10 @@ Follow this order unless the task is trivial.
 2. Confirm the user-visible behavior from the README or a spec doc when the change affects sync, reply, patch apply/export, config, or startup flow.
 3. Keep the change focused on one logical topic.
 4. Add or update regression tests when fixing a bug or changing observable behavior.
-5. Update docs when behavior, commands, config, or workflow changed.
+5. Update docs when behavior, commands, config, or workflow changed, and explicitly decide whether `README.md`, `README-zh.md`, or `docs/wiki/` need updates.
 
 Prefer updating both `README.md` and `README-zh.md` when the change affects user-facing usage or setup.
+When operator workflow, troubleshooting guidance, configuration, or other stable user-facing behavior changed, review the relevant `docs/wiki/` pages and update them in the same task unless the user explicitly scopes wiki work out. Use `criew-wiki-authoring` for the wiki edit itself.
 Keep PR-sized changes focused and commit subjects aligned with the repository's Conventional Commit prefixes:
 `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`.
 When asked to create a commit in this repository, use `git commit -s`.

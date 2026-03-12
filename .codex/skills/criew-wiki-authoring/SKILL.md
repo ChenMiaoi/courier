@@ -1,6 +1,6 @@
 ---
 name: criew-wiki-authoring
-description: Write and revise pages under `docs/wiki` for the CRIEW GitHub wiki and its MkDocs-backed GitHub Pages site. Use when Codex needs to create, expand, reorganize, or review CRIEW wiki pages such as `Home.md`, `_Sidebar.md`, `_Footer.md`, or topic pages, and when the output or workflow must follow GitHub wiki conventions, the local MkDocs pipeline, and a pragmatic, kernel-documentation writing style.
+description: Write and revise pages under `docs/wiki` for the CRIEW GitHub wiki and its MkDocs-backed GitHub Pages site. Use when Codex needs to create, expand, reorganize, or review CRIEW wiki pages such as `Home.md`, `_Sidebar.md`, `_Footer.md`, or topic pages, when code or workflow changes require a wiki sync pass, and when the output or workflow must follow GitHub wiki conventions, the local MkDocs pipeline, and a pragmatic, kernel-documentation writing style.
 ---
 
 # Criew Wiki Authoring
@@ -10,6 +10,7 @@ description: Write and revise pages under `docs/wiki` for the CRIEW GitHub wiki 
 Write CRIEW wiki pages as maintainer documentation.
 Treat `docs/wiki/` as the source GitHub wiki repository, and treat the published website as a derived MkDocs build driven from the main `CRIEW` repository.
 Keep the source compatible with both GitHub wiki rendering and the local Pages build pipeline, and prefer a direct, technical style over narrative or marketing copy.
+Use this skill not only for standalone wiki work, but also when a code or config change means the existing wiki may now be stale.
 
 ## Follow This Workflow
 
@@ -17,6 +18,7 @@ Keep the source compatible with both GitHub wiki rendering and the local Pages b
 - Read the code, README, spec, config example, or architecture note that defines the behavior.
 - Prefer `README.md`, `README-zh.md`, `docs/architecture/design.md`, `docs/specs/`, and `docs/reference/config.example.toml` depending on the topic.
 - Do not invent commands, defaults, limitations, or workflows.
+- When paired with a code change, identify which existing wiki pages describe the changed behavior and either update them or explicitly confirm that no wiki page is affected.
 
 2. Check the wiki context.
 - List the existing pages in `docs/wiki/` before creating or renaming a page.
