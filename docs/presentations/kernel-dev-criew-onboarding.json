@@ -1,0 +1,265 @@
+{
+  "metadata": {
+    "title": "从内核开发流程到邮件协作：用 CRIEW 更轻松上手",
+    "author": "OpenAI Codex"
+  },
+  "slides": [
+    {
+      "layout": "title",
+      "eyebrow": "CRIEW 项目介绍",
+      "title_lines": [
+        "从内核开发流程到",
+        "邮件协作"
+      ],
+      "subtitle": "用 CRIEW 更轻松上手 Linux kernel 邮件工作流",
+      "tagline": "订阅 -> 同步 -> 阅读 -> 应用 patch -> 回信",
+      "chips": [
+        "Terminal-first",
+        "Local-first",
+        "Mail-native"
+      ],
+      "image": "../media/criew-tui-demo.gif",
+      "image_caption": "CRIEW TUI demo（仓库内现有演示素材）",
+      "closing": "目标不是绕开邮件流程，而是把它变成新人也能持续使用的日常工作流。",
+      "footer": "CRIEW / kernel patch mail workflow / 2026-04-08"
+    },
+    {
+      "layout": "statement_cards",
+      "title": "为什么内核开发仍然以邮件为中心",
+      "statement_lines": [
+        "Linux kernel 的协作单位",
+        "不是 PR，而是 patch series + thread"
+      ],
+      "statement_note": "一封 patch 邮件只是开始；真正的协作发生在线程里。",
+      "cards": [
+        {
+          "title": "公开讨论",
+          "body": "改动发到邮件列表，review 对所有人可见。"
+        },
+        {
+          "title": "线程上下文",
+          "body": "后续意见通过 reply 累积在同一 thread。"
+        },
+        {
+          "title": "多轮修订",
+          "body": "v2 / v3 / RESEND 是常态，不是例外。"
+        },
+        {
+          "title": "合入路径",
+          "body": "maintainer 从邮件线程收集 trailer 并进入 tree。"
+        }
+      ],
+      "bottom_note": "想参与内核开发，就必须能读懂并参与这条邮件链路。",
+      "footer": "CRIEW 项目介绍"
+    },
+    {
+      "layout": "timeline",
+      "title": "一条 patch 从想法到合入，大致会经历什么",
+      "steps": [
+        {
+          "step": "1 选基线",
+          "body": "找对 subsystem 与 maintainer tree"
+        },
+        {
+          "step": "2 拆 commits",
+          "body": "一补丁一件事，写清 commit message"
+        },
+        {
+          "step": "3 形成 series",
+          "body": "cover letter + [PATCH vN M/N]"
+        },
+        {
+          "step": "4 本地自检",
+          "body": "checkpatch / 编译 / 功能测试"
+        },
+        {
+          "step": "5 收件人",
+          "body": "get_maintainer.pl 或 b4 prep --auto-to-cc"
+        },
+        {
+          "step": "6 发邮件",
+          "body": "git send-email 或 b4 send"
+        },
+        {
+          "step": "7 Reroll",
+          "body": "读 review，回复并修成 v2 / v3"
+        }
+      ],
+      "note": "关键不是一次 push，而是围绕 thread 的持续讨论。",
+      "footer": "CRIEW 项目介绍"
+    },
+    {
+      "layout": "two_column_bullets",
+      "title": "新人真正卡住的，往往不是写代码",
+      "left": {
+        "title": "技术动作",
+        "bullets": [
+          "正确拆 patch，保持每封邮件主题清晰",
+          "cover letter / changelog / Signed-off-by",
+          "回复时保住 In-Reply-To 与 References",
+          "在线程里判断哪一版才是当前上下文"
+        ]
+      },
+      "right": {
+        "title": "工具碎片",
+        "bullets": [
+          "lore、收件箱、本地 tree 来回切换",
+          "b4、git send-email、邮件客户端各管一段",
+          "手工抄送名单和 Message-ID 容易出错",
+          "review 结论、patch 状态、代码现场彼此脱节"
+        ]
+      },
+      "callout": "真正的门槛常常是上下文分裂，而不是命令本身。",
+      "footer": "CRIEW 项目介绍"
+    },
+    {
+      "layout": "workflow",
+      "title": "CRIEW 在这个流程里的定位",
+      "steps": [
+        {
+          "title": "Subscribe",
+          "body": "订阅 lore 列表或 My Inbox"
+        },
+        {
+          "title": "Sync",
+          "body": "把邮件拉到本地缓存与索引"
+        },
+        {
+          "title": "Review",
+          "body": "thread 树、正文、patch 在 TUI 内阅读"
+        },
+        {
+          "title": "Apply",
+          "body": "调用 b4 导出 / 应用到 kernel tree"
+        },
+        {
+          "title": "Reply",
+          "body": "生成标准 reply 头并进入发送预览"
+        }
+      ],
+      "callout": "它不是替代 Git，而是把邮件协作链路收束进一个终端工作台。",
+      "note": "项目定位来自 README 与设计文档：terminal-first、local-first、b4-centered。",
+      "footer": "CRIEW 项目介绍"
+    },
+    {
+      "layout": "card_grid",
+      "title": "它替你省掉哪些机械劳动",
+      "cards": [
+        {
+          "title": "统一入口",
+          "body": "criew doctor / sync / tui 把入口压缩成几条命令。"
+        },
+        {
+          "title": "双源同步",
+          "body": "既能跟 lore 订阅，也能接 IMAP INBOX。"
+        },
+        {
+          "title": "线程建模",
+          "body": "按 Message-ID / References 重建讨论上下文。"
+        },
+        {
+          "title": "Patch 语义",
+          "body": "识别 [PATCH vN M/N]，自动聚合成 series。"
+        },
+        {
+          "title": "b4 集成",
+          "body": "b4 am / shazam 的 apply 结果可以被追踪。"
+        },
+        {
+          "title": "回信面板",
+          "body": "预填 Re:、To/Cc、引用正文，并先看发送预览。"
+        }
+      ],
+      "note": "把机械动作变成默认动作，才是降低上手门槛的关键。",
+      "footer": "CRIEW 项目介绍"
+    },
+    {
+      "layout": "code_steps",
+      "title": "给新同学的 15 分钟上手路径",
+      "code": "cargo install criew\ncriew doctor\ncriew sync --mailbox io-uring\ncriew tui",
+      "code_note": "先从公开列表开始，不必一上来就配置完整真实发信链路。",
+      "steps": [
+        "先同步一个公开列表，建立对 thread 的直觉。",
+        "在 TUI 里顺着 series 阅读 cover letter、patch、回复。",
+        "需要验证时，再把 series apply 到本地 kernel tree。",
+        "熟悉回复结构之后，再进入 reply panel 写 review。",
+        "最后才接入 IMAP 与真实发送，把风险前移到阅读阶段。"
+      ],
+      "callout": "建议先练“读”和“apply”，再练“发”。",
+      "footer": "CRIEW 项目介绍"
+    },
+    {
+      "layout": "comparison",
+      "title": "对比传统做法，CRIEW 改善了什么",
+      "left": {
+        "title": "传统链路",
+        "bullets": [
+          "浏览器看 lore，终端里单独 apply",
+          "邮件客户端与代码现场天然脱节",
+          "回信头与抄送名单靠手工维护",
+          "thread 状态、patch 状态分散在多个工具里"
+        ]
+      },
+      "right": {
+        "title": "CRIEW 链路",
+        "bullets": [
+          "订阅、thread、正文、tree 视图在同一 TUI",
+          "patch apply 与邮件上下文尽量同屏",
+          "reply 头与引用结构自动构造",
+          "更适合刚上手邮件协作的新同学"
+        ]
+      },
+      "summary": "它改善的是流程摩擦与上下文切换成本，而不是试图改写 kernel 社区规则。",
+      "footer": "CRIEW 项目介绍"
+    },
+    {
+      "layout": "keypoints",
+      "title": "CRIEW 让流程更顺，但不替代内核社区基本功",
+      "lead": "工具负责把链路接起来；工程判断、测试质量和沟通质量仍然来自开发者本人。",
+      "points": [
+        "仍然要选对 maintainer 和 mailing list。",
+        "仍然要跑构建、测试和 scripts/checkpatch.pl。",
+        "仍然要写清 commit message、cover letter 和 changelog。",
+        "仍然要按 review 节奏做 v2 / v3 reroll。"
+      ],
+      "closing": "CRIEW 的价值，是让新人把注意力更早放在 patch 质量与交流内容上，而不是被工具碎片卡住。",
+      "footer": "CRIEW 项目介绍"
+    },
+    {
+      "layout": "references",
+      "title": "参考资料",
+      "references": [
+        {
+          "label": "CRIEW README",
+          "url": "https://github.com/ChenMiaoi/CRIEW"
+        },
+        {
+          "label": "Linux kernel process overview",
+          "url": "https://docs.kernel.org/process/"
+        },
+        {
+          "label": "Submitting patches",
+          "url": "https://docs.kernel.org/process/submitting-patches.html"
+        },
+        {
+          "label": "Patch submission checklist",
+          "url": "https://docs.kernel.org/process/submit-checklist.html"
+        },
+        {
+          "label": "b4 contributor overview",
+          "url": "https://b4.docs.kernel.org/en/latest/contributor/overview.html"
+        },
+        {
+          "label": "b4 am / shazam",
+          "url": "https://b4.docs.kernel.org/en/latest/maintainer/am-shazam.html"
+        },
+        {
+          "label": "git send-email",
+          "url": "https://git-scm.com/docs/git-send-email"
+        }
+      ],
+      "note": "本 deck 适合配合 8 到 12 分钟口头演示；如需对外分享，建议再补一页真实 demo 操作录像。",
+      "footer": "CRIEW 项目介绍 / References"
+    }
+  ]
+}
