@@ -27,6 +27,8 @@ criew sync --mailbox io-uring
 criew tui
 ```
 
+GitHub Releases 也会提供 Linux 和 macOS 的预编译压缩包。
+
 启用 IMAP、
 patch apply、
 或回信发送前，
@@ -46,6 +48,8 @@ patch apply、
 ## 当前版本
 
 当前源码版本和发布 tag 为 `v0.0.2`。
+GitHub Releases 会同时发布该 tag 对应的源码包以及 Linux、macOS
+预编译压缩包。
 
 ## 发布基线
 

@@ -30,6 +30,8 @@ criew sync --mailbox io-uring
 criew tui
 ```
 
+GitHub Releases also publish prebuilt archives for Linux and macOS.
+
 Use the wiki before enabling IMAP,
 patch application,
 or reply sending.
@@ -48,6 +50,8 @@ or reply sending.
 ## Current Release
 
 The current source version and release tag are `v0.0.2`.
+GitHub Releases publish the source archive together with Linux and macOS
+prebuilt archives for the same tag.
 
 ## Release Baseline
 

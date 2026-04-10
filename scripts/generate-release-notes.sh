@@ -4,6 +4,7 @@ set -euo pipefail
 
 tag_name=${1:?missing tag name}
 output_file=${2:?missing output file}
+asset_dir=${3:-$(dirname "${output_file}")}
 
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
@@ -61,8 +62,26 @@ mkdir -p "$(dirname "${output_file}")"
     printf '[![codecov](https://codecov.io/github/ChenMiaoi/CRIEW/graph/badge.svg?token=AH99YLKKPD)](https://codecov.io/github/ChenMiaoi/CRIEW)\n\n'
     printf 'Source release for `%s`.\n\n' "$(git rev-list -n 1 "${tag_name}")"
     printf '### Release Assets\n\n'
-    printf -- '- Source archive: `%s-%s-src.tar.gz`\n' "${package_name}" "${tag_name}"
-    printf -- '- Source archive: `%s-%s-src.zip`\n\n' "${package_name}" "${tag_name}"
+    assets_found=0
+    while IFS= read -r asset_path; do
+        [[ -n "${asset_path}" ]] || continue
+        assets_found=1
+        asset_name="$(basename "${asset_path}")"
+        asset_kind="Binary archive"
+        if [[ "${asset_name}" == *"-src.tar.gz" || "${asset_name}" == *"-src.zip" ]]; then
+            asset_kind="Source archive"
+        fi
+        printf -- '- %s: `%s`\n' "${asset_kind}" "${asset_name}"
+    done < <(
+        find "${asset_dir}" -maxdepth 1 -type f \
+            \( -name '*.tar.gz' -o -name '*.zip' \) \
+            | sort
+    )
+
+    if [[ "${assets_found}" -eq 0 ]]; then
+        printf -- '- No release assets were found in `%s`.\n' "${asset_dir}"
+    fi
+    printf '\n'
 
     if [[ -n "${previous_release_tag}" ]]; then
         printf '### What Changed Since `%s`\n\n' "${previous_release_tag}"

@@ -9,11 +9,20 @@ permissions:
 
 jobs:
   lint-and-test:
-    runs-on: ubuntu-latest
+    name: Lint And Test (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            should_check_commit_messages: true
+          - runner: macos-15
+            should_check_commit_messages: false
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           submodules: recursive
@@ -24,6 +33,7 @@ jobs:
           python-version: '3.12'
 
       - name: Check commit messages
+        if: matrix.should_check_commit_messages
         env:
           CI_COMMIT_BEFORE: ${{ github.event.before }}
           CI_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -59,7 +69,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           submodules: recursive
@@ -111,31 +121,121 @@ jobs:
     needs:
       - lint-and-test
       - coverage
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: release-source
+            runner: ubuntu-latest
+            setup_python: true
+          - artifact_name: release-x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_target: x86_64-unknown-linux-gnu
+          - artifact_name: release-aarch64-apple-darwin
+            runner: macos-15
+            build_target: aarch64-apple-darwin
+          - artifact_name: release-x86_64-apple-darwin
+            runner: macos-15-intel
+            build_target: x86_64-apple-darwin
+    name: Release Asset (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Python
+        if: matrix.setup_python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Rust
+        if: matrix.build_target
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        if: matrix.build_target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        if: matrix.build_target
+        env:
+          BUILD_TARGET: ${{ matrix.build_target }}
+        run: cargo build --locked --release --target "${BUILD_TARGET}" --package criew --bin criew
+
+      - name: Prepare source release assets
+        if: matrix.setup_python
+        env:
+          GIT_TAG: ${{ github.ref_name }}
+        run: ./scripts/package-release-assets.sh "${GIT_TAG}" dist/release
+
+      - name: Prepare binary release assets
+        if: matrix.build_target
+        env:
+          GIT_TAG: ${{ github.ref_name }}
+          BUILD_TARGET: ${{ matrix.build_target }}
+        run: ./scripts/package-binary-release-assets.sh "${GIT_TAG}" "${BUILD_TARGET}" dist/release
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/release
+          if-no-files-found: error
+
+  publish-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - release
     runs-on: ubuntu-latest
     permissions:
       contents: write
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          submodules: recursive
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Prepare release assets
-        env:
-          GIT_TAG: ${{ github.ref_name }}
-        run: ./scripts/package-release-assets.sh "${GIT_TAG}" dist/release
+      - name: Download source release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-source
+          path: dist/release
+
+      - name: Download Linux release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64-unknown-linux-gnu
+          path: dist/release
+
+      - name: Download macOS arm64 release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-aarch64-apple-darwin
+          path: dist/release
+
+      - name: Download macOS Intel release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-x86_64-apple-darwin
+          path: dist/release
 
       - name: Generate release notes
         env:
           GIT_TAG: ${{ github.ref_name }}
-        run: ./scripts/generate-release-notes.sh "${GIT_TAG}" dist/release/release-notes.md
+        run: ./scripts/generate-release-notes.sh "${GIT_TAG}" dist/release/release-notes.md dist/release
 
       - name: Publish release
         env:
@@ -144,21 +244,22 @@ jobs:
         run: |
           release_title="CRIEW ${GIT_TAG}"
           notes_file="dist/release/release-notes.md"
-          tar_asset="dist/release/criew-${GIT_TAG}-src.tar.gz"
-          zip_asset="dist/release/criew-${GIT_TAG}-src.zip"
+          mapfile -t release_assets < <(
+            find dist/release -maxdepth 1 -type f ! -name 'release-notes.md' | sort
+          )
+
+          if [[ "${#release_assets[@]}" -eq 0 ]]; then
+            printf '%s\n' "no release assets were downloaded" >&2
+            exit 1
+          fi
 
           if gh release view "${GIT_TAG}" >/dev/null 2>&1; then
-            gh release upload "${GIT_TAG}" \
-              "${tar_asset}" \
-              "${zip_asset}" \
-              --clobber
+            gh release upload "${GIT_TAG}" "${release_assets[@]}" --clobber
             gh release edit "${GIT_TAG}" \
               --title "${release_title}" \
               --notes-file "${notes_file}"
           else
-            gh release create "${GIT_TAG}" \
-              "${tar_asset}" \
-              "${zip_asset}" \
+            gh release create "${GIT_TAG}" "${release_assets[@]}" \
               --title "${release_title}" \
               --notes-file "${notes_file}"
           fi
