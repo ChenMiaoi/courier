@@ -116,11 +116,100 @@ jobs:
             target/coverage/html
           if-no-files-found: error
 
+  release-target-builds:
+    name: Release Target Build (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_target: x86_64-unknown-linux-gnu
+            build_subcommand: build
+            binary_name: criew
+            should_smoke_test: true
+          - artifact_name: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_target: aarch64-unknown-linux-gnu
+            build_subcommand: zigbuild
+            use_zigbuild: true
+            binary_name: criew
+            should_smoke_test: false
+          - artifact_name: riscv64gc-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_target: riscv64gc-unknown-linux-gnu
+            build_subcommand: zigbuild
+            use_zigbuild: true
+            binary_name: criew
+            should_smoke_test: false
+          - artifact_name: aarch64-apple-darwin
+            runner: macos-15
+            build_target: aarch64-apple-darwin
+            build_subcommand: build
+            binary_name: criew
+            should_smoke_test: true
+          - artifact_name: x86_64-apple-darwin
+            runner: macos-15-intel
+            build_target: x86_64-apple-darwin
+            build_subcommand: build
+            binary_name: criew
+            should_smoke_test: true
+          - artifact_name: x86_64-pc-windows-msvc
+            runner: windows-latest
+            build_target: x86_64-pc-windows-msvc
+            build_subcommand: build
+            binary_name: criew.exe
+            should_smoke_test: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.build_target }}
+
+      - name: Setup Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build target binary
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.build_target }}
+          BUILD_SUBCOMMAND: ${{ matrix.build_subcommand }}
+        run: cargo "${BUILD_SUBCOMMAND}" --locked --target "${BUILD_TARGET}" --package criew --bin criew
+
+      - name: Smoke test native binary
+        if: matrix.should_smoke_test
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.build_target }}
+          BINARY_NAME: ${{ matrix.binary_name }}
+        run: |
+          binary_path="target/${BUILD_TARGET}/debug/${BINARY_NAME}"
+          "${binary_path}" --help >/dev/null
+
   release:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs:
       - lint-and-test
       - coverage
+      - release-target-builds
     strategy:
       fail-fast: false
       matrix:
