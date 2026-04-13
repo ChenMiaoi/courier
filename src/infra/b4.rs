@@ -434,6 +434,18 @@ mod tests {
         path
     }
 
+    fn canonicalize_existing_path(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn canonicalized_path_from_output(output: &str, prefix: &str) -> PathBuf {
+        let raw_path = output
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix} line in output: {output}"));
+        canonicalize_existing_path(Path::new(raw_path))
+    }
+
     #[test]
     fn check_prefers_available_configured_script() {
         let root = temp_dir("configured-ok");
@@ -514,10 +526,9 @@ mod tests {
             result.command_line,
             format!("{} am --foo 'bar baz'", script.display())
         );
-        assert!(
-            result
-                .stdout
-                .contains(&format!("cwd={}", workdir.display()))
+        assert_eq!(
+            canonicalized_path_from_output(&result.stdout, "cwd="),
+            canonicalize_existing_path(&workdir)
         );
         assert!(result.stdout.contains("subcommand=am"));
         assert!(result.stdout.contains("arg1=--foo"));

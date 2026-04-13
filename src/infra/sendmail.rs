@@ -872,6 +872,10 @@ mod tests {
         path
     }
 
+    fn canonicalize_existing_path(path: &Path) -> PathBuf {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
     fn test_runtime_in(root: &Path) -> RuntimeConfig {
         RuntimeConfig {
             config_path: root.join("config.toml"),
@@ -1236,8 +1240,15 @@ mod tests {
 
         assert_eq!(outcome.status, SendStatus::Sent);
         let invoked_pwd = fs::read_to_string(&capture_pwd).expect("read captured pwd");
-        assert_eq!(PathBuf::from(invoked_pwd.trim()), kernel_tree);
-        assert_ne!(PathBuf::from(invoked_pwd.trim()), current_dir);
+        let invoked_working_dir = canonicalize_existing_path(Path::new(invoked_pwd.trim()));
+        assert_eq!(
+            invoked_working_dir,
+            canonicalize_existing_path(&kernel_tree)
+        );
+        assert_ne!(
+            invoked_working_dir,
+            canonicalize_existing_path(&current_dir)
+        );
 
         let _ = fs::remove_dir_all(root);
     }
