@@ -27,7 +27,15 @@ criew sync --mailbox io-uring
 criew tui
 ```
 
-GitHub Releases 也会提供 Linux 和 macOS 的预编译压缩包。
+GitHub Releases 会发布源码包、
+独立二进制文件、
+压缩包，
+以及 `SHA256SUMS` 校验清单，
+覆盖 Linux x86_64/aarch64/riscv64、
+macOS x86_64/aarch64，
+和 Windows x86_64。
+在类 Unix 系统上，
+直接下载独立二进制后可能还需要执行一次 `chmod +x`。
 
 启用 IMAP、
 patch apply、
@@ -45,11 +53,15 @@ patch apply、
 - [贡献流程](https://github.com/ChenMiaoi/CRIEW/wiki/Contribution)
 - [docs.rs API 文档](https://docs.rs/criew/)
 
-## 当前版本
+## 当前发布流程
 
-当前源码版本和发布 tag 为 `v0.0.2`。
-GitHub Releases 会同时发布该 tag 对应的源码包以及 Linux、macOS
-预编译压缩包。
+当前分支里的源码版本为 `v0.0.2`。
+对每个匹配的 `v*` tag，
+GitHub Releases 都会发布对应的源码包，
+以及 Linux x86_64/aarch64/riscv64、
+macOS x86_64/aarch64、
+Windows x86_64 的独立二进制、
+压缩包和 `SHA256SUMS` 校验清单。
 
 ## 发布基线
 

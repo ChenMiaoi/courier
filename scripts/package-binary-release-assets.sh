@@ -6,8 +6,64 @@ tag_name=${1:?missing tag name}
 build_target=${2:?missing build target}
 output_dir=${3:?missing output directory}
 
+resolve_python() {
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "python3"
+        return
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        printf '%s\n' "python"
+        return
+    fi
+
+    printf '%s\n' "python3 or python is required to package release assets" >&2
+    exit 1
+}
+
+read_cargo_package_field() {
+    local field_name=${1:?missing Cargo.toml package field}
+
+    "${python_bin}" - "${field_name}" <<'PY'
+import sys
+import tomllib
+
+field_name = sys.argv[1]
+
+with open("Cargo.toml", "rb") as handle:
+    cargo = tomllib.load(handle)
+
+print(cargo["package"][field_name])
+PY
+}
+
+create_zip_archive() {
+    local archive_path=${1:?missing zip archive path}
+    local source_root=${2:?missing source root}
+    local root_prefix=${3:?missing archive root prefix}
+
+    "${python_bin}" - "${archive_path}" "${source_root}" "${root_prefix}" <<'PY'
+from pathlib import Path
+import sys
+import zipfile
+
+archive_path = Path(sys.argv[1])
+source_root = Path(sys.argv[2])
+root_prefix = Path(sys.argv[3])
+
+with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    for source_path in sorted(source_root.rglob("*")):
+        if source_path.is_dir():
+            continue
+
+        relative_path = source_path.relative_to(source_root)
+        archive.write(source_path, arcname=(root_prefix / relative_path).as_posix())
+PY
+}
+
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
+python_bin="$(resolve_python)"
 
 install_if_present() {
     local source_path=${1:?missing source path}
@@ -21,27 +77,8 @@ install_if_present() {
     install -m "${mode}" "${source_path}" "${target_path}"
 }
 
-package_name="$(
-    python3 - <<'PY'
-import tomllib
-
-with open("Cargo.toml", "rb") as handle:
-    cargo = tomllib.load(handle)
-
-print(cargo["package"]["name"])
-PY
-)"
-
-package_version="$(
-    python3 - <<'PY'
-import tomllib
-
-with open("Cargo.toml", "rb") as handle:
-    cargo = tomllib.load(handle)
-
-print(cargo["package"]["version"])
-PY
-)"
+package_name="$(read_cargo_package_field "name")"
+package_version="$(read_cargo_package_field "version")"
 
 tag_version="${tag_name#v}"
 if [[ "${tag_version}" != "${package_version}" ]]; then
@@ -51,8 +88,13 @@ if [[ "${tag_version}" != "${package_version}" ]]; then
     exit 1
 fi
 
-binary_path="${repo_root}/target/${build_target}/release/${package_name}"
-if [[ ! -x "${binary_path}" ]]; then
+binary_name="${package_name}"
+if [[ "${build_target}" == *windows* ]]; then
+    binary_name="${binary_name}.exe"
+fi
+
+binary_path="${repo_root}/target/${build_target}/release/${binary_name}"
+if [[ ! -f "${binary_path}" ]]; then
     printf '%s\n' "release binary is missing at ${binary_path}" >&2
     exit 1
 fi
@@ -66,11 +108,16 @@ asset_prefix="${package_name}-${tag_name}-${build_target}"
 bundle_root="${release_root}/bundle-root/${asset_prefix}"
 tar_asset="${release_root}/${asset_prefix}.tar.gz"
 zip_asset="${release_root}/${asset_prefix}.zip"
+standalone_asset="${release_root}/${asset_prefix}"
+if [[ "${build_target}" == *windows* ]]; then
+    standalone_asset="${standalone_asset}.exe"
+fi
 
 rm -rf "${release_root}"
 mkdir -p "${bundle_root}" "${bundle_root}/LICENSES"
 
-install -m 0755 "${binary_path}" "${bundle_root}/${package_name}"
+install -m 0755 "${binary_path}" "${standalone_asset}"
+install -m 0755 "${binary_path}" "${bundle_root}/${binary_name}"
 install -m 0644 "${repo_root}/LICENSE" "${bundle_root}/LICENSE"
 install -m 0644 "${repo_root}/README.md" "${bundle_root}/README.md"
 install -m 0644 "${repo_root}/README-zh.md" "${bundle_root}/README-zh.md"
@@ -84,12 +131,10 @@ install_if_present \
     "${bundle_root}/LICENSES/vendor-b4-patatt-COPYING"
 
 tar -C "${release_root}/bundle-root" -czf "${tar_asset}" "${asset_prefix}"
-(
-    cd "${release_root}/bundle-root"
-    zip -qr "${zip_asset}" "${asset_prefix}"
-)
+create_zip_archive "${zip_asset}" "${release_root}/bundle-root/${asset_prefix}" "${asset_prefix}"
 
 rm -rf "${release_root}/bundle-root"
 
+printf '%s\n' "${standalone_asset}"
 printf '%s\n' "${tar_asset}"
 printf '%s\n' "${zip_asset}"

@@ -127,16 +127,32 @@ jobs:
         include:
           - artifact_name: release-source
             runner: ubuntu-latest
-            setup_python: true
           - artifact_name: release-x86_64-unknown-linux-gnu
             runner: ubuntu-latest
             build_target: x86_64-unknown-linux-gnu
+            build_subcommand: build
+          - artifact_name: release-aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_target: aarch64-unknown-linux-gnu
+            build_subcommand: zigbuild
+            use_zigbuild: true
+          - artifact_name: release-riscv64gc-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_target: riscv64gc-unknown-linux-gnu
+            build_subcommand: zigbuild
+            use_zigbuild: true
           - artifact_name: release-aarch64-apple-darwin
             runner: macos-15
             build_target: aarch64-apple-darwin
+            build_subcommand: build
           - artifact_name: release-x86_64-apple-darwin
             runner: macos-15-intel
             build_target: x86_64-apple-darwin
+            build_subcommand: build
+          - artifact_name: release-x86_64-pc-windows-msvc
+            runner: windows-latest
+            build_target: x86_64-pc-windows-msvc
+            build_subcommand: build
     name: Release Asset (${{ matrix.artifact_name }})
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -150,7 +166,6 @@ jobs:
           submodules: recursive
 
       - name: Setup Python
-        if: matrix.setup_python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -158,6 +173,16 @@ jobs:
       - name: Setup Rust
         if: matrix.build_target
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.build_target }}
+
+      - name: Setup Zig
+        if: matrix.use_zigbuild
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        if: matrix.use_zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
 
       - name: Cache cargo
         if: matrix.build_target
@@ -165,18 +190,22 @@ jobs:
 
       - name: Build release binary
         if: matrix.build_target
+        shell: bash
         env:
           BUILD_TARGET: ${{ matrix.build_target }}
-        run: cargo build --locked --release --target "${BUILD_TARGET}" --package criew --bin criew
+          BUILD_SUBCOMMAND: ${{ matrix.build_subcommand }}
+        run: cargo "${BUILD_SUBCOMMAND}" --locked --release --target "${BUILD_TARGET}" --package criew --bin criew
 
       - name: Prepare source release assets
-        if: matrix.setup_python
+        if: ${{ !matrix.build_target }}
+        shell: bash
         env:
           GIT_TAG: ${{ github.ref_name }}
         run: ./scripts/package-release-assets.sh "${GIT_TAG}" dist/release
 
       - name: Prepare binary release assets
         if: matrix.build_target
+        shell: bash
         env:
           GIT_TAG: ${{ github.ref_name }}
           BUILD_TARGET: ${{ matrix.build_target }}
@@ -208,36 +237,25 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Download source release assets
+      - name: Download release assets
         uses: actions/download-artifact@v4
         with:
-          name: release-source
+          pattern: release-*
           path: dist/release
+          merge-multiple: true
 
-      - name: Download Linux release assets
-        uses: actions/download-artifact@v4
-        with:
-          name: release-x86_64-unknown-linux-gnu
-          path: dist/release
-
-      - name: Download macOS arm64 release assets
-        uses: actions/download-artifact@v4
-        with:
-          name: release-aarch64-apple-darwin
-          path: dist/release
-
-      - name: Download macOS Intel release assets
-        uses: actions/download-artifact@v4
-        with:
-          name: release-x86_64-apple-darwin
-          path: dist/release
+      - name: Generate release checksums
+        shell: bash
+        run: ./scripts/generate-release-checksums.sh dist/release/SHA256SUMS dist/release
 
       - name: Generate release notes
+        shell: bash
         env:
           GIT_TAG: ${{ github.ref_name }}
         run: ./scripts/generate-release-notes.sh "${GIT_TAG}" dist/release/release-notes.md dist/release
 
       - name: Publish release
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GIT_TAG: ${{ github.ref_name }}

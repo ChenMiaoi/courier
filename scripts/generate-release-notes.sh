@@ -6,30 +6,44 @@ tag_name=${1:?missing tag name}
 output_file=${2:?missing output file}
 asset_dir=${3:-$(dirname "${output_file}")}
 
+resolve_python() {
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "python3"
+        return
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        printf '%s\n' "python"
+        return
+    fi
+
+    printf '%s\n' "python3 or python is required to generate release notes" >&2
+    exit 1
+}
+
+read_cargo_package_field() {
+    local field_name=${1:?missing Cargo.toml package field}
+
+    "${python_bin}" - "${field_name}" <<'PY'
+import sys
+import tomllib
+
+field_name = sys.argv[1]
+
+with open("Cargo.toml", "rb") as handle:
+    cargo = tomllib.load(handle)
+
+print(cargo["package"][field_name])
+PY
+}
+
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 
-package_name="$(
-    python3 - <<'PY'
-import tomllib
+python_bin="$(resolve_python)"
 
-with open("Cargo.toml", "rb") as handle:
-    cargo = tomllib.load(handle)
-
-print(cargo["package"]["name"])
-PY
-)"
-
-package_version="$(
-    python3 - <<'PY'
-import tomllib
-
-with open("Cargo.toml", "rb") as handle:
-    cargo = tomllib.load(handle)
-
-print(cargo["package"]["version"])
-PY
-)"
+package_name="$(read_cargo_package_field "name")"
+package_version="$(read_cargo_package_field "version")"
 
 tag_version="${tag_name#v}"
 if [[ "${tag_version}" != "${package_version}" ]]; then
@@ -67,15 +81,21 @@ mkdir -p "$(dirname "${output_file}")"
         [[ -n "${asset_path}" ]] || continue
         assets_found=1
         asset_name="$(basename "${asset_path}")"
-        asset_kind="Binary archive"
-        if [[ "${asset_name}" == *"-src.tar.gz" || "${asset_name}" == *"-src.zip" ]]; then
-            asset_kind="Source archive"
-        fi
+        asset_kind="Standalone binary"
+        case "${asset_name}" in
+            SHA256SUMS)
+                asset_kind="Checksum manifest"
+                ;;
+            *-src.tar.gz | *-src.zip)
+                asset_kind="Source archive"
+                ;;
+            *.tar.gz | *.zip)
+                asset_kind="Binary bundle"
+                ;;
+        esac
         printf -- '- %s: `%s`\n' "${asset_kind}" "${asset_name}"
     done < <(
-        find "${asset_dir}" -maxdepth 1 -type f \
-            \( -name '*.tar.gz' -o -name '*.zip' \) \
-            | sort
+        find "${asset_dir}" -maxdepth 1 -type f ! -name "$(basename "${output_file}")" | sort
     )
 
     if [[ "${assets_found}" -eq 0 ]]; then

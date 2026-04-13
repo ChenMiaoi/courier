@@ -30,7 +30,13 @@ criew sync --mailbox io-uring
 criew tui
 ```
 
-GitHub Releases also publish prebuilt archives for Linux and macOS.
+GitHub Releases publish source archives,
+standalone binaries,
+bundle archives,
+and a `SHA256SUMS` manifest for Linux x86_64/aarch64/riscv64,
+macOS x86_64/aarch64,
+and Windows x86_64.
+Downloaded standalone Unix binaries may need `chmod +x` after download.
 
 Use the wiki before enabling IMAP,
 patch application,
@@ -47,11 +53,16 @@ or reply sending.
 - [Contribution](https://github.com/ChenMiaoi/CRIEW/wiki/Contribution)
 - [API docs on docs.rs](https://docs.rs/criew/)
 
-## Current Release
+## Current Release Workflow
 
-The current source version and release tag are `v0.0.2`.
-GitHub Releases publish the source archive together with Linux and macOS
-prebuilt archives for the same tag.
+The current source version in this branch is `v0.0.2`.
+For each matching `v*` tag,
+GitHub Releases publish the matching source archive together with
+standalone binaries,
+bundle archives,
+and `SHA256SUMS` for Linux x86_64/aarch64/riscv64,
+macOS x86_64/aarch64,
+and Windows x86_64.
 
 ## Release Baseline
 
