@@ -47,7 +47,7 @@ import tempfile
 parent_dir = Path(sys.argv[1])
 parent_dir.mkdir(parents=True, exist_ok=True)
 
-print(tempfile.mkdtemp(prefix="binary-release-packaging-", dir=parent_dir))
+print(Path(tempfile.mkdtemp(prefix="binary-release-packaging-", dir=parent_dir)).as_posix())
 PY
 }
 
@@ -55,16 +55,15 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 
 python_bin="$(resolve_python)"
+source "./scripts/lib/path-utils.sh"
 package_name="$(read_cargo_package_field "name")"
 package_version="$(read_cargo_package_field "version")"
 tag_name="v${package_version}"
 
 if [[ -n "${output_dir}" ]]; then
-    if [[ "${output_dir}" = /* ]]; then
-        smoke_output_dir="${output_dir%/}"
-    else
-        smoke_output_dir="${repo_root}/${output_dir%/}"
-    fi
+    smoke_output_dir="$(
+        resolve_path_from_repo_root "${python_bin}" "${repo_root}" "${output_dir}"
+    )"
     should_cleanup_output_dir=0
 else
     smoke_output_dir="$(

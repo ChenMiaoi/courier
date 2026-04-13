@@ -93,6 +93,7 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 
 python_bin="$(resolve_python)"
+source "./scripts/lib/path-utils.sh"
 
 package_name="$(read_cargo_package_field "name")"
 package_version="$(read_cargo_package_field "version")"
@@ -105,11 +106,9 @@ if [[ "${tag_version}" != "${package_version}" ]]; then
     exit 1
 fi
 
-if [[ "${output_dir}" = /* ]]; then
-    release_root="${output_dir%/}"
-else
-    release_root="${repo_root}/${output_dir%/}"
-fi
+release_root="$(
+    resolve_path_from_repo_root "${python_bin}" "${repo_root}" "${output_dir}"
+)"
 asset_prefix="${package_name}-${tag_name}"
 source_root="${release_root}/source-root/${asset_prefix}"
 tar_asset="${release_root}/${asset_prefix}-src.tar.gz"

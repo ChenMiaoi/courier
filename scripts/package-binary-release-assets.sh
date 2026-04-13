@@ -93,6 +93,7 @@ PY
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 python_bin="$(resolve_python)"
+source "./scripts/lib/path-utils.sh"
 
 install_if_present() {
     local source_path=${1:?missing source path}
@@ -128,11 +129,9 @@ if [[ ! -f "${binary_path}" ]]; then
     exit 1
 fi
 
-if [[ "${output_dir}" = /* ]]; then
-    release_root="${output_dir%/}"
-else
-    release_root="${repo_root}/${output_dir%/}"
-fi
+release_root="$(
+    resolve_path_from_repo_root "${python_bin}" "${repo_root}" "${output_dir}"
+)"
 asset_prefix="${package_name}-${tag_name}-${build_target}"
 bundle_root="${release_root}/bundle-root/${asset_prefix}"
 tar_asset="${release_root}/${asset_prefix}.tar.gz"
