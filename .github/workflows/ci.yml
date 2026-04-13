@@ -171,6 +171,12 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Setup Python
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -193,6 +199,21 @@ jobs:
           BUILD_TARGET: ${{ matrix.build_target }}
           BUILD_SUBCOMMAND: ${{ matrix.build_subcommand }}
         run: cargo "${BUILD_SUBCOMMAND}" --locked --target "${BUILD_TARGET}" --package criew --bin criew
+
+      - name: Build release binary for packaging smoke test
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.build_target }}
+          BUILD_SUBCOMMAND: ${{ matrix.build_subcommand }}
+        run: cargo "${BUILD_SUBCOMMAND}" --locked --release --target "${BUILD_TARGET}" --package criew --bin criew
+
+      - name: Smoke test binary release packaging
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ matrix.build_target }}
+        run: bash ./scripts/check-binary-release-packaging.sh "${BUILD_TARGET}"
 
       - name: Smoke test native binary
         if: matrix.should_smoke_test

@@ -36,6 +36,35 @@ print(cargo["package"][field_name])
 PY
 }
 
+create_targz_archive() {
+    local archive_path=${1:?missing tar.gz archive path}
+    local source_root=${2:?missing source root}
+    local root_prefix=${3:?missing archive root prefix}
+
+    # Keep tar.gz generation in Python so local Windows packaging works even
+    # when Git Bash tar sees drive-letter output paths.
+    "${python_bin}" - "${archive_path}" "${source_root}" "${root_prefix}" <<'PY'
+from pathlib import Path
+import sys
+import tarfile
+
+archive_path = Path(sys.argv[1])
+source_root = Path(sys.argv[2])
+root_prefix = Path(sys.argv[3])
+
+with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+    archive.add(source_root, arcname=root_prefix.as_posix(), recursive=False)
+
+    for source_path in sorted(source_root.rglob("*")):
+        relative_path = source_path.relative_to(source_root)
+        archive.add(
+            source_path,
+            arcname=(root_prefix / relative_path).as_posix(),
+            recursive=False,
+        )
+PY
+}
+
 create_zip_archive() {
     local archive_path=${1:?missing zip archive path}
     local source_root=${2:?missing source root}
@@ -95,7 +124,7 @@ while IFS= read -r -d '' tracked_path; do
     cp -a "${tracked_path}" "${target_path}"
 done < <(git ls-files --recurse-submodules -z)
 
-tar -C "${release_root}/source-root" -czf "${tar_asset}" "${asset_prefix}"
+create_targz_archive "${tar_asset}" "${release_root}/source-root/${asset_prefix}" "${asset_prefix}"
 create_zip_archive "${zip_asset}" "${release_root}/source-root/${asset_prefix}" "${asset_prefix}"
 
 rm -rf "${release_root}/source-root"

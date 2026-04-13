@@ -37,6 +37,35 @@ print(cargo["package"][field_name])
 PY
 }
 
+create_targz_archive() {
+    local archive_path=${1:?missing tar.gz archive path}
+    local source_root=${2:?missing source root}
+    local root_prefix=${3:?missing archive root prefix}
+
+    # Use Python's tarfile module so Windows Git Bash does not misparse
+    # drive-letter archive paths like D:/... as remote tar destinations.
+    "${python_bin}" - "${archive_path}" "${source_root}" "${root_prefix}" <<'PY'
+from pathlib import Path
+import sys
+import tarfile
+
+archive_path = Path(sys.argv[1])
+source_root = Path(sys.argv[2])
+root_prefix = Path(sys.argv[3])
+
+with tarfile.open(archive_path, "w:gz", format=tarfile.PAX_FORMAT) as archive:
+    archive.add(source_root, arcname=root_prefix.as_posix(), recursive=False)
+
+    for source_path in sorted(source_root.rglob("*")):
+        relative_path = source_path.relative_to(source_root)
+        archive.add(
+            source_path,
+            arcname=(root_prefix / relative_path).as_posix(),
+            recursive=False,
+        )
+PY
+}
+
 create_zip_archive() {
     local archive_path=${1:?missing zip archive path}
     local source_root=${2:?missing source root}
@@ -130,7 +159,7 @@ install_if_present \
     0644 \
     "${bundle_root}/LICENSES/vendor-b4-patatt-COPYING"
 
-tar -C "${release_root}/bundle-root" -czf "${tar_asset}" "${asset_prefix}"
+create_targz_archive "${tar_asset}" "${release_root}/bundle-root/${asset_prefix}" "${asset_prefix}"
 create_zip_archive "${zip_asset}" "${release_root}/bundle-root/${asset_prefix}" "${asset_prefix}"
 
 rm -rf "${release_root}/bundle-root"
