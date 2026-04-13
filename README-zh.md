@@ -55,7 +55,7 @@ patch apply、
 
 ## 当前发布流程
 
-当前分支里的源码版本为 `v0.0.2`。
+当前分支里的源码版本为 `v0.0.3`。
 对每个匹配的 `v*` tag，
 GitHub Releases 都会发布对应的源码包，
 以及 Linux x86_64/aarch64/riscv64、

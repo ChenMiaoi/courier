@@ -55,7 +55,7 @@ or reply sending.
 
 ## Current Release Workflow
 
-The current source version in this branch is `v0.0.2`.
+The current source version in this branch is `v0.0.3`.
 For each matching `v*` tag,
 GitHub Releases publish the matching source archive together with
 standalone binaries,
