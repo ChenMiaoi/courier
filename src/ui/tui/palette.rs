@@ -367,7 +367,7 @@ fn split_local_palette_input(input: &str) -> Option<(String, String)> {
 }
 
 fn local_completion_suggestions(
-    state: &AppState,
+    state: &mut AppState,
     context: &PaletteCompletionContext,
 ) -> Vec<PaletteSuggestion> {
     let token = context.active_token.as_str();
@@ -378,13 +378,22 @@ fn local_completion_suggestions(
     };
 
     if context.active_index == 0 && !token_looks_like_path {
-        return local_command_completion_suggestions();
+        return local_command_completion_suggestions(
+            &mut state.palette.local_command_completion_cache,
+        );
     }
 
     local_path_completion_suggestions(&workdir, token)
 }
 
-fn local_command_completion_suggestions() -> Vec<PaletteSuggestion> {
+fn local_command_completion_suggestions(
+    cache: &mut LocalCommandCompletionCache,
+) -> Vec<PaletteSuggestion> {
+    let current_path = env::var_os("PATH");
+    if cache.is_loaded && cache.path_value == current_path {
+        return cache.suggestions.clone();
+    }
+
     let mut seen = HashSet::new();
     let mut suggestions = Vec::new();
 
@@ -397,7 +406,7 @@ fn local_command_completion_suggestions() -> Vec<PaletteSuggestion> {
         }
     }
 
-    if let Some(path_os) = env::var_os("PATH") {
+    if let Some(path_os) = current_path.as_deref() {
         for directory in env::split_paths(&path_os) {
             let Ok(entries) = fs::read_dir(directory) else {
                 continue;
@@ -419,7 +428,10 @@ fn local_command_completion_suggestions() -> Vec<PaletteSuggestion> {
         }
     }
 
-    suggestions
+    cache.is_loaded = true;
+    cache.path_value = current_path;
+    cache.suggestions = suggestions;
+    cache.suggestions.clone()
 }
 
 fn local_path_completion_suggestions(base_dir: &Path, token: &str) -> Vec<PaletteSuggestion> {

@@ -10,7 +10,7 @@ use rusqlite::{Connection, params};
 
 use crate::infra::error::{CriewError, ErrorCode, Result};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 const CREATE_SCHEMA_VERSION_TABLE: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -46,6 +46,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         description: "thread ordering uses mail date",
         sql: include_str!("../../migrations/0004_thread_sort_by_mail_date.sql"),
+    },
+    Migration {
+        version: 5,
+        description: "mail query indexes",
+        sql: include_str!("../../migrations/0005_mail_query_indexes.sql"),
     },
 ];
 
@@ -189,7 +194,7 @@ mod tests {
         assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(
             state.applied_migrations,
-            vec![1, 2, 3, CURRENT_SCHEMA_VERSION]
+            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>()
         );
 
         let connection = Connection::open(&db_path).expect("open sqlite");

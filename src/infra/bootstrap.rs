@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(first.db.schema_version, CURRENT_SCHEMA_VERSION);
         assert_eq!(
             first.db.applied_migrations,
-            vec![1, 2, 3, CURRENT_SCHEMA_VERSION]
+            (1..=CURRENT_SCHEMA_VERSION).collect::<Vec<_>>()
         );
 
         assert_eq!(second.db.path, runtime.database_path);

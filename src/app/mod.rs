@@ -403,7 +403,7 @@ mod tests {
                 path: PathBuf::from("/tmp/criew/criew.db"),
                 schema_version: crate::infra::db::CURRENT_SCHEMA_VERSION,
                 created: false,
-                applied_migrations: vec![1, 2, 3, crate::infra::db::CURRENT_SCHEMA_VERSION],
+                applied_migrations: (1..=crate::infra::db::CURRENT_SCHEMA_VERSION).collect(),
             },
         }
     }

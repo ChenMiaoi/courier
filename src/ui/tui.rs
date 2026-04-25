@@ -7,6 +7,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Stdout};
 use std::panic::{self, AssertUnwindSafe};
@@ -678,6 +679,7 @@ struct CommandPaletteState {
     show_suggestions: bool,
     last_tab_input: String,
     last_local_result: Option<LocalCommandResult>,
+    local_command_completion_cache: LocalCommandCompletionCache,
 }
 
 impl CommandPaletteState {
@@ -690,6 +692,13 @@ impl CommandPaletteState {
     fn clear_local_result(&mut self) {
         self.last_local_result = None;
     }
+}
+
+#[derive(Debug, Default)]
+struct LocalCommandCompletionCache {
+    is_loaded: bool,
+    path_value: Option<OsString>,
+    suggestions: Vec<PaletteSuggestion>,
 }
 
 #[derive(Debug, Default)]
@@ -1235,6 +1244,22 @@ impl KernelTreeRow {
             KernelTreeRowKind::RootFile => format!("[file] {}", self.path.display()),
             KernelTreeRowKind::MissingPath => format!("[missing] {}", self.path.display()),
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct KernelTreeDirectoryEntries {
+    dirs: Vec<PathBuf>,
+    files: Vec<PathBuf>,
+}
+
+impl KernelTreeDirectoryEntries {
+    fn is_empty(&self) -> bool {
+        self.dirs.is_empty() && self.files.is_empty()
+    }
+
+    fn into_children(self) -> impl Iterator<Item = PathBuf> {
+        self.dirs.into_iter().chain(self.files)
     }
 }
 
@@ -5055,7 +5080,8 @@ fn build_kernel_tree_rows(
             continue;
         }
 
-        let has_children = has_child_entries(root);
+        let children = child_entries(root);
+        let has_children = !children.is_empty();
         let is_expanded = expanded_paths.contains(root);
         rows.push(KernelTreeRow {
             path: root.clone(),
@@ -5070,14 +5096,14 @@ fn build_kernel_tree_rows(
         });
 
         if has_children && is_expanded {
-            append_kernel_tree_rows(root, 1, expanded_paths, &mut rows);
+            append_kernel_tree_rows(children, 1, expanded_paths, &mut rows);
         }
     }
     rows
 }
 
 fn append_kernel_tree_rows(
-    directory: &Path,
+    entries: KernelTreeDirectoryEntries,
     depth: usize,
     expanded_paths: &HashSet<PathBuf>,
     rows: &mut Vec<KernelTreeRow>,
@@ -5086,14 +5112,14 @@ fn append_kernel_tree_rows(
         return;
     }
 
-    let children = child_entries(directory);
-    for child in children {
+    for child in entries.into_children() {
         if rows.len() >= KERNEL_TREE_MAX_ROWS {
             break;
         }
 
         if child.is_dir() {
-            let has_children = has_child_entries(&child);
+            let children = child_entries(&child);
+            let has_children = !children.is_empty();
             let is_expanded = expanded_paths.contains(&child);
             let name = child
                 .file_name()
@@ -5109,7 +5135,7 @@ fn append_kernel_tree_rows(
             });
 
             if has_children && is_expanded {
-                append_kernel_tree_rows(&child, depth + 1, expanded_paths, rows);
+                append_kernel_tree_rows(children, depth + 1, expanded_paths, rows);
             }
             continue;
         }
@@ -5129,12 +5155,12 @@ fn append_kernel_tree_rows(
     }
 }
 
-fn child_entries(path: &Path) -> Vec<PathBuf> {
+fn child_entries(path: &Path) -> KernelTreeDirectoryEntries {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(_) => return KernelTreeDirectoryEntries::default(),
     };
     for entry in entries.flatten() {
         let child = entry.path();
@@ -5164,22 +5190,7 @@ fn child_entries(path: &Path) -> Vec<PathBuf> {
     });
     // Show directories before files so expanding the tree behaves like a
     // navigator, not like a flat alphabetical dump of mixed entries.
-    dirs.extend(files);
-    dirs
-}
-
-fn has_child_entries(path: &Path) -> bool {
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(_) => return false,
-    };
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if child.is_dir() || child.is_file() {
-            return true;
-        }
-    }
-    false
+    KernelTreeDirectoryEntries { dirs, files }
 }
 
 fn default_subscriptions(
