@@ -2311,18 +2311,18 @@ impl AppState {
                 if let Some(state) = self.inbox_auto_sync.as_mut() {
                     state.next_due_at = Instant::now() + self.runtime.inbox_auto_sync_interval();
                 }
-                if same_mailbox_name(&mailbox, &self.active_thread_mailbox) {
-                    if let Err(error) = self.reload_mailbox_threads_preserving_selection(&mailbox) {
-                        tracing::error!(
-                            op = "inbox_auto_sync",
-                            status = "failed",
-                            mailbox = %mailbox,
-                            error = %error
-                        );
-                        self.status = format!(
-                            "background sync ok but failed to reload threads for {mailbox}: {error}"
-                        );
-                    }
+                if same_mailbox_name(&mailbox, &self.active_thread_mailbox)
+                    && let Err(error) = self.reload_mailbox_threads_preserving_selection(&mailbox)
+                {
+                    tracing::error!(
+                        op = "inbox_auto_sync",
+                        status = "failed",
+                        mailbox = %mailbox,
+                        error = %error
+                    );
+                    self.status = format!(
+                        "background sync ok but failed to reload threads for {mailbox}: {error}"
+                    );
                 }
                 if inserted > 0 || updated > 0 {
                     self.status = format!(
@@ -2379,18 +2379,18 @@ impl AppState {
                         .in_flight_mailboxes
                         .retain(|in_flight| !same_mailbox_name(in_flight, &mailbox));
                 }
-                if same_mailbox_name(&mailbox, &self.active_thread_mailbox) {
-                    if let Err(error) = self.reload_mailbox_threads_preserving_selection(&mailbox) {
-                        tracing::error!(
-                            op = "subscription_auto_sync",
-                            status = "failed",
-                            mailbox = %mailbox,
-                            error = %error
-                        );
-                        self.status = format!(
-                            "background sync ok but failed to reload threads for {mailbox}: {error}"
-                        );
-                    }
+                if same_mailbox_name(&mailbox, &self.active_thread_mailbox)
+                    && let Err(error) = self.reload_mailbox_threads_preserving_selection(&mailbox)
+                {
+                    tracing::error!(
+                        op = "subscription_auto_sync",
+                        status = "failed",
+                        mailbox = %mailbox,
+                        error = %error
+                    );
+                    self.status = format!(
+                        "background sync ok but failed to reload threads for {mailbox}: {error}"
+                    );
                 }
                 if inserted > 0 || updated > 0 {
                     self.status = format!(

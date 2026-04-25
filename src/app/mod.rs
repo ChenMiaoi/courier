@@ -6,6 +6,7 @@
 pub mod cli;
 pub mod patch;
 pub mod sync;
+pub mod update;
 
 use std::path::PathBuf;
 
@@ -33,6 +34,11 @@ pub fn run() -> Result<()> {
 
     if matches!(command, cli::Command::Version) {
         println!("criew {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if let cli::Command::Update { dry_run } = &command {
+        let summary = update::run(update::UpdateRequest { dry_run: *dry_run })?;
+        println!("{}", format_update_summary(&summary));
         return Ok(());
     }
 
@@ -95,6 +101,7 @@ pub fn run() -> Result<()> {
 
             Ok(())
         }
+        cli::Command::Update { .. } => Ok(()),
         cli::Command::Version => Ok(()),
     }
 }
@@ -354,6 +361,17 @@ fn format_sync_summary(summary: &sync::SyncSummary) -> String {
     )
 }
 
+fn format_update_summary(summary: &update::UpdateSummary) -> String {
+    let status = match summary.status {
+        update::UpdateStatus::DryRun => "dry-run",
+        update::UpdateStatus::Updated => "updated",
+    };
+    format!(
+        "criew update\n  command: {}\n  status: {}",
+        summary.command_line, status
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -372,7 +390,7 @@ mod tests {
 
     use super::{
         DoctorImapStatus, build_sync_request, format_doctor_report, format_sync_summary,
-        probe_doctor_imap,
+        format_update_summary, probe_doctor_imap,
     };
 
     fn test_runtime() -> RuntimeConfig {
@@ -596,5 +614,18 @@ mod tests {
         assert!(report.contains("imap_connect_status: error (connect failed)"));
         assert!(report.contains("git_send_email_status: broken (missing send-email)"));
         assert!(report.contains("b4_status: broken (bad runtime)"));
+    }
+
+    #[test]
+    fn format_update_summary_renders_command_and_status() {
+        let summary = crate::app::update::UpdateSummary {
+            command_line: "cargo install --locked criew --force".to_string(),
+            status: crate::app::update::UpdateStatus::DryRun,
+        };
+
+        assert_eq!(
+            format_update_summary(&summary),
+            "criew update\n  command: cargo install --locked criew --force\n  status: dry-run"
+        );
     }
 }

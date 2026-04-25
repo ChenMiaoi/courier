@@ -36,6 +36,9 @@ macOS x86_64/aarch64，
 和 Windows x86_64。
 在类 Unix 系统上，
 直接下载独立二进制后可能还需要执行一次 `chmod +x`。
+如果 CRIEW 是通过 crates.io 安装的，
+可以运行 `criew update`，
+让 Cargo 重新安装最新的 crates.io 发布版本。
 
 启用 IMAP、
 patch apply、

@@ -45,6 +45,12 @@ pub enum Command {
     },
     /// Run environment diagnostics.
     Doctor,
+    /// Update CRIEW from crates.io using cargo install.
+    Update {
+        /// Print the cargo install command without running it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print CRIEW version.
     Version,
 }

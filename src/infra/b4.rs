@@ -191,10 +191,10 @@ fn candidates_with(
         values.push(Candidate::Path(path.to_path_buf()));
     }
 
-    if let Some(path) = env_b4_path {
-        if !path.as_os_str().is_empty() {
-            values.push(Candidate::Path(path.to_path_buf()));
-        }
+    if let Some(path) = env_b4_path
+        && !path.as_os_str().is_empty()
+    {
+        values.push(Candidate::Path(path.to_path_buf()));
     }
 
     if let Some(cwd) = cwd {

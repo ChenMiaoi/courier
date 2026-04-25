@@ -37,6 +37,8 @@ and a `SHA256SUMS` manifest for Linux x86_64/aarch64/riscv64,
 macOS x86_64/aarch64,
 and Windows x86_64.
 Downloaded standalone Unix binaries may need `chmod +x` after download.
+If CRIEW was installed from crates.io,
+run `criew update` to reinstall the latest crates.io release with Cargo.
 
 Use the wiki before enabling IMAP,
 patch application,
