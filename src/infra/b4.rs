@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use super::b4_vendor;
 use crate::infra::error::{CriewError, ErrorCode, Result};
 
-const EXECUTABLE_BUSY_RETRY_ATTEMPTS: u8 = 5;
-const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+const EXECUTABLE_BUSY_RETRY_ATTEMPTS: u8 = 50;
+const EXECUTABLE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone)]
 pub struct B4Check {
@@ -408,7 +408,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("criew-b4-{label}-{nonce}"));
+        let path =
+            std::env::temp_dir().join(format!("criew-b4-{label}-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&path).expect("create temp dir");
         path
     }

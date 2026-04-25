@@ -78,45 +78,6 @@ pub fn run() -> Result<()> {
             let send_email_status = sendmail::check();
             let reply_identity = sendmail::resolve_reply_identity();
 
-            println!("criew doctor");
-            println!("  config_path: {}", runtime.config_path.display());
-            println!("  data_dir: {}", runtime.data_dir.display());
-            println!("  database_path: {}", runtime.database_path.display());
-            println!("  raw_mail_dir: {}", runtime.raw_mail_dir.display());
-            println!("  patch_dir: {}", runtime.patch_dir.display());
-            println!("  log_dir: {}", runtime.log_dir.display());
-            println!("  source_mailbox: {}", runtime.source_mailbox);
-            println!(
-                "  default_active_mailbox: {}",
-                runtime.default_active_mailbox()
-            );
-            println!("  lore_base_url: {}", runtime.lore_base_url);
-            println!("  startup_sync: {}", runtime.startup_sync);
-            println!("  ui_keymap: {}", runtime.ui_keymap.as_str());
-            println!(
-                "  inbox_auto_sync_interval_secs: {}",
-                runtime.inbox_auto_sync_interval_secs
-            );
-            if runtime.kernel_trees.is_empty() {
-                println!("  kernel_trees: <none>");
-            } else {
-                for tree in &runtime.kernel_trees {
-                    println!("  kernel_tree: {}", tree.display());
-                }
-            }
-            println!("  schema_version: {}", bootstrap_state.db.schema_version);
-            println!(
-                "  schema_version_expected: {}",
-                crate::infra::db::CURRENT_SCHEMA_VERSION
-            );
-            println!(
-                "  migrations_applied: {:?}",
-                bootstrap_state.db.applied_migrations
-            );
-            println!(
-                "  database_created_this_run: {}",
-                bootstrap_state.db.created
-            );
             let self_email = config::resolve_self_email(&runtime);
             let imap_status = probe_doctor_imap(&runtime);
             println!(

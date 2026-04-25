@@ -23,6 +23,7 @@ mkdir -p "${coverage_root}"
 cargo llvm-cov clean --workspace
 cargo llvm-cov --workspace --all-features --html --output-dir "${html_dir}"
 cargo llvm-cov report --lcov --output-path "${lcov_path}"
+cargo llvm-cov report --fail-under-lines 70
 
 printf '%s\n' "coverage html report: ${html_dir}/index.html"
 printf '%s\n' "coverage lcov report: ${lcov_path}"

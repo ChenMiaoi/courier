@@ -120,10 +120,8 @@ mod tests {
             assert_eq!(script, script_path(&temp_root));
             assert!(script.exists(), "embedded b4 script should exist");
             assert!(
-                temp_root
-                    .join("vendor/b4/patatt/patatt/__init__.py")
-                    .exists(),
-                "embedded patatt runtime should exist"
+                temp_root.join("vendor/b4/src/b4/__init__.py").exists(),
+                "embedded b4 Python runtime should exist"
             );
         } else {
             assert!(!script_path(&temp_root).exists());

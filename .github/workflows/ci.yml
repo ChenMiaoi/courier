@@ -8,6 +8,25 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.85.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --locked --all-targets --all-features
+
   lint-and-test:
     name: Lint And Test (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
